@@ -1,0 +1,28 @@
+<!-- dbus/org.voiceassistant.App.xml -->
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.voiceassistant.App">
+    <!-- Методы -->
+    <method name="startRecording"/>
+    <method name="stopRecording"/>
+    <method name="setMode">
+      <arg name="mode" type="s" direction="in"/>  <!-- "dictation", "edit", "spellcheck", "off" -->
+    </method>
+    <method name="getMode">
+      <arg name="mode" type="s" direction="out"/>
+    </method>
+    <method name="reloadHotwords"/>
+    
+    <!-- Сигналы -->
+    <signal name="modeChanged">
+      <arg name="mode" type="s"/>
+    </signal>
+    <signal name="textRecognized">
+      <arg name="text" type="s"/>
+    </signal>
+    <signal name="errorOccurred">
+      <arg name="message" type="s"/>
+    </signal>
+  </interface>
+</node>

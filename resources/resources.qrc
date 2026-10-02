@@ -1,0 +1,16 @@
+<RCC>
+    <qresource prefix="/">
+        <!-- Иконки трея -->
+        <file>icons/mic-off.svg</file>
+        <file>icons/mic-on.svg</file>
+        <file>icons/dictation.svg</file>
+        <file>icons/edit.svg</file>
+        <file>icons/spellcheck.svg</file>
+        <file>icons/error.svg</file>
+
+        <!-- Конфиги по умолчанию (копируются в ~/.config/voice-assistant/ при первом запуске) -->
+        <file alias="config/settings.ini">../config/settings.ini</file>
+        <file alias="config/commands_hotwords.txt">../config/commands_hotwords.txt</file>
+        <file alias="config/user_hotwords.txt">../config/user_hotwords.txt</file>
+    </qresource>
+</RCC>

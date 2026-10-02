@@ -1,0 +1,88 @@
+cmake_minimum_required(VERSION 3.16)
+project(voice-assistant VERSION 0.0.1 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+
+find_package(Qt5 5.13 REQUIRED COMPONENTS Core Widgets Multimedia DBus)
+
+# ---------------------------------------------------------------------------
+# sherpa-onnx: ОДИН источник и для VAD (Silero), и для ASR (zipformer-ru / Whisper).
+#
+# Отдельный ONNX Runtime искать и линковать НЕ НУЖНО:
+#   * заголовок <sherpa-onnx/c-api/cxx-api.h> уже подключает всё необходимое;
+#   * libonnxruntime.so связана внутри libsherpa-onnx-c-api.so;
+#   * свой Ort::Env/Ort::Session для Silero VAD не пишем — в sherpa-onnx
+#     есть VoiceActivityDetector.
+# ---------------------------------------------------------------------------
+find_path(SHERPA_ONNX_INCLUDE_DIR
+    NAMES sherpa-onnx/c-api/cxx-api.h
+    PATHS /usr/local/include /usr/include
+)
+
+find_library(SHERPA_ONNX_CXX_LIBRARY
+    NAMES sherpa-onnx-cxx-api
+    PATHS /usr/local/lib /usr/lib
+)
+
+find_library(SHERPA_ONNX_C_LIBRARY
+    NAMES sherpa-onnx-c-api
+    PATHS /usr/local/lib /usr/lib
+)
+
+if(NOT SHERPA_ONNX_INCLUDE_DIR OR NOT SHERPA_ONNX_CXX_LIBRARY OR NOT SHERPA_ONNX_C_LIBRARY)
+    message(FATAL_ERROR
+        "sherpa-onnx не найден. Нужны: sherpa-onnx/c-api/cxx-api.h, "
+        "libsherpa-onnx-cxx-api.so, libsherpa-onnx-c-api.so")
+endif()
+
+message(STATUS "sherpa-onnx include : ${SHERPA_ONNX_INCLUDE_DIR}")
+message(STATUS "sherpa-onnx cxx lib : ${SHERPA_ONNX_CXX_LIBRARY}")
+message(STATUS "sherpa-onnx c   lib : ${SHERPA_ONNX_C_LIBRARY}")
+
+# ---------------------------------------------------------------------------
+# ABI libstdc++ — ГРАБЛИ, на которые легко наступить.
+#
+# Официальные ПРЕДСОБРАННЫЕ sherpa-onnx (linux-x64 shared) собраны со старым
+# ABI: _GLIBCXX_USE_CXX11_ABI=0. Проверено по манглингу:
+#   nm -D --defined-only libsherpa-onnx-cxx-api.so | grep 12CreateStream
+#   -> ...17OfflineRecognizer12CreateStreamERKSs   ("Ss" = старый ABI)
+#
+# Если такая библиотека слинкована с кодом, собранным в стандартном (новом)
+# ABI, то cxx::VadModelConfig / OfflineRecognizerConfig передаются через
+# границу библиотек с разной раскладкой std::string (32 байта против 8):
+# sizeof(VadModelConfig) = 160 вместо 88, библиотека читает ten_vad.model
+# из наших float'ов и падает в strlen() -> SIGSEGV внутри Create().
+# Компилируется при этом БЕЗ единой ошибки — ловится только в рантайме.
+#
+# Как проверить СВОЮ библиотеку (одна команда):
+#   nm -D --defined-only /usr/local/lib/libsherpa-onnx-cxx-api.so | grep -c ERKSs
+#     >0 -> old-ABI  => собирай с -DSHERPA_ONNX_OLD_CXX_ABI=ON
+#      0 -> new-ABI  => оставь OFF (обычно так, если sherpa-onnx собиралась
+#                      из исходников тем же g++, что и проект)
+# ---------------------------------------------------------------------------
+option(SHERPA_ONNX_OLD_CXX_ABI
+       "Собирать проект с _GLIBCXX_USE_CXX11_ABI=0 (нужно для предсобранных sherpa-onnx)"
+       OFF)
+if(SHERPA_ONNX_OLD_CXX_ABI)
+    add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
+    message(STATUS "Включён старый ABI libstdc++ (_GLIBCXX_USE_CXX11_ABI=0) — "
+                   "под предсобранные sherpa-onnx")
+endif()
+
+# Чтобы бинарник запускался и без `sudo ldconfig` (библиотеки стоят в /usr/local/lib)
+list(APPEND CMAKE_BUILD_RPATH "/usr/local/lib")
+list(APPEND CMAKE_INSTALL_RPATH "/usr/local/lib")
+
+add_subdirectory(src)
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/tools/CMakeLists.txt")
+    add_subdirectory(tools)
+endif()
