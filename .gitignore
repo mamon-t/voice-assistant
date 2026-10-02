@@ -1,3 +1,21 @@
+# сборка
 build/
+build-*/
+cmake-build-*/
+
+# IDE
 .vscode/
-test_voice.wav
+.idea/
+*.user
+
+# модели и аудио (скачиваются отдельно, в репозиторий не входят)
+models/
+*.onnx
+*.wav
+!resources/**/*.svg
+
+# служебное
+*.bak
+*.orig
+*.rej
+.cache/
