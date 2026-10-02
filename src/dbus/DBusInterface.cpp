@@ -10,6 +10,18 @@ DBusInterface::DBusInterface(ApplicationController* controller)
             this, [this](Mode mode) {
         emit modeChanged(modeToString(mode));
     });
+
+    // Раньше эти два сигнала адаптора никто не отправлял — внешний подписчик
+    // (например, `dbus-monitor` или свой виджет) их просто не видел.
+    connect(m_controller, &ApplicationController::textRecognized,
+            this, [this](const QString& text) {
+        emit textRecognized(text);
+    });
+
+    connect(m_controller, &ApplicationController::errorOccurred,
+            this, [this](const QString& message) {
+        emit errorOccurred(message);
+    });
 }
 
 void DBusInterface::startRecording() {
@@ -29,5 +41,5 @@ QString DBusInterface::getMode() const {
 }
 
 void DBusInterface::reloadHotwords() {
-    // TODO
+    m_controller->reloadHotwords();
 }

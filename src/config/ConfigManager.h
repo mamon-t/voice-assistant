@@ -63,6 +63,17 @@ public:
     bool autoPunctuate() const;
     bool voicePunctuation() const;
 
+    // --- вывод текста (ITextInjector) ---
+    QString injectorMethod() const;    // [output] method: auto | xdotool | clipboard
+    int     typingDelayMs() const;     // [output] typing_delay_ms
+
+    // --- команды ---
+    bool    editingCommandsInDictation() const;  // [commands] editing_in_dictation
+    QString customCommandsPath() const;          // [commands] file
+
+    // --- отладка ---
+    bool audioDebugLog() const;        // [audio] debug_log
+
 private:
     QSettings m_settings;
 };

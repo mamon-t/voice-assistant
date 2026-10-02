@@ -1,255 +1,85 @@
-# Интеграция VoicePipeline в ApplicationController
+# Интеграция в ApplicationController — РЕАЛИЗОВАНО
 
-Патч к текущему `src/core/ApplicationController.{h,cpp}` (тот, что с `m_agc`,
-`m_audioBuffer` и `TARGET_CHUNK_SIZE = 1600`). Контроллер остаётся тонким: вся
-речевая цепочка живёт в `VoicePipeline`.
+Этот документ был планом. План выполнен, ниже — что реально в коде (итерация 5).
+Подробный разбор и таблицы замеров — в корневом `README.md`, раздел 0.
 
----
+## Цепочка
 
-## 1. `ApplicationController.h`
-
-```cpp
-#pragma once
-
-#include <QObject>
-#include <QByteArray>
-#include <memory>
-#include "core/Mode.h"
-
-class IAudioCapture;
-class Agc;
-class ConfigManager;      // +++
-class VoicePipeline;      // +++
-class ITextInjector;      // +++ (если уже инжектируешь текст)
-class CommandParser;      // +++
-
-class ApplicationController : public QObject {
-    Q_OBJECT
-
-public:
-    explicit ApplicationController(QObject* parent = nullptr);
-    ~ApplicationController();
-
-    Mode mode() const;
-    void startRecording();
-    void stopRecording();
-    void setMode(Mode mode);
-
-    // +++ смена ASR-профиля на лету (переключатель "шумно/быстро" в трее)
-    bool switchAsrProfile(const QString& profileName);
-    QString activeAsrProfile() const;
-
-signals:
-    void modeChanged(Mode mode);
-    void errorOccurred(const QString& message);
-    void textRecognized(const QString& text);   // +++ для UI/лога
-
-private slots:
-    void onAudioDataReady(const QByteArray& data, int sampleRate);
-    void onAudioError(const QString& message);
-    void onTextReady(const QString& text);      // +++
-
-private:
-    bool buildPipeline();                       // +++
-
-    Mode m_mode = Mode::Off;
-    std::unique_ptr<IAudioCapture> m_audioCapture;
-    std::unique_ptr<Agc> m_agc;
-    std::unique_ptr<ConfigManager>  m_config;    // +++
-    std::unique_ptr<VoicePipeline>  m_pipeline;  // +++
-    std::unique_ptr<ITextInjector>  m_injector;  // +++ (XdotoolInjector/YdotoolInjector)
-    std::unique_ptr<CommandParser>  m_commands;  // +++
-
-    QByteArray m_audioBuffer;
-    static constexpr int TARGET_CHUNK_SIZE = 1600; // 50 мс при 16 кГц
-};
+```
+QtAudioCapture --audioDataReady(QByteArray,int)--> ApplicationController::onAudioDataReady
+    -> буфер по 1600 байт (50 мс @ 16 кГц)
+    -> Agc::process()
+    -> VoicePipeline::processAudio()          (только если mode != Off)
+         -> SileroVad::processAudio()          Silero VAD через sherpa-onnx
+         -> SileroVad::speechSegmentReady()    целый речевой сегмент, PCM16 16 кГц
+         -> IRecognizer (TransducerRecognizer / NemoCtcRecognizer / WhisperRecognizer)
+         -> TextPostProcessor                  «точка» -> «.», заглавные, точка в конце
+    -> VoicePipeline::rawTextRecognized(raw)   -> CommandParser::parse(raw)
+                                                 совпало целиком -> executeCommand(),
+                                                 m_skipNextText = true
+    -> VoicePipeline::textReady(text)          -> emit textRecognized(text)
+                                                 если m_skipNextText -> пропуск
+                                                 Mode::Dictation -> ITextInjector::typeText(text)
+                                                 Mode::Edit      -> только команды
+                                                 Mode::Spellcheck-> TODO (AspellChecker пуст)
 ```
 
-## 2. `ApplicationController.cpp` — конструктор
+## Порядок сигналов важен
+
+`VoicePipeline::onSpeechSegment()` сначала шлёт `rawTextRecognized`, затем `textReady`
+(соединения прямые, один поток). Команда ищется по сырому тексту, потому что
+`TextPostProcessor` съедает слова «точка», «новая строка», «пробел», превращая их
+в знаки, — из готового текста команда уже не соберётся.
+
+## Компоненты контроллера
+
+| Поле | Тип | Роль |
+|---|---|---|
+| `m_config` | `ConfigManager` | settings.ini: профили ASR, VAD, вывод, команды |
+| `m_audioCapture` | `IAudioCapture` | Qt-захват, 16 кГц моно int16 |
+| `m_agc` | `Agc` | усиление + шумовой порог |
+| `m_pipeline` | `VoicePipeline` | VAD -> ASR -> постобработка |
+| `m_injector` | `ITextInjector` | `XdotoolInjector`: буфер обмена или `xdotool type` |
+| `m_commands` | `CommandParser` | словарь из 26 команд + свой файл |
+| `m_hotwords` | `HotwordsManager` | `commands_hotwords.txt` + `user_hotwords.txt` |
+
+Владение: все поля — `unique_ptr` без Qt-родителя. Родителя QObject намеренно не
+передаём, чтобы объект не оказался одновременно в списке детей и под `unique_ptr`.
+
+## Публичное API контроллера
 
 ```cpp
-#include "ApplicationController.h"
-#include "audio/QtAudioCapture.h"
-#include "audio/Agc.h"
-#include "config/ConfigManager.h"        // +++
-#include "core/VoicePipeline.h"          // +++
-#include "commands/CommandParser.h"      // +++
-#include "output/XdotoolInjector.h"      // +++
-#include <QDebug>
+Mode mode() const;
+void startRecording();               // mode = Dictation
+void stopRecording();                // flush() пайплайна, затем mode = Off
+void setMode(Mode);
 
-ApplicationController::ApplicationController(QObject* parent)
-    : QObject(parent)
-{
-    // 1. Аудиоподсистема — как было
-    m_audioCapture = std::make_unique<QtAudioCapture>();
-    if (!m_audioCapture->initialize()) {
-        emit errorOccurred(QStringLiteral("Failed to initialize audio capture"));
-        return;
-    }
+QStringList asrProfiles() const;     // из [asr] profiles=
+QString     activeAsrProfile() const;
+bool        switchAsrProfile(const QString& name);   // выгрузка старой модели + загрузка новой
+void        reloadHotwords();                        // используется и из D-Bus
 
-    // 2. AGC — как был
-    m_agc = std::make_unique<Agc>();
-    m_agc->setTargetDb(-15.0f);
-    m_agc->setAttackTime(0.05f);
-    m_agc->setReleaseTime(0.2f);
-    m_agc->setMaxGain(10.0f);
-    m_agc->setMinGain(0.01f);
-
-    // 3. +++ Конфиг и речевой пайплайн (VAD -> ASR -> пунктуация)
-    m_config = std::make_unique<ConfigManager>();
-    if (!buildPipeline()) {
-        return;   // ошибка уже отправлена сигналом из buildPipeline()
-    }
-
-    // 4. +++ Инжектор текста и парсер команд
-    m_injector = std::make_unique<XdotoolInjector>();
-    if (!m_injector->initialize() || !m_injector->isAvailable()) {
-        emit errorOccurred(QStringLiteral("Text injector недоступен (xdotool/ydotool?)"));
-    }
-    m_commands = std::make_unique<CommandParser>();
-
-    // 5. Сигналы аудио — как было
-    connect(m_audioCapture.get(), &IAudioCapture::audioDataReady,
-            this, &ApplicationController::onAudioDataReady);
-    connect(m_audioCapture.get(), &IAudioCapture::errorOccurred,
-            this, &ApplicationController::onAudioError);
-}
+signals: modeChanged(Mode), errorOccurred(QString),
+         textRecognized(QString), commandExecuted(QString);
 ```
 
-## 3. `buildPipeline()` — сборка цепочки из конфига
+`DBusInterface` (сервис `org.voiceassistant.App`, объект `/org/voiceassistant/App`)
+использует ровно это API; `reloadHotwords()` и сигналы `textRecognized`/`errorOccurred`
+больше не заглушки.
 
-```cpp
-bool ApplicationController::buildPipeline()
-{
-    m_pipeline = std::make_unique<VoicePipeline>(
-        VoicePipeline::loadSettings(*m_config), this);
+## Режимы и команды
 
-    connect(m_pipeline.get(), &VoicePipeline::errorOccurred,
-            this, &ApplicationController::errorOccurred);
-    connect(m_pipeline.get(), &VoicePipeline::textReady,
-            this, &ApplicationController::onTextReady);
+* Команды смены режима («режим редактирования», «выключить») работают **всегда**.
+* Команды правки («удали слово», «новая строка», «пробел», одиночные знаки) в режиме
+  диктовки по умолчанию игнорируются: `[commands] editing_in_dictation=false`.
+  Иначе продиктованное «удали слово» уничтожало бы само себя.
+* Действия: `DeleteWord` -> `ctrl+BackSpace`, `DeleteLine` -> `shift+Home` + `BackSpace`,
+  `NewLine` -> `Return`, `Space` -> `space`, `Punctuation` -> `typeText(символ)`.
 
-    QString err;
-    if (!m_pipeline->initialize(&err)) {
-        emit errorOccurred(QStringLiteral("VoicePipeline: %1").arg(err));
-        m_pipeline.reset();
-        return false;
-    }
+## Проверка без железа
 
-    // Подсказки пользователя (HotwordsManager / user_hotwords.txt).
-    // Диктантные знаки ("точка", "запятая", ...) VoicePipeline примешает сам.
-    const QStringList hw = m_config->loadHotwords(m_config->userHotwordsPath());
-    if (!hw.isEmpty()) {
-        m_pipeline->setHotwords(hw, m_config->hotwordsScore());
-    }
-
-    qInfo().noquote() << QStringLiteral("ASR-профиль: %1")
-                             .arg(m_pipeline->asrProfileName());
-    return true;
-}
+```bash
+VOICE_ASSISTANT_DRYRUN=1 ./src/voice-assistant    # инжектор логирует вместо отправки
+ctest --output-on-failure                          # 2 теста, 23 проверки
+./tools/vad-asr-test запись.wav --config ~/.config/voice-assistant/settings.ini
 ```
-
-## 4. `onAudioDataReady()` — AGC остался, дальше в пайплайн
-
-```cpp
-void ApplicationController::onAudioDataReady(const QByteArray& data, int sampleRate)
-{
-    m_audioBuffer.append(data);
-
-    while (m_audioBuffer.size() >= TARGET_CHUNK_SIZE) {
-        const QByteArray chunk = m_audioBuffer.left(TARGET_CHUNK_SIZE);
-        m_audioBuffer.remove(0, TARGET_CHUNK_SIZE);
-
-        const QByteArray processed = m_agc->process(chunk, sampleRate);
-
-        // было: RMS в qDebug. стало: отдаём в речевой пайплайн
-        if (m_mode != Mode::Off && m_pipeline) {
-            m_pipeline->processAudio(processed, sampleRate);
-        }
-    }
-}
-```
-
-ВАЖНО: `QtAudioCapture` должен отдавать **16 кГц моно int16**, иначе Silero VAD
-откажется работать (он не ресемплит). Если захват идёт в 44.1/48 кГц — ресемплить
-надо до `processAudio()` (например, `QAudioFormat` с `setSampleRate(16000)`,
-либо `LinearResampler` из sherpa-onnx).
-
-## 5. `onTextReady()` — маршрутизация по режиму
-
-```cpp
-void ApplicationController::onTextReady(const QString& text)
-{
-    emit textRecognized(text);
-
-    switch (m_mode) {
-    case Mode::Dictation:
-        if (m_injector && m_injector->isAvailable()) {
-            m_injector->typeText(text);
-        }
-        break;
-
-    case Mode::Edit:
-    case Mode::Spellcheck:
-        if (m_commands) {
-            if (const auto cmd = m_commands->parse(text); cmd.has_value()) {
-                // выполнить команду (DeleteWord / NewLine / SetMode / Punctuation ...)
-            } else if (m_mode == Mode::Dictation) {
-                m_injector->typeText(text);
-            }
-        }
-        break;
-
-    case Mode::Off:
-    case Mode::Error:
-        break;
-    }
-}
-```
-
-## 6. Push-to-talk
-
-```cpp
-// отпускание клавиши PTT:
-m_pipeline->flush();     // вытолкнуть хвост фразы -> придёт textReady
-
-// начало новой записи:
-m_agc->reset();
-m_audioBuffer.clear();
-m_pipeline->reset();     // сбросить состояние VAD и буфер ASR
-```
-
-## 7. Смена профиля на лету
-
-```cpp
-bool ApplicationController::switchAsrProfile(const QString& profileName)
-{
-    if (!m_config->hasAsrProfile(profileName)) {
-        emit errorOccurred(QStringLiteral("Нет профиля ASR: %1").arg(profileName));
-        return false;
-    }
-    m_config->setActiveAsrProfileName(profileName);
-
-    const Mode old = m_mode;
-    if (m_pipeline) {
-        disconnect(m_pipeline.get(), nullptr, this, nullptr);
-        m_pipeline.reset();               // модель выгружается, ОЗУ освобождается
-    }
-    if (!buildPipeline()) {
-        m_mode = Mode::Error;
-        emit modeChanged(m_mode);
-        return false;
-    }
-    setMode(old);
-    return true;
-}
-
-QString ApplicationController::activeAsrProfile() const
-{
-    return m_pipeline ? m_pipeline->asrProfileName() : QString();
-}
-```
-
-Переинициализация стоит 1.2–5.1 с (замерено: GigaAM CTC 1.7 с, GigaAM RNN-T 2.9 с,
-zipformer-ru 5.1 с, Whisper 1.2 с) — делать только по явному действию пользователя,
-не на каждый чанк.

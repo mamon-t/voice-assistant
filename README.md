@@ -1,4 +1,4 @@
-# voice-assistant — VAD + ASR + конфиг профилей (итерация 4)
+# voice-assistant — VAD + ASR + конфиг профилей + интеграция (итерация 5)
 
 Дата замеров: 2026-10-03. Все цифры — результат компиляции и запуска в песочнице.
 Заголовки sherpa-onnx совпадают с твоими байт в байт: `cxx-api.h` 67 563 Б (66.0 KB),
@@ -6,7 +6,89 @@
 
 ---
 
-## 0. Что добавилось в этой итерации (вариант Б)
+## 0. Интеграция в приложение (итерация 5)
+
+Голосовой тракт собран воедино и **встроен в `ApplicationController`**. Проект
+целиком компилируется (0 ошибок, 0 предупреждений), тесты проходят: `ctest` 2/2,
+в сумме 23 проверки.
+
+| Файл | Что сделано |
+|---|---|
+| `src/core/ApplicationController.{h,cpp}` | конфиг → AGC → `VoicePipeline` → команда или вставка текста; смена профиля ASR на лету; reloadHotwords |
+| `src/commands/CommandDictionary.{h,cpp}` | 26 русских команд + загрузка своего файла `фраза = тип[:аргумент]` |
+| `src/commands/CommandParser.{h,cpp}` | нормализация (регистр, пунктуация, дефис) и поиск команды по ВСЕЙ фразе |
+| `src/output/XdotoolInjector.{h,cpp}` | настоящая вставка: буфер обмена (xclip/xsel/wl-copy) + Ctrl+V, либо `xdotool type --file -`; `VOICE_ASSISTANT_DRYRUN=1` для прогонов без X |
+| `src/output/ITextInjector.h` | добавлен `backendName()` (не pure — чужие реализации не ломаются) |
+| `src/config/HotwordsManager.cpp` | реализован `reload()` (был TODO) |
+| `src/config/ConfigManager.{h,cpp}` | секции `[output]`, `[commands]`, `[audio]` |
+| `src/dbus/DBusInterface.cpp` | `reloadHotwords()` + проброс `textRecognized`/`errorOccurred` (сигналы объявлялись, но никто их не слал) |
+| `src/main.cpp` | регистрация D-Bus сервиса `org.voiceassistant.App` на `/org/voiceassistant/App` |
+| `src/CMakeLists.txt` | цель `voice-assistant-core` (статическая библиотека) — её ждал `tests/`, теперь тесты собираются |
+| `tests/test_voice_units.cpp` | 18 проверок на парсер, словарь, постпроцессор и инжектор |
+| `config/settings.ini`, `config/commands_hotwords.txt` | новые секции и подсказки для команд |
+
+Удалено: `src/asr/SenseVoiceRecognizer.{h,cpp}` (это и были 6 ошибок сборки —
+старый код с несуществующим API), `config/ConfigManager.h` (забытый стаб с путями
+SenseVoice вне `src/`).
+
+### Маршрутизация результата
+
+```
+микрофон -> AGC -> VoicePipeline
+                     |-> rawTextRecognized(raw)  -> CommandParser: ВСЯ фраза есть в словаре?
+                     |                                да -> executeCommand(), текст НЕ вставляем
+                     |-> textReady(text)          -> Mode::Dictation: инжектор.typeText(text)
+                                                    Mode::Edit: только команды
+                                                    Mode::Spellcheck: TODO (AspellChecker пустой)
+```
+
+Команда ищется по **сырому** тексту намеренно: `TextPostProcessor` превращает
+«точка» и «новая строка» в знаки, и из готового текста команда уже не соберётся.
+
+Команды правки («удали слово», «новая строка») в режиме диктовки по умолчанию
+**не** выполняются — иначе продиктованное «удали слово» съедало бы само себя.
+Включается `[commands] editing_in_dictation=true`. Команды смены режима работают всегда.
+
+Фразы из словаря автоматически уходят в hotwords (`applyHotwords()`): без буста
+ASR проглатывает служебные слова — тот же эффект, что с «точка»/«запятая».
+
+### Запуск
+
+```bash
+sudo apt install xdotool xclip          # xclip — для вставки кириллицы без зависимости от раскладки
+mkdir -p ~/.config/voice-assistant && cp config/* ~/.config/voice-assistant/
+cd build && cmake .. && make -j4 && ctest --output-on-failure
+
+# проверка ввода текста без X-сервера:
+VOICE_ASSISTANT_DRYRUN=1 ./src/voice-assistant
+```
+
+### Что осталось сделать
+
+* `Mode::Spellcheck`: `src/spellcheck/AspellChecker.cpp` **пустой файл** (0 байт),
+  как и `src/core/Application.cpp` — их стоит либо наполнить, либо удалить
+  (CMake на них ругается предупреждением AutoGen).
+* Push-to-talk: глобальный хоткей через `evdev` (в текущей схеме режимы переключаются
+  из трея и по D-Bus).
+* Wayland/TTY: `ydotool` вместо `xdotool` (сейчас инжектор X11-специфичный;
+  интерфейс `ITextInjector` позволяет добавить вторую реализацию без правок контроллера).
+
+### Грабли, найденные при интеграции
+
+1. **`QTextStream << "кириллица"` (узкий литерал) кодируется как Latin-1** — получается
+   двойная UTF-8-кодировка. Везде нужен `QStringLiteral`/`QString`. На этом споткнулся
+   мой же тест: файл команд записывался кракозябрами, а `added` при этом честно
+   возвращал 3.
+2. **Дефис в `normalize()`**: если его удалять, «режим-правки» превращается в «режимправки»
+   и никогда не совпадёт со словарём. Теперь дефис/тире — разделитель. Нормализация
+   одна на парсер и словарь (`CommandParser::normalize`), иначе они разъезжаются.
+3. **`tests/` ссылался на несуществующую цель `voice-assistant-core`** — CMake не
+   ругается на этапе конфигурации (принимает её за имя библиотеки), падает только
+   компиляция на отсутствии include-путей.
+
+---
+
+## 0.1. Профили и движки (итерация 4)
 
 | Файл | Зачем |
 |---|---|
@@ -184,11 +266,21 @@ nm -D --defined-only /usr/local/lib/libsherpa-onnx-cxx-api.so | grep -c ERKSs
 
 ```
 CMakeLists.txt                        поиск sherpa-onnx, опция ABI, rpath, tools/tests
-config/settings.ini                   шаблон с 4 профилями (zipformer-ru активен)
-src/CMakeLists.txt                    + *.h в источниках (фикс AUTOMOC/vtable)
+config/settings.ini                   4 профиля ASR + [vad] [text] [output] [commands] [audio]
+config/commands_hotwords.txt          диктантные команды как подсказки для ASR
+src/CMakeLists.txt                    цель voice-assistant-core + *.h в источниках (AUTOMOC/vtable)
+tests/test_voice_units.cpp            18 проверок: парсер, словарь, постпроцессор, инжектор
 
 src/config/AsrProfile.h               профиль модели + проверка путей
-src/config/ConfigManager.h/.cpp       settings.ini: профили, пути, VAD, текст
+src/config/ConfigManager.h/.cpp       settings.ini: профили, пути, VAD, текст, вывод, команды
+src/config/HotwordsManager.h/.cpp     reload() реализован: командные + пользовательские подсказки
+src/commands/CommandDictionary.h/.cpp 26 команд + свой файл «фраза = тип[:аргумент]»
+src/commands/CommandParser.h/.cpp     нормализация и поиск команды по всей фразе
+src/core/ApplicationController.h/.cpp режимы, AGC, пайплайн, команды, инжектор, D-Bus-сигналы
+src/output/ITextInjector.h            интерфейс + backendName()
+src/output/XdotoolInjector.h/.cpp     буфер обмена + Ctrl+V, либо xdotool type; DRY RUN
+src/dbus/DBusInterface.cpp            reloadHotwords + проброс textRecognized/errorOccurred
+src/main.cpp                          регистрация D-Bus сервиса
 src/asr/IRecognizer.h                 интерфейс (эталон)
 src/asr/RecognizerFactory.h/.cpp      профиль -> конкретный распознаватель
 src/asr/TransducerRecognizer.h/.cpp   zipformer-ru, GigaAM RNN-T + hotwords

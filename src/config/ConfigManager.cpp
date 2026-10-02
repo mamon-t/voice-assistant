@@ -283,3 +283,37 @@ bool ConfigManager::voicePunctuation() const
 {
     return m_settings.value(QStringLiteral("text/voice_punctuation"), true).toBool();
 }
+
+// ---------------------------------------------------------------------------
+// Вывод текста, команды, отладка
+// ---------------------------------------------------------------------------
+
+QString ConfigManager::injectorMethod() const
+{
+    return m_settings.value(QStringLiteral("output/method"), QStringLiteral("auto"))
+        .toString().trimmed().toLower();
+}
+
+int ConfigManager::typingDelayMs() const
+{
+    return m_settings.value(QStringLiteral("output/typing_delay_ms"), 12).toInt();
+}
+
+bool ConfigManager::editingCommandsInDictation() const
+{
+    return m_settings.value(QStringLiteral("commands/editing_in_dictation"), false).toBool();
+}
+
+QString ConfigManager::customCommandsPath() const
+{
+    const QString v = m_settings.value(QStringLiteral("commands/file")).toString().trimmed();
+    if (v.isEmpty()) {
+        return configDir() + QStringLiteral("/commands.txt");
+    }
+    return resolvePath(v);
+}
+
+bool ConfigManager::audioDebugLog() const
+{
+    return m_settings.value(QStringLiteral("audio/debug_log"), false).toBool();
+}

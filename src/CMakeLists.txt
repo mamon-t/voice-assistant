@@ -1,31 +1,29 @@
-file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
-
-# ОБЯЗАТЕЛЬНО: заголовки тоже должны попасть в список источников.
-# IVad.h / IRecognizer.h / IAudioCapture.h и т.п. — header-only классы с Q_OBJECT
-# и сигналами. Если AUTOMOC не видит их в составе цели, он не создаёт moc_IVad.cpp,
-# и на линковке падает:
-#   undefined reference to `IVad::speechStarted()' / `vtable for IVad'
+file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS "*.cpp")
 file(GLOB_RECURSE HEADERS CONFIGURE_DEPENDS "*.h")
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/resources/resources.qrc")
-    set(RESOURCES "${CMAKE_SOURCE_DIR}/resources/resources.qrc")
-else()
-    set(RESOURCES "")
-endif()
+# main.cpp не входит в библиотеку: он нужен только исполняемому файлу,
+# а тесты должны линковаться со всем остальным кодом.
+set(CORE_SOURCES ${ALL_SOURCES})
+list(FILTER CORE_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 
-add_executable(voice-assistant
-    ${SOURCES}
-    ${HEADERS}
-    ${RESOURCES}
+# ---------------------------------------------------------------------------
+# Статическая библиотека с ядром. Нужна тестам (tests/CMakeLists.txt ссылается
+# на цель voice-assistant-core) и позволяет гонять QTest без GUI и микрофона.
+# ---------------------------------------------------------------------------
+add_library(voice-assistant-core STATIC
+    ${CORE_SOURCES}
+    ${HEADERS}   # ОБЯЗАТЕЛЬНО: header-only классы с Q_OBJECT (IVad, IRecognizer,
+                 # IAudioCapture) иначе не попадают в AUTOMOC -> undefined
+                 # reference to `vtable for IVad'
 )
 
-target_include_directories(voice-assistant PRIVATE
+target_include_directories(voice-assistant-core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${SHERPA_ONNX_INCLUDE_DIR}
 )
 
-# ONNX Runtime здесь не линкуем намеренно — он уже внутри libsherpa-onnx-c-api.so
-target_link_libraries(voice-assistant PRIVATE
+# ONNX Runtime не линкуем намеренно — он уже внутри libsherpa-onnx-c-api.so
+target_link_libraries(voice-assistant-core PUBLIC
     Qt5::Core
     Qt5::Widgets
     Qt5::Multimedia
@@ -33,3 +31,19 @@ target_link_libraries(voice-assistant PRIVATE
     ${SHERPA_ONNX_CXX_LIBRARY}
     ${SHERPA_ONNX_C_LIBRARY}
 )
+
+# ---------------------------------------------------------------------------
+# Исполняемый файл
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_SOURCE_DIR}/resources/resources.qrc")
+    set(RESOURCES "${CMAKE_SOURCE_DIR}/resources/resources.qrc")
+else()
+    set(RESOURCES "")
+endif()
+
+add_executable(voice-assistant
+    main.cpp
+    ${RESOURCES}
+)
+
+target_link_libraries(voice-assistant PRIVATE voice-assistant-core)

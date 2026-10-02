@@ -64,7 +64,11 @@ bool VoicePipeline::initialize(QString* error)
     vadOpt.numThreads         = m_settings.vadNumThreads;
     vadOpt.bufferSizeSeconds  = m_settings.vadBufferSeconds;
 
-    m_vad = std::make_unique<SileroVad>(m_settings.vadModelPath, vadOpt, this);
+    // Родителя QObject не задаём намеренно: владельцем является unique_ptr.
+    // Если передать this, объект попадёт и в список детей, и под unique_ptr —
+    // порядок деструкции (сначала члены, потом база QObject) делает это безопасным,
+    // но полагаться на такой тонкий момент не стоит.
+    m_vad = std::make_unique<SileroVad>(m_settings.vadModelPath, vadOpt);
 
     connect(m_vad.get(), &IVad::speechStarted, this, &VoicePipeline::speechStarted);
     connect(m_vad.get(), &IVad::speechEnded,   this, &VoicePipeline::speechEnded);
@@ -79,7 +83,7 @@ bool VoicePipeline::initialize(QString* error)
 
     // --- ASR ---
     QString factoryError;
-    m_asr = RecognizerFactory::create(m_settings.asr, this, &factoryError);
+    m_asr = RecognizerFactory::create(m_settings.asr, nullptr, &factoryError);
     if (!m_asr) {
         return fail(factoryError.isEmpty()
                         ? QStringLiteral("не удалось создать распознаватель для профиля '%1'")

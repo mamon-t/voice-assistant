@@ -194,8 +194,9 @@ QString TextPostProcessor::fixSpacing(const QString& text)
         }
 
         if (c == QLatin1Char(' ')) {
-            // схлопываем повторяющиеся пробелы
-            if (out.isEmpty() || out.endsWith(QLatin1Char(' ')) || out.endsWith(QLatin1Char('\n'))) {
+            // схлопываем повторяющиеся пробелы и не ставим пробел после "("
+            if (out.isEmpty() || out.endsWith(QLatin1Char(' '))
+                || out.endsWith(QLatin1Char('\n')) || out.endsWith(QLatin1Char('('))) {
                 continue;
             }
             // не ставим пробел перед закрывающей пунктуацией
