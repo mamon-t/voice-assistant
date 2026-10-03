@@ -8,6 +8,9 @@
 #include "config/HotwordsManager.h"
 #include "core/VoicePipeline.h"
 #include "output/XdotoolInjector.h"
+#include "spellcheck/HunspellChecker.h"
+#include "text/TextPostProcessor.h"
+#include "spellcheck/ISpellChecker.h"
 
 #include <QDebug>
 #include <QFile>
@@ -75,7 +78,25 @@ ApplicationController::ApplicationController(QObject* parent)
     }
     m_injector = std::move(injector);
 
-    // 5. Аудиоподсистема --------------------------------------------------------
+    // 5. Проверка правописания ---------------------------------------------------
+    // Не критично для диктовки: если словаря или библиотеки нет, сообщаем и живём дальше.
+    if (m_config->spellcheckEnabled()) {
+        HunspellChecker::Options sopt;
+        sopt.lang           = m_config->spellcheckLang();
+        sopt.dictionaryDir  = m_config->spellcheckDictionaryDir();
+        sopt.maxSuggestions = m_config->spellcheckMaxSuggestions();
+
+        auto checker = std::make_unique<HunspellChecker>(sopt);
+        if (checker->initialize()) {
+            m_spellChecker = std::move(checker);
+        } else {
+            qWarning().noquote()
+                << QStringLiteral("Проверка правописания недоступна: %1")
+                       .arg(checker->lastError());
+        }
+    }
+
+    // 6. Аудиоподсистема --------------------------------------------------------
     m_audioCapture = std::make_unique<QtAudioCapture>();
     if (!m_audioCapture->initialize()) {
         reportError(QStringLiteral("Не удалось инициализировать захват звука"));
@@ -97,7 +118,7 @@ ApplicationController::ApplicationController(QObject* parent)
     connect(m_audioCapture.get(), &IAudioCapture::errorOccurred,
             this, &ApplicationController::onAudioError);
 
-    // 6. Речевой пайплайн (VAD -> ASR -> пунктуация) -----------------------------
+    // 7. Речевой пайплайн (VAD -> ASR -> пунктуация) -----------------------------
     if (!buildPipeline()) {
         // Без ASR приложение работать не может. Не делаем вид, что всё в порядке:
         // переводимся в Mode::Error (трей покажет error.svg) и сообщаем наружу.
@@ -167,12 +188,17 @@ void ApplicationController::applyHotwords()
     // Подсказки пользователя + фразы команд: ASR проглатывает редкие слова,
     // а диктантные команды обязаны распознаваться дословно (тот же эффект,
     // что и с «точка»/«запятая»). Диктантные знаки VoicePipeline добавит сам.
+    // Пользовательские подсказки идут с общим скором ([asr] hotwords_score),
+    // фразы команд — со своим, более мягким: их много (26+), и сильный буст
+    // начинает протаскивать служебные слова в обычную речь.
     QStringList hw = m_hotwords ? m_hotwords->allHotwords() : QStringList();
     if (m_commands && m_commands->dictionary()) {
+        const QString suffix = QStringLiteral(" :%1")
+                                   .arg(m_config ? m_config->commandsHotwordsScore() : 1.5f, 0, 'f', 2);
         const QStringList phrases = m_commands->dictionary()->phrases();
         for (const QString& p : phrases) {
             if (!hw.contains(p)) {
-                hw << p;
+                hw << p + suffix;
             }
         }
     }
@@ -202,6 +228,7 @@ void ApplicationController::startRecording()
         if (m_pipeline) m_pipeline->reset();
         m_audioBuffer.clear();
         m_skipNextText = false;
+        m_lastInjected.clear();
 
         if (m_audioCapture) m_audioCapture->start();
         m_mode = Mode::Dictation;
@@ -240,6 +267,7 @@ void ApplicationController::setMode(Mode mode)
         if (m_pipeline) m_pipeline->reset();
         m_audioBuffer.clear();
         m_skipNextText = false;
+        m_lastInjected.clear();
         if (m_audioCapture) m_audioCapture->start();
     } else if (mode == Mode::Off) {
         if (m_pipeline) m_pipeline->flush();
@@ -382,8 +410,10 @@ void ApplicationController::onTextReady(const QString& text)
         break;
 
     case Mode::Spellcheck:
-        // TODO: AspellChecker — прогнать текст и предложить замены
-        qInfo().noquote() << QStringLiteral("Spellcheck (не реализовано): %1").arg(text);
+        // Диктуем как обычно и тут же проверяем: текст вставляется, а о найденных
+        // ошибках сообщаем сигналом (трей показывает их уведомлением).
+        injectText(text);
+        runSpellcheck(text);
         break;
 
     case Mode::Edit:
@@ -402,9 +432,78 @@ void ApplicationController::injectText(const QString& text)
         reportError(QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
         return;
     }
-    if (!m_injector->typeText(text)) {
-        reportError(QStringLiteral("Не удалось вставить текст"));
+    // VAD отдаёт речь отдельными фразами, каждая вставляется своим вызовом.
+    // Без разделителя получалось "…двадцать лет назад.Сегодня вот…" — добавляем
+    // пробел, если предыдущая вставка им не закончилась.
+    QString toType = text;
+    if (m_config->spaceBetweenSegments()
+        && TextPostProcessor::needsLeadingSpace(m_lastInjected, toType)) {
+        toType.prepend(QLatin1Char(' '));
     }
+
+    if (!m_injector->typeText(toType)) {
+        reportError(QStringLiteral("Не удалось вставить текст"));
+        return;
+    }
+    m_lastInjected = toType;
+}
+
+// ---------------------------------------------------------------------------
+// Проверка правописания
+// ---------------------------------------------------------------------------
+
+bool ApplicationController::isSpellcheckAvailable() const
+{
+    return static_cast<bool>(m_spellChecker);
+}
+
+QStringList ApplicationController::checkText(const QString& text)
+{
+    return m_spellChecker ? m_spellChecker->check(text) : QStringList();
+}
+
+QStringList ApplicationController::suggestionsFor(const QString& word)
+{
+    return m_spellChecker ? m_spellChecker->suggest(word) : QStringList();
+}
+
+QString ApplicationController::spellcheckStatus() const
+{
+    if (!m_spellChecker) {
+        return QStringLiteral("недоступна (нет hunspell или словаря)");
+    }
+    const auto* hun = dynamic_cast<const HunspellChecker*>(m_spellChecker.get());
+    return hun ? QStringLiteral("hunspell, словарь %1").arg(hun->dictionaryPath())
+               : QStringLiteral("доступна");
+}
+
+void ApplicationController::runSpellcheck(const QString& text)
+{
+    if (!m_spellChecker) {
+        return;
+    }
+
+    const QStringList errors = m_spellChecker->check(text);
+    if (errors.isEmpty()) {
+        qInfo().noquote() << QStringLiteral("Орфография: ошибок нет");
+        emit spellcheckFinished(text, errors);
+        return;
+    }
+
+    QStringList report;
+    report.reserve(errors.size());
+    for (const QString& word : errors) {
+        const QStringList sug = m_spellChecker->suggest(word);
+        report << (sug.isEmpty() ? word
+                                 : QStringLiteral("%1 -> %2").arg(word, sug.join(QStringLiteral(", "))));
+    }
+
+    qWarning().noquote()
+        << QStringLiteral("Орфография: найдено %1 — %2")
+               .arg(errors.size())
+               .arg(report.join(QStringLiteral("; ")));
+
+    emit spellcheckFinished(text, errors);
 }
 
 void ApplicationController::executeCommand(const Command& cmd)

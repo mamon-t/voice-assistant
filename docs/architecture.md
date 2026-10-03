@@ -85,7 +85,7 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 | VAD | `IVad` | `SileroVad` |
 | ASR | `IRecognizer` | `TransducerRecognizer`, `NemoCtcRecognizer`, `WhisperRecognizer` |
 | Ввод текста | `ITextInjector` | `XdotoolInjector` |
-| Правописание | `ISpellChecker` | `AspellChecker` — **заглушка, .cpp пустой** |
+| Правописание | `ISpellChecker` | `HunspellChecker` (hunspell, C API) |
 
 Конкретную реализацию ASR выбирает `RecognizerFactory::create(AsrProfile)`;
 остальное приложение знает только `IRecognizer`.
@@ -118,6 +118,32 @@ QObject-родителя намеренно не передаём. Иначе о
 потом база `QObject`) делает это безопасным, но полагаться на такой тонкий
 момент не стоит — двойное владение легко превращается в double free при
 первом же рефакторинге.
+
+## Проверка правописания
+
+`HunspellChecker` реализует `ISpellChecker` и создаётся в конструкторе
+`ApplicationController`, если `[spellcheck] enabled=true`. Отсутствие hunspell
+или словаря **не мешает** остальному: контроллер логирует причину и продолжает
+работать без режима `Spellcheck`.
+
+В режиме `Spellcheck` текст вставляется как при диктовке, а затем проверяется:
+
+```
+onTextReady(text) → injectText(text)
+                  → runSpellcheck(text) → check(text)  → слова с ошибками
+                                        → suggest(word) → варианты
+                                        → emit spellcheckFinished(text, errors)
+                                          (трей показывает уведомление)
+```
+
+Числа («2026») ошибками не считаются: словарь их не знает, а в диктовке они
+встречаются постоянно. Слова разбираются регулярным выражением `[^\W\d_]+`
+с `UseUnicodePropertiesOption`, поэтому «ё», дефисы и пунктуация обрабатываются
+корректно.
+
+`HunspellChecker` намеренно использует **C API** hunspell (`char*`), а не
+`hunspell.hxx` (`std::string`): C++ API зависит от `_GLIBCXX_USE_CXX11_ABI`
+и ломает линковку при сборке со старым ABI.
 
 ## Потоки
 

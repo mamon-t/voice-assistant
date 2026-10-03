@@ -6,6 +6,7 @@
 #include "vad/SileroVad.h"
 
 #include <QDebug>
+#include <QSet>
 
 VoicePipeline::VoicePipeline(const Settings& settings, QObject* parent)
     : QObject(parent)
@@ -35,6 +36,8 @@ VoicePipeline::Settings VoicePipeline::loadSettings(const ConfigManager& config)
     s.text.capitalizeSentences = config.autoPunctuate();
     s.text.addFinalDot         = config.autoPunctuate();
     s.text.collapseSpaces      = true;
+
+    s.punctuationHotwordsScore = config.punctuationHotwordsScore();
 
     return s;
 }
@@ -163,10 +166,22 @@ void VoicePipeline::applyHotwords()
         && m_settings.asr.decodingMethod == QLatin1String("modified_beam_search");
 
     if (canBoost) {
+        // Записи могут приходить уже с суффиксом ":score" (их добавляет
+        // ApplicationController для фраз команд), поэтому сравниваем по базовой
+        // фразе — иначе «точка» попала бы в список дважды с разными скорами.
+        QSet<QString> already;
+        for (const QString& e : effective) {
+            const int i = e.lastIndexOf(QStringLiteral(" :"));
+            already.insert(i < 0 ? e : e.left(i));
+        }
+
         const QStringList punct = m_post.punctuationPhrases();
+        const QString suffix = QStringLiteral(" :%1")
+                                   .arg(m_settings.punctuationHotwordsScore, 0, 'f', 2);
         for (const QString& p : punct) {
-            if (!effective.contains(p)) {
-                effective << p;
+            if (!already.contains(p)) {
+                effective << p + suffix;   // "точка :2.00" — скор именно на эту фразу
+                already.insert(p);
             }
         }
     }

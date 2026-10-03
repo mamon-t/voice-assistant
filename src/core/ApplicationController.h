@@ -16,6 +16,7 @@ class VoicePipeline;
 class ITextInjector;
 class CommandParser;
 class HotwordsManager;
+class ISpellChecker;
 
 // Сердце приложения: аудиопоток -> AGC -> VoicePipeline (VAD -> ASR -> пунктуация),
 // затем маршрутизация результата: команда или вставка текста.
@@ -46,6 +47,12 @@ public:
     // некому было принять сигналом). Пустая строка — ошибок не было.
     QString lastError() const { return m_lastError; }
 
+    // --- проверка правописания ---
+    bool      isSpellcheckAvailable() const;
+    QStringList checkText(const QString& text);        // слова с ошибками
+    QStringList suggestionsFor(const QString& word);   // варианты исправления
+    QString   spellcheckStatus() const;                // одна строка для логов и --check
+
     // Готов ли тракт к работе (VAD и ASR созданы).
     bool isReady() const;
 
@@ -54,6 +61,7 @@ signals:
     void errorOccurred(const QString& message);
     void textRecognized(const QString& text);        // что услышали (после постобработки)
     void commandExecuted(const QString& description); // для логов и UI
+    void spellcheckFinished(const QString& text, const QStringList& errors);
 
 private slots:
     void onAudioDataReady(const QByteArray& data, int sampleRate);
@@ -66,6 +74,7 @@ private:
     void applyHotwords();
     void executeCommand(const Command& cmd);
     void injectText(const QString& text);
+    void runSpellcheck(const QString& text);
 
     Mode m_mode = Mode::Off;
 
@@ -76,6 +85,7 @@ private:
     std::unique_ptr<ITextInjector>   m_injector;
     std::unique_ptr<CommandParser>   m_commands;
     std::unique_ptr<HotwordsManager> m_hotwords;
+    std::unique_ptr<ISpellChecker>   m_spellChecker;
 
     QByteArray m_audioBuffer;
     static constexpr int TARGET_CHUNK_SIZE = 1600; // 50 мс при 16 кГц
@@ -83,6 +93,7 @@ private:
     void reportError(const QString& message);
 
     QString m_lastError;
+    QString m_lastInjected;      // чтобы ставить пробел между сегментами
     bool m_skipNextText   = false;  // фраза оказалась командой — вставлять нечего
     bool m_audioDebugLog  = false;
     bool m_editCmdsInDictation = false;

@@ -17,6 +17,7 @@
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
 #include "output/XdotoolInjector.h"
+#include "spellcheck/HunspellChecker.h"
 
 #include <cstdio>
 #include <memory>
@@ -225,6 +226,35 @@ int runDiagnostics(const QStringList& args)
                 cfg->clipboardRestoreMs());
 
     // --- прочее ---
+    // --- правописание ---
+    std::printf("Правописание\n");
+    if (!cfg->spellcheckEnabled()) {
+        std::printf("  выключено ([spellcheck] enabled=false)\n");
+    } else {
+        HunspellChecker::Options sopt;
+        sopt.lang           = cfg->spellcheckLang();
+        sopt.dictionaryDir  = cfg->spellcheckDictionaryDir();
+        sopt.maxSuggestions = cfg->spellcheckMaxSuggestions();
+        HunspellChecker sc(sopt);
+        if (sc.initialize()) {
+            std::printf("  движок    : hunspell\n");
+            std::printf("  словарь   : %s\n", qPrintable(sc.dictionaryPath()));
+            // контрольная проверка: заведомо ошибочное слово
+            const QStringList err = sc.check(QStringLiteral("прверка"));
+            const QStringList sug = sc.suggest(QStringLiteral("прверка"));
+            std::printf("  контроль  : \"прверка\" -> %s%s\n",
+                        err.isEmpty() ? "НЕ найдена ошибка (словарь странный)" : "ошибка",
+                        sug.isEmpty() ? "" : qPrintable(QStringLiteral(", варианты: ") + sug.join(QStringLiteral(", "))));
+            if (err.isEmpty()) {
+                ++problems;
+            }
+        } else {
+            std::printf("  НЕДОСТУПНО: %s\n", qPrintable(sc.lastError()));
+            ++problems;
+        }
+    }
+    std::printf("\n");
+
     std::printf("Постобработка : auto_punctuate=%s voice_punctuation=%s\n",
                 cfg->autoPunctuate() ? "true" : "false",
                 cfg->voicePunctuation() ? "true" : "false");

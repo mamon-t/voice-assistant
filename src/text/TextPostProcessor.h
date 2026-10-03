@@ -48,6 +48,16 @@ public:
     // превратится в "точка" + хвост.
     static QList<Rule> defaultRules();
 
+    // Нужен ли пробел перед очередным сегментом при вставке.
+    //
+    // VAD режет речь на фразы, и каждая вставляется отдельным вызовом typeText().
+    // Без разделителя получается "…двадцать лет назад.Сегодня вот…" — именно так
+    // это и выглядело в первом живом прогоне.
+    //
+    // Правила: пробел нужен, если предыдущий сегмент не кончился пробелом/переводом
+    // строки, а следующий не начинается со знака препинания или закрывающей кавычки.
+    static bool needsLeadingSpace(const QString& previous, const QString& next);
+
 private:
     QString applyVoicePunctuation(const QString& text) const;
     static QString fixSpacing(const QString& text);

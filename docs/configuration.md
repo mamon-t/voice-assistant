@@ -53,6 +53,8 @@ hotwords_score=2.0     ; сила бустинга подсказок
 | `decoding_method` | `modified_beam_search`, `greedy_search` | hotwords работают только в `modified_beam_search` |
 | `max_active_paths` | 4 | ширина луча |
 | `hotwords_score` | 2.0 | переопределяет общее значение |
+| `commands_hotwords_score` | 2.0 | скор для фраз команд из словаря |
+| `punctuation_hotwords_score` | 2.0 | скор для диктантных знаков; замер показал, что ниже 1.75 модель их теряет |
 | `debug` | `false` | лог sherpa-onnx |
 
 По движкам:
@@ -137,6 +139,7 @@ int16 и сообщает об ошибке иначе. `QtAudioCapture` зап�
 |---|---|---|
 | `method` | `auto` | `auto` — буфер обмена, если есть `xclip`/`xsel`/`wl-copy`, иначе `xdotool type`; `clipboard` — только буфер; `xdotool` — только посимвольный ввод |
 | `typing_delay_ms` | `12` | задержка между символами в режиме `xdotool type` |
+| `space_between_segments` | `true` | добавлять пробел между фразами: VAD отдаёт речь кусками, каждый вставляется отдельным вызовом |
 | `preserve_clipboard` | `true` | запомнить прежний текст буфера и вернуть его после вставки |
 | `clipboard_restore_ms` | `1000` | через сколько миллисекунд возвращать буфер |
 
@@ -170,6 +173,25 @@ int16 и сообщает об ошибке иначе. `QtAudioCapture` зап�
 Типы: `set-mode:{dictation|edit|spellcheck|off}`, `delete-word`, `delete-line`,
 `new-line`, `space`, `punctuation:<символ>`. Битые строки пропускаются с
 предупреждением в лог, а не роняют загрузку.
+
+## `[spellcheck]`
+
+| Ключ | По умолчанию | Комментарий |
+|---|---|---|
+| `enabled` | `true` | включать ли проверку правописания вообще |
+| `lang` | `ru_RU` | имя словаря: ищутся `<lang>.aff` и `<lang>.dic` |
+| `dictionary_dir` | пусто | каталог словаря; пусто = стандартные пути |
+| `max_suggestions` | `5` | сколько вариантов исправления предлагать |
+
+Стандартные пути поиска: `/usr/share/hunspell`, `/usr/share/myspell`,
+`/usr/local/share/hunspell`, `~/.hunspell`, `~/.local/share/hunspell`.
+
+Словарь обязан быть в **UTF-8** — `HunspellChecker` проверяет кодировку через
+`Hunspell_get_dic_encoding()` и отказывается работать с KOI8-R/ISO8859-5,
+поскольку текст из ASR приходит в UTF-8 и сравнивается побайтово.
+
+Отсутствие hunspell не ломает сборку: зависимость детектируется pkg-config,
+без неё `initialize()` возвращает false с внятным сообщением.
 
 ## `[audio]`
 

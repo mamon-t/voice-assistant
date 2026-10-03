@@ -92,6 +92,29 @@ QStringList TextPostProcessor::punctuationPhrases() const
     return out;
 }
 
+bool TextPostProcessor::needsLeadingSpace(const QString& previous, const QString& next)
+{
+    if (previous.isEmpty() || next.isEmpty()) {
+        return false;
+    }
+
+    const QChar last = previous.at(previous.size() - 1);
+    if (last.isSpace()) {
+        return false;   // разделитель уже есть
+    }
+
+    const QChar first = next.at(0);
+    if (first.isSpace()) {
+        return false;
+    }
+    // "…слово" + ", а также…" -> пробел перед запятой не ставится
+    static const QString noSpaceBefore = QStringLiteral(".,!?;:)\u00bb\"'\u201d");
+    if (noSpaceBefore.contains(first)) {
+        return false;
+    }
+    return true;
+}
+
 QString TextPostProcessor::process(const QString& raw) const
 {
     QString text = raw.trimmed();

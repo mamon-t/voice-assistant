@@ -14,6 +14,8 @@
 | Приложение работает, но речь не распознаётся | не инициализировался ASR: нет файлов модели | [раздел 0](#0-ничего-не-распознаётся-первое-что-проверить) |
 | Текст не печатается вообще | нет xdotool / Wayland | [раздел 8](#8-текст-не-вставляется) |
 | Буфер обмена затирается при диктовке | вставка идёт через буфер | `[output] preserve_clipboard=true` (по умолчанию включено) |
+| `undefined reference to Hunspell::spell(std::string const&…)` | ABI-конфликт libhunspell | [раздел 13](#13-ошибка-линковки-с-hunspell) |
+| Режим правописания молчит | нет словаря или проект собран без hunspell | [раздел 14](#14-проверка-правописания-не-работает) |
 | Нет сегментов, `Segments: 0` | не та частота, тишина, высокий порог VAD | [раздел 9](#9-сегменты-не-появляются) |
 | Подсказки не действуют | не transducer или не `modified_beam_search` | [раздел 10](#10-hotwords-не-работают) |
 | `Each line in vocab should contain two items` | вместо словаря ssentencepiece подсунули `bpe.model` | [раздел 11](#11-ошибка-про-две-колонки-в-vocab) |
@@ -305,3 +307,48 @@ iconv -f cp1251 -t utf-8 commands.txt -o commands.utf8.txt && mv commands.utf8.t
   sherpa-onnx — информационное: стрим сам ресемплит вход.
 * `AutoGen warning: "…AspellChecker.cpp" is empty` — файл действительно пустой,
   см. дорожную карту в README.
+
+## 13. Ошибка линковки с hunspell
+
+**Симптом.**
+
+```
+undefined reference to `Hunspell::spell(std::string const&, int*, std::string*)'
+undefined reference to `Hunspell::suggest(std::string const&)'
+```
+
+**Причина.** Тот же конфликт ABI libstdc++, что и с sherpa-onnx: проект собран
+с `-DSHERPA_ONNX_OLD_CXX_ABI=ON` (старый ABI), а системный `libhunspell` —
+с новым. C++ API hunspell принимает `std::string`, поэтому символы не совпадают.
+
+**Лечение.** Уже сделано в коде: `HunspellChecker` использует **чистый C API**
+(`hunspell.h`: `Hunspell_create`, `Hunspell_spell`, `Hunspell_suggest`),
+он работает с `char*` и от ABI не зависит. Если ошибка вернулась — значит,
+где-то снова подключён `hunspell/hunspell.hxx`.
+
+## 14. Проверка правописания не работает
+
+**Диагностика.**
+
+```bash
+./src/voice-assistant --check      # раздел «Правописание»
+```
+
+Варианты:
+
+* `выключено ([spellcheck] enabled=false)` — включите в конфиге;
+* `Словарь 'ru_RU' не найден` → `sudo apt install hunspell-ru`. Если словарь
+  лежит в нестандартном месте — `[spellcheck] dictionary_dir=/путь`;
+* `Словарь … в кодировке 'KOI8-R', а нужен UTF-8` → нужен словарь в UTF-8
+  (пакет `hunspell-ru` в Debian/Ubuntu именно такой);
+* `Проект собран без поддержки hunspell` → `sudo apt install libhunspell-dev`
+  и пересобрать: `cd build && cmake .. && make -j4`. В выводе `cmake` должна
+  появиться строка `hunspell 1.7.1: найден — проверка правописания включена`.
+
+**Проверка без приложения:**
+
+```bash
+cd build && ./tests/test_voice_units spellCheckRealDictionary
+```
+
+Если словарь не установлен, тест корректно пропустится (`SKIP`), а не упадёт.

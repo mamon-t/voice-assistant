@@ -22,6 +22,30 @@ target_include_directories(voice-assistant-core PUBLIC
     ${SHERPA_ONNX_INCLUDE_DIR}
 )
 
+# ---------------------------------------------------------------------------
+# hunspell — проверка правописания. Зависимость НЕОБЯЗАТЕЛЬНАЯ:
+# если её нет, проект собирается без режима Spellcheck (см. HunspellChecker.cpp).
+# ---------------------------------------------------------------------------
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HUNSPELL QUIET hunspell)
+endif()
+
+if(HUNSPELL_FOUND)
+    target_compile_definitions(voice-assistant-core PRIVATE HAVE_HUNSPELL=1)
+    target_include_directories(voice-assistant-core PRIVATE ${HUNSPELL_INCLUDE_DIRS})
+    if(HUNSPELL_LIBRARY_DIRS)
+        target_link_directories(voice-assistant-core PRIVATE ${HUNSPELL_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(voice-assistant-core PUBLIC ${HUNSPELL_LIBRARIES})
+    message(STATUS "hunspell ${HUNSPELL_VERSION}: найден — проверка правописания включена")
+else()
+    message(WARNING
+        "hunspell не найден — проект соберётся БЕЗ проверки правописания.\n"
+        "   Установка: sudo apt install libhunspell-dev hunspell-ru\n"
+        "   После этого пересоберите: cd build && cmake .. && make -j4")
+endif()
+
 # ONNX Runtime не линкуем намеренно — он уже внутри libsherpa-onnx-c-api.so
 target_link_libraries(voice-assistant-core PUBLIC
     Qt5::Core

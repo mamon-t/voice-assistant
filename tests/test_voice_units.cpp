@@ -14,6 +14,7 @@
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
 #include "output/XdotoolInjector.h"
+#include "spellcheck/HunspellChecker.h"
 #include "text/TextPostProcessor.h"
 
 class TestVoiceUnits : public QObject {
@@ -198,6 +199,29 @@ private slots:
                  QStringLiteral("привет точка мир"));
     }
 
+    void leadingSpaceBetweenSegments()
+    {
+        // ровно тот случай из первого живого прогона: "…назад." + "Сегодня вот…"
+        QVERIFY(TextPostProcessor::needsLeadingSpace(
+            QStringLiteral("Это было двадцать лет назад."), QStringLiteral("Сегодня вот маленький.")));
+        QVERIFY(TextPostProcessor::needsLeadingSpace(
+            QStringLiteral("мастер спорта россии"), QStringLiteral("Россиянин.")));
+
+        // пробел уже есть — второй не нужен
+        QVERIFY(!TextPostProcessor::needsLeadingSpace(
+            QStringLiteral("первая строка\n"), QStringLiteral("Вторая.")));
+        QVERIFY(!TextPostProcessor::needsLeadingSpace(
+            QStringLiteral("слово "), QStringLiteral("слово.")));
+
+        // следующий сегмент начинается со знака — пробел перед ним не ставится
+        QVERIFY(!TextPostProcessor::needsLeadingSpace(
+            QStringLiteral("слово"), QStringLiteral(", продолжение")));
+
+        // пустые строки
+        QVERIFY(!TextPostProcessor::needsLeadingSpace(QString(), QStringLiteral("текст")));
+        QVERIFY(!TextPostProcessor::needsLeadingSpace(QStringLiteral("текст"), QString()));
+    }
+
     void punctuationPhrasesForHotwords()
     {
         TextPostProcessor pp;
@@ -278,6 +302,47 @@ private slots:
         QCOMPARE(cfg.clipboardRestoreMs(), 1000);
         QCOMPARE(cfg.vadThreshold(), 0.5f);
         QVERIFY(cfg.asrProfileNames().isEmpty());
+    }
+
+    // ---------------- HunspellChecker ----------------
+
+    void spellSplitWords()
+    {
+        QCOMPARE(HunspellChecker::splitWords(QStringLiteral("Привет, мир! 2026 год.")),
+                 (QStringList{QStringLiteral("Привет"), QStringLiteral("мир"),
+                              QStringLiteral("год")}));
+        // буквы с диакритикой не теряются, дефис разделяет
+        QCOMPARE(HunspellChecker::splitWords(QStringLiteral("съешь ещё этих — кто-то")),
+                 (QStringList{QStringLiteral("съешь"), QStringLiteral("ещё"),
+                              QStringLiteral("этих"), QStringLiteral("кто"),
+                              QStringLiteral("то")}));
+        QVERIFY(HunspellChecker::splitWords(QString()).isEmpty());
+        QVERIFY(HunspellChecker::splitWords(QStringLiteral("123 456")).isEmpty());
+    }
+
+    void spellCheckRealDictionary()
+    {
+        HunspellChecker c;
+        if (!c.initialize()) {
+            QSKIP("hunspell или словарь ru_RU не установлены — тест пропускается");
+        }
+        QVERIFY(c.isAvailable());
+        QVERIFY(!c.dictionaryPath().isEmpty());
+
+        // заведомо ошибочное слово находится, правильное — нет
+        QCOMPARE(c.check(QStringLiteral("привет прверка мира")),
+                 QStringList{QStringLiteral("прверка")});
+        QVERIFY(c.check(QStringLiteral("проверка связи")).isEmpty());
+
+        // повторы не дублируются
+        QCOMPARE(c.check(QStringLiteral("прверка и ещё раз прверка")).size(), 1);
+
+        // варианты исправления содержат правильный
+        QVERIFY(c.suggest(QStringLiteral("прверка")).contains(QStringLiteral("проверка")));
+        QVERIFY(c.suggest(QStringLiteral("прверка")).size() <= 5);   // max_suggestions по умолчанию
+
+        // числа не считаются ошибками
+        QVERIFY(c.check(QStringLiteral("2026 42 3.14")).isEmpty());
     }
 
     // ---------------- XdotoolInjector (dry-run) ----------------

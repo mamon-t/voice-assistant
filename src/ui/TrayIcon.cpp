@@ -85,6 +85,29 @@ void TrayIcon::connectSignals()
             this, &TrayIcon::onModeChanged);
     connect(m_controller, &ApplicationController::errorOccurred,
             this, &TrayIcon::onError);
+
+    // Результаты проверки правописания показываем уведомлением: список слов
+    // с вариантами исправления берём у контроллера, чтобы не тащить их сигналом.
+    connect(m_controller, &ApplicationController::spellcheckFinished,
+            this, [this](const QString& text, const QStringList& errors) {
+        Q_UNUSED(text)
+        if (errors.isEmpty()) {
+            return;
+        }
+        QStringList lines;
+        for (const QString& w : errors) {
+            const QStringList sug = m_controller->suggestionsFor(w);
+            lines << (sug.isEmpty() ? w
+                                    : QStringLiteral("%1 → %2").arg(w, sug.join(QStringLiteral(", "))));
+        }
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(QStringLiteral("Проверка правописания: %1").arg(errors.size()),
+                          lines.join(QStringLiteral("\n")),
+                          QSystemTrayIcon::Information, 10000);
+        } else {
+            qInfo().noquote() << lines.join(QStringLiteral("; "));
+        }
+    });
 }
 
 void TrayIcon::onError(const QString& message)

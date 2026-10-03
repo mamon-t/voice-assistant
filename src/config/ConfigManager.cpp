@@ -215,6 +215,20 @@ float ConfigManager::hotwordsScore() const
     return m_settings.value(QStringLiteral("asr/hotwords_score"), 2.0f).toFloat();
 }
 
+float ConfigManager::commandsHotwordsScore() const
+{
+    // 2.0 — замеренный минимум с запасом: при 1.5 и ниже модель начинает
+    // терять служебные слова (см. docs/hotwords-and-punctuation.md)
+    return m_settings.value(QStringLiteral("asr/commands_hotwords_score"), 2.0f).toFloat();
+}
+
+float ConfigManager::punctuationHotwordsScore() const
+{
+    // Замер на живой записи: 1.0/1.25/1.5 — «точка» теряется, 1.75 и 2.0 — нет.
+    // Фантомных вставок «точки» на речи без диктантных слов при 2.0 не замечено.
+    return m_settings.value(QStringLiteral("asr/punctuation_hotwords_score"), 2.0f).toFloat();
+}
+
 void ConfigManager::setHotwordsScore(float score)
 {
     m_settings.setValue(QStringLiteral("asr/hotwords_score"), score);
@@ -299,6 +313,11 @@ int ConfigManager::typingDelayMs() const
     return m_settings.value(QStringLiteral("output/typing_delay_ms"), 12).toInt();
 }
 
+bool ConfigManager::spaceBetweenSegments() const
+{
+    return m_settings.value(QStringLiteral("output/space_between_segments"), true).toBool();
+}
+
 bool ConfigManager::preserveClipboard() const
 {
     return m_settings.value(QStringLiteral("output/preserve_clipboard"), true).toBool();
@@ -321,6 +340,27 @@ QString ConfigManager::customCommandsPath() const
         return configDir() + QStringLiteral("/commands.txt");
     }
     return resolvePath(v);
+}
+
+bool ConfigManager::spellcheckEnabled() const
+{
+    return m_settings.value(QStringLiteral("spellcheck/enabled"), true).toBool();
+}
+
+QString ConfigManager::spellcheckLang() const
+{
+    return m_settings.value(QStringLiteral("spellcheck/lang"), QStringLiteral("ru_RU"))
+        .toString().trimmed();
+}
+
+QString ConfigManager::spellcheckDictionaryDir() const
+{
+    return resolvePath(m_settings.value(QStringLiteral("spellcheck/dictionary_dir")).toString());
+}
+
+int ConfigManager::spellcheckMaxSuggestions() const
+{
+    return m_settings.value(QStringLiteral("spellcheck/max_suggestions"), 5).toInt();
 }
 
 bool ConfigManager::audioDebugLog() const
