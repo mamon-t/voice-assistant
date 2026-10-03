@@ -43,6 +43,31 @@ public:
     void setPreserveClipboard(bool preserve);
     void setClipboardRestoreMs(int ms);
 
+    // --- привязка к окну ---
+    //
+    // Без привязки текст уходит в то окно, которое в фокусе В МОМЕНТ ПРИХОДА
+    // результата, а это через 0.5–2 с после произнесённой фразы. Стоит
+    // переключиться в другой файл, чтобы сделать пометку, — и продиктованное
+    // прилетит туда.
+    //
+    // С привязкой окно запоминается в начале записи, и вставка идёт в него
+    // (xdotool ... --window WID), даже если фокус уже в другом месте:
+    // можно диктовать и параллельно печатать руками.
+    //
+    // ЧЕСТНО ПРО ОГРАНИЧЕНИЕ: `xdotool --window` доставляет события через
+    // XSendEvent, и часть приложений такие события игнорирует (в первую
+    // очередь это касается `key`, то есть способа «буфер обмена + Ctrl+V»).
+    // Поэтому привязка выключена по умолчанию, а при первом неподтверждённом
+    // вводе пишется предупреждение в лог. Проверить на своём редакторе:
+    //   [output] pin_window=true  ->  надиктовать фразу, переключив окно.
+    void    setPinnedWindow(const QString& windowId);
+    QString pinnedWindow() const { return m_pinnedWindow; }
+    void    clearPinnedWindow() { m_pinnedWindow.clear(); }
+
+    // WID активного окна ("xdotool getactivewindow"). Пустая строка, если
+    // xdotool не найден, X-сервера нет или окно не определилось.
+    static QString activeWindowId();
+
     QString backendName() const override;   // для логов и SettingsDialog
 
 private:
@@ -59,6 +84,8 @@ private:
 
     bool    m_preserveClipboard = true;
     int     m_clipboardRestoreMs = 1000;
+
+    QString     m_pinnedWindow;    // WID окна-цели; пусто = вставлять в активное
 
     QString     m_xdotool;         // полный путь к xdotool
     QString     m_clipboardTool;   // xclip / xsel / wl-copy

@@ -425,6 +425,26 @@ bool ConfigManager::hotkeyGrab() const
     return m_settings.value(QStringLiteral("hotkey/grab"), false).toBool();
 }
 
+QStringList ConfigManager::hotkeyGrabDevices() const
+{
+    // ВАЖНО: именно toStringList(). QSettings возвращает QStringList для
+    // значений с запятыми, а toString() для такого значения даёт пустую строку
+    // (грабля №9 в development-log.md).
+    QStringList out;
+    const QVariant v = m_settings.value(QStringLiteral("hotkey/grab_devices"));
+    // userType() есть и в Qt5, и в Qt6 (в отличие от typeId()/type())
+    if (v.userType() == QMetaType::QStringList) {
+        out = v.toStringList();
+    } else {
+        out = v.toString().split(QLatin1Char(','), Qt::SkipEmptyParts);
+    }
+    for (QString& s : out) {
+        s = s.trimmed();
+    }
+    out.removeAll(QString());
+    return out;
+}
+
 QString ConfigManager::hotkeyMode() const
 {
     const QString v = m_settings.value(QStringLiteral("hotkey/mode"),
@@ -436,4 +456,99 @@ QString ConfigManager::hotkeyMode() const
 bool ConfigManager::audioDebugLog() const
 {
     return m_settings.value(QStringLiteral("audio/debug_log"), false).toBool();
+}
+
+// ---------------------------------------------------------------------------
+// Вывод текста: привязка к окну
+// ---------------------------------------------------------------------------
+
+bool ConfigManager::pinWindow() const
+{
+    return m_settings.value(QStringLiteral("output/pin_window"), false).toBool();
+}
+
+// ---------------------------------------------------------------------------
+// Заметки (цель вывода Notes)
+// ---------------------------------------------------------------------------
+
+bool ConfigManager::notesEnabled() const
+{
+    return m_settings.value(QStringLiteral("notes/enabled"), true).toBool();
+}
+
+QString ConfigManager::notesDir() const
+{
+    const QString v = m_settings.value(QStringLiteral("notes/dir")).toString().trimmed();
+    if (v.isEmpty()) {
+        return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+               + QStringLiteral("/notes");
+    }
+    // resolvePath() считает относительные пути от каталога моделей — для заметок
+    // это было бы сюрпризом, поэтому раскрываем "~" и считаем относительный
+    // путь от домашнего каталога.
+    if (v == QLatin1String("~")) {
+        return QDir::homePath();
+    }
+    if (v.startsWith(QLatin1String("~/"))) {
+        return QDir::cleanPath(QDir::homePath() + v.mid(1));
+    }
+    if (QDir::isAbsolutePath(v)) {
+        return QDir::cleanPath(v);
+    }
+    return QDir::cleanPath(QDir::homePath() + QLatin1Char('/') + v);
+}
+
+QString ConfigManager::notesFile() const
+{
+    const QString v = m_settings.value(QStringLiteral("notes/file")).toString().trimmed();
+    if (v.isEmpty()) {
+        return QString();
+    }
+    if (v == QLatin1String("~")) {
+        return QDir::homePath();
+    }
+    if (v.startsWith(QLatin1String("~/"))) {
+        return QDir::cleanPath(QDir::homePath() + v.mid(1));
+    }
+    if (QDir::isAbsolutePath(v)) {
+        return QDir::cleanPath(v);
+    }
+    return QDir::cleanPath(QDir::homePath() + QLatin1Char('/') + v);
+}
+
+QString ConfigManager::notesTimestampFormat() const
+{
+    return m_settings.value(QStringLiteral("notes/timestamp"), QStringLiteral("HH:mm:ss"))
+        .toString();
+}
+
+bool ConfigManager::notesMarkdown() const
+{
+    return m_settings.value(QStringLiteral("notes/markdown"), true).toBool();
+}
+
+bool ConfigManager::notesDayHeader() const
+{
+    return m_settings.value(QStringLiteral("notes/day_header"), true).toBool();
+}
+
+bool ConfigManager::notesVoiceCommands() const
+{
+    return m_settings.value(QStringLiteral("notes/voice_commands"), true).toBool();
+}
+
+QString ConfigManager::notesStartTarget() const
+{
+    return m_settings.value(QStringLiteral("notes/start_target"), QStringLiteral("focus"))
+        .toString().trimmed().toLower();
+}
+
+// ---------------------------------------------------------------------------
+// Глушитель микрофона на время печати
+// ---------------------------------------------------------------------------
+
+int ConfigManager::typingGuardMs() const
+{
+    const int v = m_settings.value(QStringLiteral("audio/typing_guard_ms"), 0).toInt();
+    return (v < 0) ? 0 : v;
 }

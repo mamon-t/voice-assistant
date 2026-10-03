@@ -3,6 +3,7 @@
 #include <QSystemTrayIcon>
 #include <QMap>
 #include "core/Mode.h"
+#include "core/OutputTarget.h"
 
 class QAction;
 class ApplicationController;
@@ -21,15 +22,24 @@ private slots:
     void onModeChanged(Mode mode);
     void onError(const QString& message);
     void onToggleMicCheck();
+    void onToggleNotesTarget();
+    void onOpenNotesFile();
+    void onOutputTargetChanged(OutputTarget target);
 
 private:
     void buildMenu();
     void connectSignals();
     void updateIcon(Mode mode);
     void updateMenu(Mode mode);
+    // Синхронизирует пункты заметок с состоянием контроллера БЕЗ уведомления:
+    // вызывается при старте и из updateMenu(), чтобы не показывать всплывающее
+    // окно каждый раз, когда меню перерисовывается.
+    void syncNotesAction();
 
     ApplicationController* m_controller;
     QAction* m_toggleAction = nullptr;
     QAction* m_micCheckAction = nullptr;
+    QAction* m_notesAction = nullptr;       // куда писать: окно или файл заметок
+    QAction* m_openNotesAction = nullptr;
     QMap<Mode, QAction*> m_modeActions;
 };

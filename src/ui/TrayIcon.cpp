@@ -5,7 +5,9 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QDesktopServices>
 #include <QFileInfo>
+#include <QUrl>
 #include <QIcon>
 #include <QMenu>
 #include <QTimer>
@@ -17,6 +19,7 @@ TrayIcon::TrayIcon(ApplicationController* controller, QWidget* parent)
     buildMenu();
     connectSignals();
     updateIcon(m_controller ? m_controller->mode() : Mode::Off);
+    syncNotesAction();
 
     // Ошибки, возникшие в конструкторе ApplicationController, сигналом мы уже
     // не получим (подписка появилась позже). Догоняем их отложенно — к этому
@@ -66,6 +69,21 @@ void TrayIcon::buildMenu()
 
     menu->addSeparator();
 
+    // --- Цель вывода: активное окно или файл заметок ---
+    // Заметки нужны, чтобы диктовать по ходу работы с файлом: результат уходит
+    // в файл, а не в окно, поэтому клавиатура, фокус и буфер обмена свободны —
+    // можно продолжать печатать руками.
+    m_notesAction = menu->addAction(tr("Писать в файл заметок"));
+    m_notesAction->setCheckable(true);
+    m_notesAction->setToolTip(tr("Распознанный текст дописывается в файл заметок, "
+                                 "а не вставляется в активное окно"));
+    connect(m_notesAction, &QAction::triggered, this, &TrayIcon::onToggleNotesTarget);
+
+    m_openNotesAction = menu->addAction(tr("Открыть файл заметок"));
+    connect(m_openNotesAction, &QAction::triggered, this, &TrayIcon::onOpenNotesFile);
+
+    menu->addSeparator();
+
     // --- Настройки и редактор hotwords ---
     auto* settingsAction = menu->addAction(tr("Настройки..."));
     connect(settingsAction, &QAction::triggered,
@@ -91,6 +109,8 @@ void TrayIcon::connectSignals()
             this, &TrayIcon::onModeChanged);
     connect(m_controller, &ApplicationController::errorOccurred,
             this, &TrayIcon::onError);
+    connect(m_controller, &ApplicationController::outputTargetChanged,
+            this, &TrayIcon::onOutputTargetChanged);
 
     // Запись микрофона завершена — сообщаем, куда лёг файл
     connect(m_controller, &ApplicationController::micCheckFinished,
@@ -224,5 +244,74 @@ void TrayIcon::updateMenu(Mode mode)
     // Галки на пунктах режимов
     for (auto it = m_modeActions.begin(); it != m_modeActions.end(); ++it) {
         it.value()->setChecked(it.key() == mode);
+    }
+
+    syncNotesAction();
+}
+
+void TrayIcon::syncNotesAction()
+{
+    if (!m_controller) {
+        return;
+    }
+    const bool notes = (m_controller->outputTarget() == OutputTarget::Notes);
+    const QString path = m_controller->notesFilePath();
+
+    if (m_notesAction) {
+        m_notesAction->setChecked(notes);
+        m_notesAction->setText(notes ? tr("Писать в активное окно")
+                                     : tr("Писать в файл заметок"));
+        m_notesAction->setEnabled(notes || !path.isEmpty());
+    }
+    if (m_openNotesAction) {
+        m_openNotesAction->setEnabled(!path.isEmpty());
+        m_openNotesAction->setText(path.isEmpty()
+            ? tr("Открыть файл заметок")
+            : tr("Открыть заметки: %1").arg(QFileInfo(path).fileName()));
+    }
+}
+
+void TrayIcon::onToggleNotesTarget()
+{
+    if (!m_controller) {
+        return;
+    }
+    // -> outputTargetChanged -> onOutputTargetChanged (галка и уведомление)
+    m_controller->toggleOutputTarget();
+}
+
+void TrayIcon::onOutputTargetChanged(OutputTarget target)
+{
+    syncNotesAction();
+
+    // Уведомление обязательно: другого индикатора цели вывода нет, а ошибка
+    // «диктовал в редактор, а текст ушёл в файл» стоит дорого.
+    const bool notes = (target == OutputTarget::Notes);
+    const QString title = notes ? tr("Заметки") : tr("Диктовка");
+    const QString msg = notes
+        ? tr("Текст дописывается в %1\nКлавиатура, фокус и буфер обмена не трогаются.")
+              .arg(m_controller ? m_controller->notesFilePath() : QString())
+        : tr("Текст вставляется в активное окно.");
+
+    if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+        showMessage(title, msg, QSystemTrayIcon::Information, 6000);
+    } else {
+        qInfo().noquote() << title << QStringLiteral(":") << msg;
+    }
+}
+
+void TrayIcon::onOpenNotesFile()
+{
+    const QString path = m_controller ? m_controller->notesFilePath() : QString();
+    if (path.isEmpty()) {
+        onError(tr("Файл заметок не задан (проверьте [notes] enabled)"));
+        return;
+    }
+    if (!QFileInfo::exists(path)) {
+        onError(tr("Файла заметок ещё нет: %1\nОн появится после первой записи.").arg(path));
+        return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path))) {
+        onError(tr("Не удалось открыть %1").arg(path));
     }
 }

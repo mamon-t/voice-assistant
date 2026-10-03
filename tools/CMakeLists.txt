@@ -13,6 +13,9 @@ add_executable(vad-asr-test
     ${CMAKE_SOURCE_DIR}/src/config/ConfigManager.cpp
     ${CMAKE_SOURCE_DIR}/src/core/VoicePipeline.cpp
     ${CMAKE_SOURCE_DIR}/src/text/TextPostProcessor.cpp
+    # цель вывода «заметки» (--notes): тот же FileInjector, что и в приложении.
+    # Зависит только от QtCore, поэтому список библиотек ниже менять не нужно.
+    ${CMAKE_SOURCE_DIR}/src/output/FileInjector.cpp
 
     # header-only / Q_OBJECT заголовки: без них в списке источников AUTOMOC
     # не сгенерирует moc_*.cpp и линковка упадёт на vtable

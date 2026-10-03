@@ -10,6 +10,7 @@
 #include "config/ConfigManager.h"
 #include "config/HotwordsManager.h"
 #include "core/VoicePipeline.h"
+#include "output/FileInjector.h"
 #include "output/XdotoolInjector.h"
 #include "spellcheck/HunspellChecker.h"
 #include "text/TextPostProcessor.h"
@@ -27,6 +28,8 @@ QString commandDescription(const Command& cmd)
 {
     switch (cmd.type) {
     case Command::Type::SetMode:     return QStringLiteral("режим: %1").arg(modeToString(cmd.mode));
+    case Command::Type::SetTarget:   return QStringLiteral("куда писать: %1")
+                                               .arg(outputTargetTitle(cmd.target));
     case Command::Type::DeleteWord:  return QStringLiteral("удалить слово");
     case Command::Type::DeleteLine:  return QStringLiteral("удалить строку");
     case Command::Type::NewLine:     return QStringLiteral("новая строка");
@@ -52,6 +55,22 @@ ApplicationController::ApplicationController(QObject* parent)
     const QString customCommands = m_config->customCommandsPath();
     if (QFile::exists(customCommands)) {
         m_commands->dictionary()->loadFromFile(customCommands);
+    }
+
+    // Слово «заметка» встречается в обычной речи. Если оно мешает, голосовое
+    // переключение цели выключается ([notes] voice_commands=false), а цель
+    // остаётся доступной из трея, по D-Bus и хоткеем.
+    if (!m_config->notesVoiceCommands()) {
+        int removed = 0;
+        const QStringList phrases = CommandDictionary::targetCommandPhrases();
+        for (const QString& phrase : phrases) {
+            if (m_commands->dictionary()->removeCommand(phrase)) {
+                ++removed;
+            }
+        }
+        qInfo().noquote()
+            << QStringLiteral("Голосовые команды заметок выключены ([notes] "
+                              "voice_commands=false), убрано фраз: %1").arg(removed);
     }
 
     // 3. Подсказки пользователя -------------------------------------------------
@@ -81,6 +100,23 @@ ApplicationController::ApplicationController(QObject* parent)
             "Для Wayland/TTY требуется ydotool."));
     }
     m_injector = std::move(injector);
+
+    // 4b. Заметки, привязка к окну, глушитель печати ----------------------------
+    m_clock.start();
+    setupNotes();
+
+    m_pinWindow = m_config->pinWindow();
+    m_typingGuard.setGuardMs(m_config->typingGuardMs());
+    if (m_typingGuard.isEnabled()) {
+        qInfo().noquote()
+            << QStringLiteral("Глушитель печати: %1 мс (аудио не уходит в ASR, пока "
+                              "идёт набор текста)").arg(m_typingGuard.guardMs());
+        if (!isHotkeyActive() && m_config->hotkeyBackend() != QLatin1String("evdev")) {
+            qWarning().noquote()
+                << QStringLiteral("Глушитель печати не сработает: нужны события клавиатуры, "
+                                  "а [hotkey] backend != evdev");
+        }
+    }
 
     // 5. Проверка правописания ---------------------------------------------------
     // Не критично для диктовки: если словаря или библиотеки нет, сообщаем и живём дальше.
@@ -239,6 +275,8 @@ void ApplicationController::startRecording()
         m_audioBuffer.clear();
         m_skipNextText = false;
         m_lastInjected.clear();
+        m_typingGuard.reset();
+        captureTargetWindow();
 
         if (m_audioCapture) m_audioCapture->start();
         m_mode = Mode::Dictation;
@@ -256,6 +294,16 @@ void ApplicationController::stopRecording()
         }
         m_audioBuffer.clear();
         m_mode = Mode::Off;
+
+        // Без этой строки непонятно, не съел ли глушитель печати саму речь:
+        // если секунд много, [audio] typing_guard_ms стоит уменьшить.
+        if (m_typingGuard.droppedChunks() > 0) {
+            qInfo().noquote()
+                << QStringLiteral("Глушитель печати: выброшено %1 кусков аудио (%2 с) — "
+                                  "столько речи не дошло до ASR")
+                       .arg(m_typingGuard.droppedChunks())
+                       .arg(m_typingGuard.droppedSamples() / 16000.0, 0, 'f', 2);
+        }
         qDebug() << "Recording stopped";
         emit modeChanged(m_mode);
     }
@@ -280,6 +328,8 @@ void ApplicationController::setMode(Mode mode)
         m_audioBuffer.clear();
         m_skipNextText = false;
         m_lastInjected.clear();
+        m_typingGuard.reset();
+        captureTargetWindow();
         if (m_audioCapture) m_audioCapture->start();
     } else if (mode == Mode::Off) {
         if (m_pipeline) m_pipeline->flush();
@@ -378,14 +428,23 @@ void ApplicationController::onAudioDataReady(const QByteArray& data, int sampleR
                                                                : QStringLiteral("NO"));
         }
 
-        // Запись тракта для диагностики (работает в любом режиме)
+        // Запись тракта для диагностики (работает в любом режиме).
+        // Пишется ВСЕГДА, в том числе когда глушитель печати выбрасывает аудио:
+        // снимок микрофона обязан показывать весь тракт, иначе его нельзя
+        // сравнивать с тем, что слышит ASR.
         if (m_wavWriter && m_wavWriter->isOpen()) {
             m_wavWriter->write(m_micCheckSource == QLatin1String("raw") ? chunk : processed);
         }
 
         // VAD в sherpa-onnx требует ровно 16 кГц моно int16 и сам не ресемплит
         if (m_mode != Mode::Off && m_pipeline) {
-            m_pipeline->processAudio(processed, sampleRate);
+            if (m_typingGuard.blocked(m_clock.elapsed())) {
+                // Идёт печать: стук клавиш не должен превращаться в текст,
+                // а продиктованное — вклиниваться в напечатанное.
+                m_typingGuard.countDropped(processed.size() / 2);
+            } else {
+                m_pipeline->processAudio(processed, sampleRate);
+            }
         }
     }
 }
@@ -493,14 +552,18 @@ void ApplicationController::setupHotkey()
     }
 
     EvdevHotkeyListener::Options opt;
-    opt.key  = m_config->hotkeyKey();
-    opt.grab = m_config->hotkeyGrab();
+    opt.key         = m_config->hotkeyKey();
+    opt.grab        = m_config->hotkeyGrab();
+    opt.grabDevices = m_config->hotkeyGrabDevices();
 
     auto listener = std::make_unique<EvdevHotkeyListener>(opt);
     connect(listener.get(), &IHotkeyListener::errorOccurred,
             this, &ApplicationController::errorOccurred);
     connect(listener.get(), &IHotkeyListener::pressed,  this, &ApplicationController::onHotkeyPressed);
     connect(listener.get(), &IHotkeyListener::released, this, &ApplicationController::onHotkeyReleased);
+    // Печать пользователя глушит микрофон (см. audio/TypingGuard.h)
+    connect(listener.get(), &IHotkeyListener::keyActivity,
+            this, &ApplicationController::onKeyActivity);
 
     QString err;
     if (!listener->start(&err)) {
@@ -599,6 +662,24 @@ void ApplicationController::onTextReady(const QString& text)
 
 void ApplicationController::injectText(const QString& text)
 {
+    // Цель «заметки»: файл. Ни фокус окна, ни клавиатура, ни буфер обмена
+    // не участвуют, поэтому печатать руками можно параллельно с диктовкой.
+    if (m_target == OutputTarget::Notes) {
+        if (!m_notes || !m_notes->isAvailable()) {
+            reportError(QStringLiteral("Заметки недоступны: файл не открыт "
+                                       "([notes] enabled=false или нет прав на каталог)"));
+            return;
+        }
+        if (!m_notes->typeText(text)) {
+            reportError(QStringLiteral("Не удалось записать заметку: %1")
+                            .arg(m_notes->lastError()));
+            return;
+        }
+        qInfo().noquote() << QStringLiteral("Заметка -> %1").arg(m_notes->filePath());
+        emit noteWritten(m_notes->filePath(), text);
+        return;
+    }
+
     if (!m_injector || !m_injector->isAvailable()) {
         reportError(QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
         return;
@@ -687,6 +768,15 @@ void ApplicationController::executeCommand(const Command& cmd)
         return;
     }
 
+    // Смена цели вывода — это маршрутизация, а не правка текста, поэтому она
+    // обязана работать и в режиме диктовки при editing_in_dictation=false.
+    // Иначе сказанное «заметка» пропало бы именно тогда, когда оно нужно.
+    if (cmd.type == Command::Type::SetTarget) {
+        emit commandExecuted(desc);
+        setOutputTarget(cmd.target);
+        return;
+    }
+
     // Правка текста в режиме диктовки по умолчанию запрещена: иначе продиктованное
     // «удали слово» съедало бы само себя. Включается [commands] editing_in_dictation=true.
     if (m_mode == Mode::Dictation && !m_editCmdsInDictation) {
@@ -696,7 +786,11 @@ void ApplicationController::executeCommand(const Command& cmd)
         return;
     }
 
-    if (!m_injector || !m_injector->isAvailable()) {
+    // Команды правки идут в ту же цель, что и текст: для заметок это файл
+    // («удали слово» сотрёт последнее слово последней заметки, «новая строка»
+    // добавит пустую строку).
+    ITextInjector* out = activeInjector();
+    if (!out) {
         reportError(QStringLiteral("Инжектор недоступен, команда «%1» не выполнена")
                         .arg(desc));
         return;
@@ -704,25 +798,156 @@ void ApplicationController::executeCommand(const Command& cmd)
 
     switch (cmd.type) {
     case Command::Type::DeleteWord:
-        m_injector->sendKey(QStringLiteral("ctrl+BackSpace"));
+        out->sendKey(QStringLiteral("ctrl+BackSpace"));
         break;
     case Command::Type::DeleteLine:
-        m_injector->sendKey(QStringLiteral("shift+Home"));
-        m_injector->sendKey(QStringLiteral("BackSpace"));
+        out->sendKey(QStringLiteral("shift+Home"));
+        out->sendKey(QStringLiteral("BackSpace"));
         break;
     case Command::Type::NewLine:
-        m_injector->sendKey(QStringLiteral("Return"));
+        out->sendKey(QStringLiteral("Return"));
         break;
     case Command::Type::Space:
-        m_injector->sendKey(QStringLiteral("space"));
+        out->sendKey(QStringLiteral("space"));
         break;
     case Command::Type::Punctuation:
-        m_injector->typeText(cmd.argument);
+        out->typeText(cmd.argument);
         break;
     case Command::Type::SetMode:
+    case Command::Type::SetTarget:
     case Command::Type::Unknown:
         break;
     }
 
     emit commandExecuted(desc);
+}
+
+// ---------------------------------------------------------------------------
+// Цель вывода: активное окно или файл заметок
+// ---------------------------------------------------------------------------
+
+void ApplicationController::setupNotes()
+{
+    if (!m_config->notesEnabled()) {
+        qInfo().noquote() << QStringLiteral("Заметки выключены ([notes] enabled=false)");
+        return;
+    }
+
+    FileInjector::Options nopt;
+    nopt.dir            = m_config->notesDir();
+    nopt.file           = m_config->notesFile();
+    nopt.timestampFormat = m_config->notesTimestampFormat();
+    nopt.markdown       = m_config->notesMarkdown();
+    nopt.dayHeader      = m_config->notesDayHeader();
+
+    auto notes = std::make_unique<FileInjector>(nopt);
+    if (!notes->initialize()) {
+        // Не смертельно: диктовка в окно продолжает работать.
+        reportError(QStringLiteral("Заметки недоступны: %1").arg(notes->lastError()));
+        return;
+    }
+    m_notes = std::move(notes);
+
+    if (m_config->notesStartTarget() == QLatin1String("notes")) {
+        m_target = OutputTarget::Notes;
+        qInfo().noquote()
+            << QStringLiteral("Цель вывода по умолчанию — файл заметок: %1")
+                   .arg(m_notes->filePath());
+    }
+}
+
+OutputTarget ApplicationController::outputTarget() const
+{
+    return m_target;
+}
+
+QString ApplicationController::outputTargetName() const
+{
+    return outputTargetToString(m_target);
+}
+
+bool ApplicationController::isNotesAvailable() const
+{
+    return m_notes && m_notes->isAvailable();
+}
+
+QString ApplicationController::notesFilePath() const
+{
+    return m_notes ? m_notes->filePath() : QString();
+}
+
+bool ApplicationController::setOutputTarget(OutputTarget target)
+{
+    if (target == OutputTarget::Notes && !isNotesAvailable()) {
+        reportError(QStringLiteral("Заметки недоступны: включите [notes] enabled "
+                                   "и проверьте права на каталог %1")
+                        .arg(m_config ? m_config->notesDir() : QString()));
+        return false;
+    }
+    if (m_target == target) {
+        return true;
+    }
+
+    m_target = target;
+    // Пробел между сегментами считается от последней вставки В ОКНО; для файла
+    // каждая запись — своя строка, поэтому хвост сбрасываем.
+    m_lastInjected.clear();
+
+    qInfo().noquote()
+        << QStringLiteral("Куда писать: %1%2")
+               .arg(outputTargetTitle(m_target),
+                    m_target == OutputTarget::Notes && m_notes
+                        ? QStringLiteral(" (%1)").arg(m_notes->filePath())
+                        : QString());
+    emit outputTargetChanged(m_target);
+    return true;
+}
+
+bool ApplicationController::toggleOutputTarget()
+{
+    return setOutputTarget(m_target == OutputTarget::Notes ? OutputTarget::Focus
+                                                           : OutputTarget::Notes);
+}
+
+ITextInjector* ApplicationController::activeInjector() const
+{
+    if (m_target == OutputTarget::Notes) {
+        return (m_notes && m_notes->isAvailable()) ? m_notes.get() : nullptr;
+    }
+    return (m_injector && m_injector->isAvailable()) ? m_injector.get() : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Привязка вставки к окну и глушитель печати
+// ---------------------------------------------------------------------------
+
+void ApplicationController::captureTargetWindow()
+{
+    if (!m_pinWindow) {
+        return;
+    }
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    if (!xdotool) {
+        return;
+    }
+
+    const QString wid = XdotoolInjector::activeWindowId();
+    if (wid.isEmpty()) {
+        qWarning().noquote()
+            << QStringLiteral("pin_window: не удалось определить активное окно, "
+                              "вставка пойдёт туда, где будет фокус");
+        xdotool->clearPinnedWindow();
+        m_pinnedWindow.clear();
+        return;
+    }
+
+    m_pinnedWindow = wid;
+    xdotool->setPinnedWindow(wid);
+}
+
+void ApplicationController::onKeyActivity()
+{
+    if (m_typingGuard.isEnabled()) {
+        m_typingGuard.noteKeyActivity(m_clock.elapsed());
+    }
 }

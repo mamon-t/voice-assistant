@@ -24,6 +24,12 @@ public:
     // Стандартный набор русских команд (см. loadDefaults() в .cpp)
     void loadDefaults();
 
+    // Фразы переключения цели вывода («заметка», «в редактор»). Вынесены
+    // отдельно, потому что их можно выключить ([notes] voice_commands=false):
+    // слово «заметка» встречается в обычной речи, и если оно мешает, цель
+    // переключают из трея или по D-Bus.
+    static QStringList targetCommandPhrases();
+
     // Дочитать команды из файла. Формат строк:
     //   фраза = тип[:аргумент]
     //   удали слово = delete-word
@@ -34,6 +40,7 @@ public:
     int loadFromFile(const QString& path);
 
     void addCommand(const QString& phrase, Command command);
+    bool removeCommand(const QString& phrase);   // true, если такая команда была
     void clear();
 
     // Поиск по уже нормализованной фразе.

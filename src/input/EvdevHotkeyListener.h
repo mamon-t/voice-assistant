@@ -36,7 +36,21 @@ public:
 
     struct Options {
         QString key = QStringLiteral("KEY_F8");   // "F8", "KEY_F8", "ctrl+space", "66"
-        bool    grab = true;                      // EVIOCGRAB: не отдавать клавишу системе
+
+        // EVIOCGRAB: не отдавать клавишу системе.
+        //
+        // По умолчанию false, и это принципиально: перехват ЭКСКЛЮЗИВНЫЙ,
+        // X-сервер перестаёт получать с устройства ВСЕ клавиши, а не только
+        // нашу. Раньше здесь стояло true — при первом же запуске без
+        // скопированного settings.ini клавиатура ушла бы из-под X.
+        bool    grab = false;
+
+        // Сужает grab до перечисленных устройств (подстрока имени или пути:
+        // "footswitch", "/dev/input/event7"). Пустой список при grab=true
+        // означает «только устройства, не похожие на полноценную клавиатуру»
+        // (см. looksLikeFullKeyboard) — то есть педаль или вторую клавиатуру,
+        // но ни в коем случае не основную.
+        QStringList grabDevices;
     };
 
     explicit EvdevHotkeyListener(QObject* parent = nullptr);
@@ -68,6 +82,27 @@ public:
 
     static quint32 modifierBitForKey(int code);
     static int keyNameToCode(const QString& name);   // -1, если имя неизвестно
+
+    // Попадает ли устройство под список grab_devices: совпадение подстроки
+    // (без учёта регистра) с именем устройства или с его путём.
+    static bool matchesDeviceSpec(const QStringList& specs,
+                                  const QString& deviceName,
+                                  const QString& devicePath);
+
+    // Похоже ли устройство на полноценную клавиатуру: есть буквы и цифры.
+    // keyBits — маска EVIOCGBIT(EV_KEY, ...), numBytes — её размер.
+    // Используется как предохранитель: такое устройство не перехватывается
+    // эксклюзивно, даже если в конфиге стоит grab=true и список пуст.
+    static bool looksLikeFullKeyboard(const unsigned char* keyBits, int numBytes);
+
+    // Перехватывать ли устройство эксклюзивно. Вся политика grab'а в одной
+    // функции, чтобы её можно было проверить тестами без /dev/input.
+    static bool shouldGrab(const Options& options,
+                           const QString& deviceName,
+                           const QString& devicePath,
+                           const unsigned char* keyBits,
+                           int numBytes,
+                           QString* reason = nullptr);
 
 private:
     void onDeviceReadable(int fd);

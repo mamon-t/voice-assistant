@@ -23,10 +23,18 @@ public slots:
     bool isMicChecking() const;
     QString hotkeyStatus() const;
 
+    // --- цель вывода: активное окно или файл заметок ---
+    void    setOutputTarget(const QString& target);   // "focus" | "notes"
+    QString getOutputTarget() const;
+    void    toggleOutputTarget();
+    QString notesFile() const;                        // путь к файлу заметок, "" если выключены
+
 signals:
     void modeChanged(const QString& mode);
     void textRecognized(const QString& text);
     void errorOccurred(const QString& message);
+    void outputTargetChanged(const QString& target);
+    void noteWritten(const QString& path, const QString& text);
 
 private:
     ApplicationController* m_controller;

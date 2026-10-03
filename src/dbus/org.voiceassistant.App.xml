@@ -23,6 +23,19 @@
     <method name="hotkeyStatus">
       <arg name="status" type="s" direction="out"/>
     </method>
+    <!-- Куда писать распознанный текст: "focus" (активное окно) или "notes"
+         (файл заметок). Заметки не трогают ни фокус, ни клавиатуру, ни буфер
+         обмена, поэтому их можно диктовать, продолжая печатать руками. -->
+    <method name="setOutputTarget">
+      <arg name="target" type="s" direction="in"/>   <!-- "focus" | "notes" -->
+    </method>
+    <method name="getOutputTarget">
+      <arg name="target" type="s" direction="out"/>
+    </method>
+    <method name="toggleOutputTarget"/>
+    <method name="notesFile">
+      <arg name="path" type="s" direction="out"/>    <!-- "" если заметки выключены -->
+    </method>
     
     <!-- Сигналы -->
     <signal name="modeChanged">
@@ -33,6 +46,13 @@
     </signal>
     <signal name="errorOccurred">
       <arg name="message" type="s"/>
+    </signal>
+    <signal name="outputTargetChanged">
+      <arg name="target" type="s"/>                  <!-- "focus" | "notes" -->
+    </signal>
+    <signal name="noteWritten">
+      <arg name="path" type="s"/>
+      <arg name="text" type="s"/>
     </signal>
   </interface>
 </node>

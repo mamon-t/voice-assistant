@@ -2,7 +2,7 @@
 // (SileroVad -> IRecognizer -> TextPostProcessor), без UI и микрофона.
 //
 //   vad-asr-test <file.wav> --config <settings.ini> [--profile <имя>] [--hotwords <file>]
-//                             [--threads N] [--no-punct]
+//                             [--threads N] [--no-punct] [--notes] [--notes-file <путь>]
 //
 //   vad-asr-test <file.wav> <silero_vad.onnx> transducer <enc> <dec> <joiner> <tokens>
 //                          [hotwords-file] [bpe-vocab]
@@ -14,6 +14,7 @@
 
 #include "config/ConfigManager.h"
 #include "core/VoicePipeline.h"
+#include "output/FileInjector.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -156,7 +158,7 @@ void usage(const QString& prog)
     std::fprintf(stderr,
         "Usage:\n"
         "  %s <file.wav> --config <settings.ini> [--profile <name>] [--hotwords <file>]\n"
-        "                [--threads N] [--no-punct]\n"
+        "                [--threads N] [--no-punct] [--notes] [--notes-file <path>]\n"
         "  %s <file.wav> <silero_vad.onnx> transducer <enc> <dec> <joiner> <tokens>"
         " [hotwords-file] [bpe-vocab]\n"
         "  %s <file.wav> <silero_vad.onnx> nemo-ctc <model> <tokens>\n"
@@ -189,10 +191,14 @@ int main(int argc, char** argv)
 
     VoicePipeline::Settings settings;
     QString hotwordsFile;
+    std::unique_ptr<ConfigManager> cfgPtr;   // нужен для --notes вне блока config
+    bool   writeNotes = false;
+    QString notesFileOverride;
 
     if (a.at(2) == QLatin1String("--config")) {
         // --------- БОЕВОЙ РЕЖИМ: всё из settings.ini ---------
-        const ConfigManager cfg(a.at(3));
+        cfgPtr = std::make_unique<ConfigManager>(a.at(3));
+        const ConfigManager& cfg = *cfgPtr;
         settings = VoicePipeline::loadSettings(cfg);
 
         for (int i = 4; i < a.size(); ++i) {
@@ -203,6 +209,11 @@ int main(int argc, char** argv)
                 hotwordsFile = a.at(++i);
             } else if (k == QLatin1String("--threads") && i + 1 < a.size()) {
                 settings.asr.numThreads = a.at(++i).toInt();
+            } else if (k == QLatin1String("--notes")) {
+                writeNotes = true;
+            } else if (k == QLatin1String("--notes-file") && i + 1 < a.size()) {
+                writeNotes       = true;
+                notesFileOverride = a.at(++i);
             } else if (k == QLatin1String("--no-punct")) {
                 settings.text.voicePunctuation    = false;
                 settings.text.capitalizeSentences = false;
@@ -262,6 +273,31 @@ int main(int argc, char** argv)
         }
     }
 
+    // --------- заметки: тот же путь вывода, что и в приложении ---------
+    // Нужен не только для теста: записанный микрофоном WAV (--record или
+    // «Проверить микрофон») можно прогнать и сразу получить заметки в файле,
+    // без микрофона и без X-сервера.
+    std::unique_ptr<FileInjector> notesOut;
+    if (writeNotes) {
+        if (!cfgPtr) {
+            std::fprintf(stderr, "--notes работает только в режиме --config\n");
+            return 2;
+        }
+        FileInjector::Options nopt;
+        nopt.dir            = cfgPtr->notesDir();
+        nopt.file           = notesFileOverride.isEmpty() ? cfgPtr->notesFile()
+                                                          : notesFileOverride;
+        nopt.timestampFormat = cfgPtr->notesTimestampFormat();
+        nopt.markdown       = cfgPtr->notesMarkdown();
+        nopt.dayHeader      = cfgPtr->notesDayHeader();
+        notesOut = std::make_unique<FileInjector>(nopt);
+        if (!notesOut->initialize()) {
+            std::fprintf(stderr, "--notes: %s\n", qPrintable(notesOut->lastError()));
+            return 1;
+        }
+        std::printf("NOTES: %s\n", qPrintable(notesOut->filePath()));
+    }
+
     // --------- пайплайн ---------
     VoicePipeline pipeline(settings);
 
@@ -286,6 +322,9 @@ int main(int argc, char** argv)
     });
     QObject::connect(&pipeline, &VoicePipeline::textReady, [&](const QString& text) {
         std::printf("  #%d  text: %s\n", segmentIndex, qPrintable(text));
+        if (notesOut && !notesOut->typeText(text)) {
+            std::fprintf(stderr, "--notes: %s\n", qPrintable(notesOut->lastError()));
+        }
         std::fflush(stdout);
     });
 
@@ -330,6 +369,12 @@ int main(int argc, char** argv)
     std::printf("\nSegments: %d | audio %.2f s | wall %.0f ms | ASR %.0f ms | RTF %.2f\n",
                 segmentIndex, wav.seconds, static_cast<double>(total.elapsed()), asrTotalMs,
                 wav.seconds > 0.0 ? (asrTotalMs / 1000.0) / wav.seconds : 0.0);
+
+    if (notesOut) {
+        std::printf("Notes : %lld записей -> %s\n",
+                    static_cast<long long>(notesOut->entries()),
+                    qPrintable(notesOut->filePath()));
+    }
 
     return segmentIndex > 0 ? 0 : 1;
 }

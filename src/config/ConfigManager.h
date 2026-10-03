@@ -73,6 +73,20 @@ public:
     bool    preserveClipboard() const; // [output] preserve_clipboard
     bool    spaceBetweenSegments() const; // [output] space_between_segments
     int     clipboardRestoreMs() const;// [output] clipboard_restore_ms
+    // Привязывать вставку к окну, которое было активным в НАЧАЛЕ записи, а не
+    // к тому, что в фокусе сейчас. Нужно, чтобы можно было переключиться
+    // в другой файл и печатать там, пока диктовка продолжается.
+    bool    pinWindow() const;           // [output] pin_window
+
+    // --- заметки: вторая цель вывода (OutputTarget::Notes) ---
+    bool    notesEnabled() const;          // [notes] enabled
+    QString notesDir() const;              // [notes] dir   (один файл на день)
+    QString notesFile() const;             // [notes] file  (явный файл вместо ежедневного)
+    QString notesTimestampFormat() const;  // [notes] timestamp ("HH:mm:ss", пусто = без метки)
+    bool    notesMarkdown() const;         // [notes] markdown
+    bool    notesDayHeader() const;        // [notes] day_header
+    bool    notesVoiceCommands() const;    // [notes] voice_commands («заметка»/«в редактор»)
+    QString notesStartTarget() const;      // [notes] start_target: focus | notes
 
     // --- команды ---
     bool    editingCommandsInDictation() const;  // [commands] editing_in_dictation
@@ -93,10 +107,19 @@ public:
     QString hotkeyBackend() const;      // [hotkey] backend: evdev | off
     QString hotkeyKey() const;          // [hotkey] key: KEY_F8, ctrl+space, ...
     bool    hotkeyGrab() const;         // [hotkey] grab: перехватывать клавишу (EVIOCGRAB)
+    // Список устройств, которые разрешено перехватывать эксклюзивно (подстрока
+    // имени или пути: "footswitch", "/dev/input/event7"). Пусто = grab
+    // применяется только к устройствам, не похожим на полноценную клавиатуру.
+    // Это защита от того, чтобы основная клавиатура ушла из-под X.
+    QStringList hotkeyGrabDevices() const;   // [hotkey] grab_devices
     QString hotkeyMode() const;         // [hotkey] mode: push_to_talk | toggle
 
     // --- отладка ---
     bool audioDebugLog() const;        // [audio] debug_log
+
+    // Глушить микрофон, пока идёт печать (см. audio/TypingGuard.h).
+    // 0 = выключено. Работает только при [hotkey] backend=evdev.
+    int  typingGuardMs() const;        // [audio] typing_guard_ms
 
 private:
     QSettings m_settings;

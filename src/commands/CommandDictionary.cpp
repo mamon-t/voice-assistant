@@ -30,6 +30,10 @@ bool parseCommandSpec(const QString& spec, Command* out)
         else if (arg == QLatin1String("off"))        m = Mode::Off;
         else return false;
         *out = Command::setMode(m);
+    } else if (type == QLatin1String("set-target")) {
+        // "set-target:notes" / "set-target:focus"
+        if (arg.isEmpty()) return false;
+        *out = Command::setTarget(stringToOutputTarget(arg));
     } else if (type == QLatin1String("delete-word")) {
         *out = Command::deleteWord();
     } else if (type == QLatin1String("delete-line")) {
@@ -46,6 +50,23 @@ bool parseCommandSpec(const QString& spec, Command* out)
     }
     return true;
 }
+
+// Фраза -> цель. Таблица одна и для loadDefaults(), и для targetCommandPhrases(),
+// чтобы список фраз не разъезжался с их назначением.
+struct TargetPhrase {
+    const char*  phrase;
+    OutputTarget target;
+};
+
+const TargetPhrase kTargetPhrases[] = {
+    { "заметка",         OutputTarget::Notes },
+    { "в заметки",       OutputTarget::Notes },
+    { "пиши в заметки",  OutputTarget::Notes },
+    { "заметки",         OutputTarget::Notes },
+    { "в редактор",      OutputTarget::Focus },
+    { "в окно",          OutputTarget::Focus },
+    { "диктовка в окно", OutputTarget::Focus },
+};
 
 }  // namespace
 
@@ -68,6 +89,14 @@ void CommandDictionary::loadDefaults()
     addCommand(QStringLiteral("выключить"),              Command::setMode(Mode::Off));
     addCommand(QStringLiteral("стоп"),                   Command::setMode(Mode::Off));
     addCommand(QStringLiteral("режим выключен"),         Command::setMode(Mode::Off));
+
+    // --- цель вывода: окно или файл заметок ---
+    // Работают в любом режиме, включая диктовку: это не правка текста, а
+    // маршрутизация, поэтому ApplicationController обрабатывает их ДО запрета
+    // editing_in_dictation (иначе сказанное «заметка» в диктовке пропало бы).
+    for (const TargetPhrase& t : kTargetPhrases) {
+        addCommand(QString::fromUtf8(t.phrase), Command::setTarget(t.target));
+    }
 
     // --- правка текста ---
     addCommand(QStringLiteral("удали слово"),            Command::deleteWord());
@@ -135,6 +164,16 @@ int CommandDictionary::loadFromFile(const QString& path)
     return added;
 }
 
+QStringList CommandDictionary::targetCommandPhrases()
+{
+    QStringList out;
+    out.reserve(static_cast<int>(sizeof(kTargetPhrases) / sizeof(kTargetPhrases[0])));
+    for (const TargetPhrase& t : kTargetPhrases) {
+        out << QString::fromUtf8(t.phrase);
+    }
+    return out;
+}
+
 void CommandDictionary::addCommand(const QString& phrase, Command command)
 {
     const QString k = key(phrase);
@@ -142,6 +181,11 @@ void CommandDictionary::addCommand(const QString& phrase, Command command)
         return;
     }
     m_commands.insert(k, command);
+}
+
+bool CommandDictionary::removeCommand(const QString& phrase)
+{
+    return m_commands.remove(key(phrase)) > 0;
 }
 
 void CommandDictionary::clear()

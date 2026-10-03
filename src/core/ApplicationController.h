@@ -1,13 +1,16 @@
 #pragma once
 
-#include <QObject>
 #include <QByteArray>
+#include <QElapsedTimer>
+#include <QObject>
 #include <QString>
 #include <QStringList>
 #include <memory>
 
+#include "audio/TypingGuard.h"
 #include "core/Command.h"
 #include "core/Mode.h"
+#include "core/OutputTarget.h"
 
 class IAudioCapture;
 class Agc;
@@ -19,6 +22,7 @@ class HotwordsManager;
 class ISpellChecker;
 class IHotkeyListener;
 class WavWriter;
+class FileInjector;
 
 // Сердце приложения: аудиопоток -> AGC -> VoicePipeline (VAD -> ASR -> пунктуация),
 // затем маршрутизация результата: команда или вставка текста.
@@ -59,6 +63,20 @@ public:
     bool    isHotkeyActive() const;
     QString hotkeyDescription() const;
 
+    // --- цель вывода: активное окно или файл заметок ---
+    //
+    // Зачем: диктовка в окно конфликтует с ручной печатью. Результат приходит
+    // через 0.5–2 с после фразы и уходит в то окно, которое в фокусе СЕЙЧАС,
+    // а способ «буфер обмена + Ctrl+V» ещё и затирает буфер. Заметки в файл
+    // не зависят ни от фокуса, ни от клавиатуры, ни от буфера: можно
+    // диктовать пометки к файлу, с которым работаешь, продолжая печатать.
+    OutputTarget outputTarget() const;
+    bool        setOutputTarget(OutputTarget target);
+    bool        toggleOutputTarget();
+    QString     outputTargetName() const;      // "focus" | "notes" — для D-Bus
+    QString     notesFilePath() const;         // куда пишутся заметки (пусто, если выключены)
+    bool        isNotesAvailable() const;
+
     // Последняя ошибка, в том числе возникшая в конструкторе (тогда её ещё
     // некому было принять сигналом). Пустая строка — ошибок не было.
     QString lastError() const { return m_lastError; }
@@ -80,22 +98,32 @@ signals:
     void spellcheckFinished(const QString& text, const QStringList& errors);
     void micCheckStarted(const QString& path);
     void micCheckFinished(const QString& path, double seconds);
+    void outputTargetChanged(OutputTarget target);
+    void noteWritten(const QString& path, const QString& text);
 
 private slots:
     void onAudioDataReady(const QByteArray& data, int sampleRate);
     void onAudioError(const QString& message);
     void onRawTextRecognized(const QString& raw);    // до постобработки — ищем команду
     void onTextReady(const QString& text);           // после постобработки — вставляем
+    void onKeyActivity();                            // пользователь печатает — см. TypingGuard
 
 private:
     bool buildPipeline();
     void applyHotwords();
     void executeCommand(const Command& cmd);
     void injectText(const QString& text);
+    // Инжектор текущей цели вывода: файл заметок или окно. nullptr, если
+    // соответствующий вывод недоступен.
+    ITextInjector* activeInjector() const;
     void runSpellcheck(const QString& text);
     void setupHotkey();
     void onHotkeyPressed();
     void onHotkeyReleased();
+    void setupNotes();
+    // [output] pin_window: запомнить окно, активное в НАЧАЛЕ записи, и вставлять
+    // в него, даже если фокус ушёл в другой файл.
+    void captureTargetWindow();
 
     Mode m_mode = Mode::Off;
 
@@ -109,10 +137,17 @@ private:
     std::unique_ptr<ISpellChecker>   m_spellChecker;
     std::unique_ptr<IHotkeyListener> m_hotkey;
     std::unique_ptr<WavWriter>       m_wavWriter;
+    std::unique_ptr<FileInjector>    m_notes;
 
     bool    m_micCheckOwnsCapture = false;   // захват запущен специально для записи
     QString m_micCheckSource;                // "agc" | "raw"
     QString m_hotkeyMode;                    // "push_to_talk" | "toggle"
+
+    OutputTarget  m_target = OutputTarget::Focus;
+    TypingGuard   m_typingGuard;             // глушим микрофон, пока идёт печать
+    QElapsedTimer m_clock;                   // единые часы для TypingGuard
+    bool          m_pinWindow = false;       // [output] pin_window
+    QString       m_pinnedWindow;            // WID окна, в которое вставляем
 
     QByteArray m_audioBuffer;
     static constexpr int TARGET_CHUNK_SIZE = 1600; // 50 мс при 16 кГц

@@ -16,13 +16,17 @@
 
 #include "audio/QtAudioCapture.h"
 #include "audio/WavWriter.h"
+#include "commands/CommandDictionary.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
 #include "input/EvdevHotkeyListener.h"
+#include "output/FileInjector.h"
 #include "output/XdotoolInjector.h"
 
 #include <QTimer>
 #include "spellcheck/HunspellChecker.h"
+
+#include <linux/input-event-codes.h>
 
 #include <cstdio>
 #include <memory>
@@ -84,6 +88,35 @@ int countLines(const QString& path)
         }
     }
     return n;
+}
+
+// Клавиша, которую с большой вероятностью использует само приложение или DE.
+// Без EVIOCGRAB она доходит и до активного окна — поэтому для хоткея микрофона
+// лучше брать то, чем никто не пользуется. Перехватывать из-за этого ВСЮ
+// клавиатуру (grab=true) нельзя: диктовка не должна мешать печатать.
+bool keyIsLikelyInUse(const QString& spec)
+{
+    int code = -1;
+    quint32 mods = EvdevHotkeyListener::ModNone;
+    if (!EvdevHotkeyListener::parseKey(spec, &code, &mods, nullptr)) {
+        return false;          // спецификация и так будет показана как ошибочная
+    }
+    if (mods != EvdevHotkeyListener::ModNone) {
+        return false;          // комбинация — почти наверняка свободна
+    }
+    if (code >= KEY_F13 && code <= KEY_F24) {
+        return false;
+    }
+    switch (code) {
+    case KEY_SCROLLLOCK:
+    case KEY_PAUSE:
+    case KEY_MICMUTE:
+    case KEY_RIGHTCTRL:
+    case KEY_RIGHTALT:
+        return false;
+    default:
+        return true;
+    }
 }
 
 int runDiagnostics(const QStringList& args)
@@ -225,10 +258,19 @@ int runDiagnostics(const QStringList& args)
                 : cfg->injectorMethod() == QLatin1String("clipboard") ? XdotoolInjector::Method::Clipboard
                                                                       : XdotoolInjector::Method::Auto);
     inj.initialize();
-    std::printf("  метод   : %s (preserve_clipboard=%s, restore=%d мс)\n\n",
+    std::printf("  метод   : %s (preserve_clipboard=%s, restore=%d мс)\n",
                 qPrintable(inj.backendName()),
                 cfg->preserveClipboard() ? "true" : "false",
                 cfg->clipboardRestoreMs());
+    std::printf("  pin_window: %s\n", cfg->pinWindow() ? "true" : "false");
+    if (cfg->pinWindow()) {
+        std::printf("              -> вставка идёт в окно, активное В НАЧАЛЕ записи;\n"
+                    "                 можно переключиться и печатать в другом файле.\n"
+                    "                 xdotool --window работает через XSendEvent,\n"
+                    "                 некоторые приложения такие события игнорируют —\n"
+                    "                 проверьте на своём редакторе.\n");
+    }
+    std::printf("\n");
 
     // --- прочее ---
     // --- правописание ---
@@ -266,8 +308,9 @@ int runDiagnostics(const QStringList& args)
         std::printf("  backend   : off (управление из трея и по D-Bus)\n");
     } else {
         EvdevHotkeyListener::Options hopt;
-        hopt.key  = cfg->hotkeyKey();
-        hopt.grab = cfg->hotkeyGrab();
+        hopt.key         = cfg->hotkeyKey();
+        hopt.grab        = cfg->hotkeyGrab();
+        hopt.grabDevices = cfg->hotkeyGrabDevices();
         EvdevHotkeyListener hk(hopt);
         QString hkError;
         // configure() не трогает /dev/input — валидируется только спецификация клавиши
@@ -281,8 +324,26 @@ int runDiagnostics(const QStringList& args)
         std::printf("  режим     : %s, grab=%s\n",
                     qPrintable(cfg->hotkeyMode()),
                     cfg->hotkeyGrab()
-                        ? "true (ЭКСКЛЮЗИВНО: клавиатура уйдёт из-под X!)"
-                        : "false");
+                        ? "true (ЭКСКЛЮЗИВНО для перечисленных устройств)"
+                        : "false (только наблюдение — клавиатура не блокируется)");
+        const QStringList grabDevs = cfg->hotkeyGrabDevices();
+        std::printf("  grab_devices: %s\n",
+                    grabDevs.isEmpty() ? qPrintable(QStringLiteral("<не задан>"))
+                                       : qPrintable(grabDevs.join(QStringLiteral(", "))));
+        if (cfg->hotkeyGrab()) {
+            std::printf("              -> перехватывается ТОЛЬКО перечисленное, либо\n"
+                        "                 устройства, не похожие на полноценную клавиатуру:\n"
+                        "                 основная клавиатура останется рабочей в любом случае.\n");
+        }
+        if (!cfg->hotkeyGrab() && keyIsLikelyInUse(cfg->hotkeyKey())) {
+            std::printf("  совет     : '%s' скорее всего занята приложениями, а без grab\n"
+                        "              клавиша доходит и до активного окна. Свободные варианты:\n"
+                        "              F13-F24, Scroll Lock, Pause, Mic Mute, правый Ctrl\n"
+                        "              или комбинация (ctrl+alt+f8). Блокировать ради этого\n"
+                        "              клавиатуру НЕ нужно: печатать во время диктовки\n"
+                        "              должно быть можно всегда.\n",
+                        qPrintable(cfg->hotkeyKey()));
+        }
         if (QFileInfo::exists(QStringLiteral("/dev/input"))) {
             const QDir di(QStringLiteral("/dev/input"));
             const QStringList events =
@@ -307,6 +368,52 @@ int runDiagnostics(const QStringList& args)
     }
     std::printf("\n");
 
+    // --- заметки (цель вывода "notes") ---
+    std::printf("Заметки\n");
+    if (!cfg->notesEnabled()) {
+        std::printf("  выключено ([notes] enabled=false)\n");
+    } else {
+        const QString notesFile = cfg->notesFile();
+        const QString notesDir  = notesFile.isEmpty() ? cfg->notesDir()
+                                                      : QFileInfo(notesFile).absolutePath();
+        std::printf("  каталог   : %s  %s\n", qPrintable(notesDir),
+                    QDir(notesDir).exists()
+                        ? (QFileInfo(notesDir).isWritable() ? "[есть, доступен для записи]"
+                                                            : "[есть, НЕТ прав на запись]")
+                        : "[будет создан]");
+        if (QDir(notesDir).exists() && !QFileInfo(notesDir).isWritable()) {
+            ++problems;
+        }
+        FileInjector::Options nopt;
+        nopt.dir            = cfg->notesDir();
+        nopt.file           = cfg->notesFile();
+        nopt.timestampFormat = cfg->notesTimestampFormat();
+        nopt.markdown       = cfg->notesMarkdown();
+        nopt.dayHeader      = cfg->notesDayHeader();
+        const FileInjector probe(nopt);
+        const QString target = probe.filePath();
+        std::printf("  файл      : %s  %s\n", qPrintable(target),
+                    QFileInfo::exists(target) ? "[есть]" : "[появится после первой записи]");
+        std::printf("  метка     : %s, markdown=%s, заголовок дня=%s\n",
+                    nopt.timestampFormat.isEmpty()
+                        ? qPrintable(QStringLiteral("нет"))
+                        : qPrintable(nopt.timestampFormat),
+                    nopt.markdown ? "true" : "false",
+                    nopt.dayHeader ? "true" : "false");
+        std::printf("  команды   : %s\n",
+                    cfg->notesVoiceCommands()
+                        ? qPrintable(CommandDictionary::targetCommandPhrases()
+                                         .join(QStringLiteral(", ")))
+                        : qPrintable(QStringLiteral("выключены ([notes] voice_commands=false) — "
+                                                      "переключение из трея и по D-Bus")));
+        std::printf("  цель старта: %s\n", qPrintable(cfg->notesStartTarget()));
+        std::printf("  из консоли : ./src/voice-assistant --note \"текст заметки\"\n");
+        std::printf("  по D-Bus    : dbus-send --session --type=method_call "
+                    "--dest=org.voiceassistant.App /org/voiceassistant/App "
+                    "org.voiceassistant.App.setOutputTarget string:notes\n");
+    }
+    std::printf("\n");
+
     // --- запись микрофона ---
     std::printf("Запись микрофона\n");
     const QString recDir = cfg->micCheckDir();
@@ -324,8 +431,14 @@ int runDiagnostics(const QStringList& args)
                 cfg->voicePunctuation() ? "true" : "false");
     std::printf("Команды       : editing_in_dictation=%s\n",
                 cfg->editingCommandsInDictation() ? "true" : "false");
-    std::printf("Аудио         : debug_log=%s\n",
-                cfg->audioDebugLog() ? "true" : "false");
+    std::printf("Аудио         : debug_log=%s typing_guard_ms=%d%s\n",
+                cfg->audioDebugLog() ? "true" : "false",
+                cfg->typingGuardMs(),
+                cfg->typingGuardMs() > 0
+                    ? (cfg->hotkeyBackend() == QLatin1String("evdev")
+                           ? " (микрофон глушится, пока идёт печать)"
+                           : " (НЕ СРАБОТАЕТ: нужен [hotkey] backend=evdev)")
+                    : " (выключен)");
     std::printf("Сессия        : XDG_SESSION_TYPE=%s\n",
                 qPrintable(qEnvironmentVariable("XDG_SESSION_TYPE",
                                                 QStringLiteral("(не задан)"))));
@@ -426,6 +539,55 @@ int main(int argc, char *argv[])
 
         app.exec();
         return exitCode;
+    }
+
+    // --note <текст> [--config <путь>] — дописать строку в файл заметок и выйти.
+    // Проверяет всю цепочку «конфиг -> FileInjector -> файл» без микрофона,
+    // без GUI и без X-сервера: удобно убедиться, куда именно пойдут заметки,
+    // до того как это понадобится в разговоре.
+    const int noteIdx = rawArgs.indexOf(QStringLiteral("--note"));
+    if (noteIdx >= 0) {
+        QCoreApplication app(argc, argv);
+        const QStringList args = QCoreApplication::arguments();
+
+        const QString text = (noteIdx + 1 < args.size()) ? args.at(noteIdx + 1) : QString();
+        if (text.trimmed().isEmpty()) {
+            std::fprintf(stderr,
+                         "--note: нужен текст заметки.\n"
+                         "Пример: ./src/voice-assistant --note \"проверить AGC на тихом микрофоне\"\n");
+            return 2;
+        }
+
+        QString iniPath;
+        const int ci = args.indexOf(QStringLiteral("--config"));
+        if (ci >= 0 && ci + 1 < args.size()) {
+            iniPath = args.at(ci + 1);
+        }
+        std::unique_ptr<ConfigManager> cfg(iniPath.isEmpty() ? new ConfigManager()
+                                                            : new ConfigManager(iniPath));
+        if (!cfg->notesEnabled()) {
+            std::fprintf(stderr, "--note: заметки выключены ([notes] enabled=false)\n");
+            return 1;
+        }
+
+        FileInjector::Options nopt;
+        nopt.dir            = cfg->notesDir();
+        nopt.file           = cfg->notesFile();
+        nopt.timestampFormat = cfg->notesTimestampFormat();
+        nopt.markdown       = cfg->notesMarkdown();
+        nopt.dayHeader      = cfg->notesDayHeader();
+
+        FileInjector notes(nopt);
+        if (!notes.initialize()) {
+            std::fprintf(stderr, "--note: %s\n", qPrintable(notes.lastError()));
+            return 1;
+        }
+        if (!notes.typeText(text)) {
+            std::fprintf(stderr, "--note: %s\n", qPrintable(notes.lastError()));
+            return 1;
+        }
+        std::printf("Записано: %s\n", qPrintable(notes.filePath()));
+        return 0;
     }
 
     QApplication app(argc, argv);

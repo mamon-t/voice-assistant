@@ -90,20 +90,65 @@ void XdotoolInjector::setClipboardRestoreMs(int ms)
     m_clipboardRestoreMs = (ms >= 0) ? ms : 1000;
 }
 
+void XdotoolInjector::setPinnedWindow(const QString& windowId)
+{
+    const QString wid = windowId.trimmed();
+    if (wid == m_pinnedWindow) {
+        return;
+    }
+    m_pinnedWindow = wid;
+    if (wid.isEmpty()) {
+        qDebug().noquote() << QStringLiteral("XdotoolInjector: привязка к окну снята, "
+                                            "вставка идёт в активное окно");
+    } else {
+        qInfo().noquote() << QStringLiteral("XdotoolInjector: вставка привязана к окну %1. "
+                                           "Если приложение игнорирует ввод — выключите "
+                                           "[output] pin_window (xdotool --window работает "
+                                           "через XSendEvent, его принимают не все)")
+                                 .arg(wid);
+    }
+}
+
+QString XdotoolInjector::activeWindowId()
+{
+    const QString xdotool = QStandardPaths::findExecutable(QStringLiteral("xdotool"));
+    if (xdotool.isEmpty()) {
+        return QString();
+    }
+    QProcess proc;
+    proc.setProgram(xdotool);
+    proc.setArguments({QStringLiteral("getactivewindow")});
+    proc.start();
+    if (!proc.waitForStarted(2000) || !proc.waitForFinished(2000)) {
+        proc.kill();
+        proc.waitForFinished(200);
+        return QString();
+    }
+    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+        return QString();
+    }
+    return QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+}
+
 QString XdotoolInjector::backendName() const
 {
     if (m_dryRun) {
         return QStringLiteral("dry-run");
     }
     const bool haveClipboard = !m_clipboardTool.isEmpty();
+    QString name;
     switch (m_method) {
-    case Method::XdotoolType: return QStringLiteral("xdotool type");
-    case Method::Clipboard:   return haveClipboard ? QStringLiteral("clipboard+ctrl+v")
-                                                   : QStringLiteral("xdotool type (буфер недоступен)");
-    case Method::Auto:        return haveClipboard ? QStringLiteral("clipboard+ctrl+v")
-                                                   : QStringLiteral("xdotool type");
+    case Method::XdotoolType: name = QStringLiteral("xdotool type"); break;
+    case Method::Clipboard:   name = haveClipboard
+                                     ? QStringLiteral("clipboard+ctrl+v")
+                                     : QStringLiteral("xdotool type (буфер недоступен)"); break;
+    case Method::Auto:        name = haveClipboard ? QStringLiteral("clipboard+ctrl+v")
+                                                   : QStringLiteral("xdotool type"); break;
     }
-    return QStringLiteral("unknown");
+    if (!name.isEmpty() && !m_pinnedWindow.isEmpty()) {
+        name += QStringLiteral(" -> окно %1").arg(m_pinnedWindow);
+    }
+    return name.isEmpty() ? QStringLiteral("unknown") : name;
 }
 
 bool XdotoolInjector::isAvailable() const
@@ -157,8 +202,12 @@ bool XdotoolInjector::sendKey(const QString& key)
         return false;
     }
 
-    return runProcess(m_xdotool,
-                      { QStringLiteral("key"), QStringLiteral("--clearmodifiers"), key });
+    QStringList args{ QStringLiteral("key") };
+    if (!m_pinnedWindow.isEmpty()) {
+        args << QStringLiteral("--window") << m_pinnedWindow;
+    }
+    args << QStringLiteral("--clearmodifiers") << key;
+    return runProcess(m_xdotool, args);
 }
 
 bool XdotoolInjector::typeViaXdotool(const QString& text)
@@ -168,12 +217,14 @@ bool XdotoolInjector::typeViaXdotool(const QString& text)
     }
     // --file - читает текст из stdin: так мы не упираемся в лимит длины
     // аргумента командной строки и не воюем с экранированием кавычек.
-    return runProcess(m_xdotool,
-                      { QStringLiteral("type"),
-                        QStringLiteral("--clearmodifiers"),
-                        QStringLiteral("--delay"), QString::number(m_typingDelayMs),
-                        QStringLiteral("--file"), QStringLiteral("-") },
-                      text.toUtf8());
+    QStringList args{ QStringLiteral("type") };
+    if (!m_pinnedWindow.isEmpty()) {
+        args << QStringLiteral("--window") << m_pinnedWindow;
+    }
+    args << QStringLiteral("--clearmodifiers")
+         << QStringLiteral("--delay") << QString::number(m_typingDelayMs)
+         << QStringLiteral("--file") << QStringLiteral("-");
+    return runProcess(m_xdotool, args, text.toUtf8());
 }
 
 bool XdotoolInjector::typeViaClipboard(const QString& text)
@@ -195,9 +246,12 @@ bool XdotoolInjector::typeViaClipboard(const QString& text)
     if (!runProcess(m_clipboardTool, m_clipboardArgs, text.toUtf8())) {
         return false;
     }
-    if (!runProcess(m_xdotool,
-                    { QStringLiteral("key"), QStringLiteral("--clearmodifiers"),
-                      QStringLiteral("ctrl+v") })) {
+    QStringList pasteArgs{ QStringLiteral("key") };
+    if (!m_pinnedWindow.isEmpty()) {
+        pasteArgs << QStringLiteral("--window") << m_pinnedWindow;
+    }
+    pasteArgs << QStringLiteral("--clearmodifiers") << QStringLiteral("ctrl+v");
+    if (!runProcess(m_xdotool, pasteArgs)) {
         return false;
     }
 

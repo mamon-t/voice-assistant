@@ -17,9 +17,12 @@
 │ audio/         │   │ core/VoicePipeline       │   │ выход            │
 │  QtAudioCapture│   │  vad/SileroVad           │   │  commands/       │
 │  Agc           │   │  asr/IRecognizer         │   │   CommandParser  │
-│                │   │  text/TextPostProcessor  │   │  output/         │
+│  TypingGuard   │   │  text/TextPostProcessor  │   │  output/         │
 └────────────────┘   └──────────────────────────┘   │   ITextInjector  │
-                                                    └─────────────────┘
+┌────────────────┐                                  │   Xdotool (окно) │
+│ input/         │                                  │   FileInjector   │
+│  EvdevHotkey   │                                  └─────────────────┘
+└────────────────┘
 ┌─────────────────────────────────────────────────────────────────────┐
 │ Конфигурация: config/ConfigManager, config/AsrProfile,              │
 │               config/HotwordsManager                                │
@@ -84,10 +87,12 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 | Захват звука | `IAudioCapture` | `QtAudioCapture` |
 | VAD | `IVad` | `SileroVad` |
 | ASR | `IRecognizer` | `TransducerRecognizer`, `NemoCtcRecognizer`, `WhisperRecognizer` |
-| Ввод текста | `ITextInjector` | `XdotoolInjector` |
+| Ввод текста | `ITextInjector` | `XdotoolInjector` (окно), `FileInjector` (файл заметок) |
 | Правописание | `ISpellChecker` | `HunspellChecker` (hunspell, C API) |
 | Глобальный хоткей | `IHotkeyListener` | `EvdevHotkeyListener` (`/dev/input/event*`) |
 | Запись аудио | — | `WavWriter` (PCM16 → WAV) |
+| Глушитель печати | — | `TypingGuard` (header-only, время передаётся снаружи) |
+| Цель вывода | — | `OutputTarget` (`Focus` / `Notes`) |
 
 Конкретную реализацию ASR выбирает `RecognizerFactory::create(AsrProfile)`;
 остальное приложение знает только `IRecognizer`.
@@ -106,6 +111,12 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 Реализовать `ITextInjector` поверх `ydotool` и выбирать его в
 `ApplicationController` по значению `[output] method`. Интерфейс уже содержит
 `backendName()` для логов и настроек.
+
+То, что реализаций может быть несколько и они могут работать одновременно,
+уже проверено на практике: `FileInjector` пишет в файл заметок, пока
+`XdotoolInjector` вставляет в окно. Выбор между ними делает
+`ApplicationController::activeInjector()` по текущей цели вывода
+(`OutputTarget`), остальной тракт разницы не замечает.
 
 ## Владение объектами
 
@@ -169,6 +180,81 @@ onTextReady(text) → injectText(text)
 (флаг `m_micCheckOwnsCapture`) и не меняет режим, а `stopRecording()` не глушит
 захват, пока идёт запись.
 
+## Цель вывода: окно или файл заметок
+
+`Mode` описывает, **что** делать с речью (диктовать, править, проверять
+орфографию). `OutputTarget` — **куда** класть результат. Понятия ортогональны:
+заметки можно диктовать и одновременно проверять на орфографию.
+
+```
+VoicePipeline::textReady(text)
+        │
+        ▼
+ApplicationController::injectText(text)
+        │
+        ├── OutputTarget::Focus ──▶ XdotoolInjector ──▶ буфер обмена + Ctrl+V
+        │                                              или xdotool type --file -
+        └── OutputTarget::Notes ──▶ FileInjector ─────▶ ~/.local/share/
+                                                        voice-assistant/notes/
+                                                        YYYY-MM-DD.md
+```
+
+Зачем это понадобилось. Вставка в окно привязана к фокусу **в момент прихода
+результата**, а это через 0.5–2 с после фразы: переключился сделать пометку —
+и продиктованное улетело в пометки. Способ «буфер обмена + Ctrl+V» к тому же
+затирает буфер. Файл не зависит ни от фокуса, ни от клавиатуры, ни от буфера,
+поэтому диктовка и ручная печать перестают конфликтовать.
+
+Переключение цели:
+
+| Откуда | Как |
+|---|---|
+| голосом | «заметка» / «в редактор» — команда `Command::Type::SetTarget` |
+| из трея | пункт «Писать в файл заметок» (галочка) |
+| по D-Bus | `setOutputTarget "notes"`, `toggleOutputTarget`, `notesFile` |
+| из консоли | `./src/voice-assistant --note "текст"` |
+| в конфиге | `[notes] start_target=notes` |
+
+`SetTarget` обрабатывается в `executeCommand()` **до** проверки
+`editing_in_dictation`: это маршрутизация, а не правка текста, иначе сказанное
+«заметка» пропало бы именно в режиме диктовки, где оно нужнее всего.
+
+`FileInjector` намеренно реализует `ITextInjector`, поэтому команды правки
+работают и в файле («удали слово» стирает последнее слово последней заметки,
+«новая строка» добавляет пустую). Неприменимые к файлу клавиши
+(`shift+Home`) возвращают `true` и просто пропускаются: команда не имеет
+смысла в этой цели, но и ошибкой не является.
+
+Запись идёт байтами в UTF-8, а не через `QTextStream << "кириллица"` — узкий
+литерал кодируется как Latin-1 (грабля №6). Перезапись последней строки
+делается через `QSaveFile`, чтобы обрыв записи не портил файл заметок.
+
+## Глушитель печати
+
+`TypingGuard` — единственный компонент, которому нужно знать, что пользователь
+печатает. Источник бесплатный: `EvdevHotkeyListener` и так читает все события
+устройства и шлёт `keyActivity()` на любую клавишу, кроме самого хоткея и
+модификаторов из его комбинации (иначе `ctrl+space` глушил бы сам себя).
+
+```
+evdev: клавиша ──▶ IHotkeyListener::keyActivity()
+                          │
+                          ▼
+        ApplicationController::onKeyActivity()
+                          │  m_typingGuard.noteKeyActivity(m_clock.elapsed())
+                          ▼
+   onAudioDataReady(): if (m_typingGuard.blocked(now)) chunk не уходит в VAD
+```
+
+Класс не знает ни про evdev, ни про Qt-события, ни про аудио: время
+передаётся снаружи, поэтому логика проверяется тестами на синтетических
+числах. Запись в WAV при этом **не** прерывается — снимок тракта обязан
+показывать всё, иначе его нельзя сравнивать с тем, что слышит ASR.
+
+По умолчанию выключен (`[audio] typing_guard_ms=0`): если говорить и печатать
+одновременно, речь режется. По окончании записи контроллер печатает, сколько
+аудио было выброшено, — по этой строке видно, не слишком ли значение велико.
+
 ## Глобальный хоткей
 
 `EvdevHotkeyListener` читает `/dev/input/event*` напрямую, поэтому работает
@@ -186,7 +272,26 @@ onTextReady(text) → injectText(text)
 этим пользуется `--check`, которому права на устройства не нужны.
 
 `EVIOCGRAB` (`[hotkey] grab`) по умолчанию выключен: он забирает устройство
-эксклюзивно, и X-сервер перестаёт получать с него все клавиши.
+эксклюзивно, и X-сервер перестаёт получать с него все клавиши. Печатать во
+время диктовки должно быть можно всегда, поэтому это не «настройка по
+умолчанию», а требование к реализации.
+
+Вся политика перехвата собрана в одной статической функции
+`shouldGrab(options, name, path, keyBits, numBytes, &reason)` — она не трогает
+дескрипторы, поэтому проверяется тестами без железа:
+
+| Условие | Результат |
+|---|---|
+| `grab=false` | никогда не перехватываем, только слушаем |
+| `grab=true`, `grab_devices` задан | перехватываем **только** перечисленное (подстрока имени или путь) |
+| `grab=true`, список пуст, устройство похоже на клавиатуру | **не** перехватываем, в лог пишется причина |
+| `grab=true`, список пуст, педаль/пульт | перехватываем |
+
+«Похоже на клавиатуру» определяет `looksLikeFullKeyboard()`: в маске
+`EVIOCGBIT(EV_KEY)` есть хотя бы 20 букв и хотя бы 5 цифр. Буквы
+перечислены явным списком, потому что их коды в `input-event-codes.h` идут
+не подряд (`KEY_A`=30, `KEY_B`=48, `KEY_Z`=44) — перебор диапазона
+`KEY_A..KEY_Z` даёт 11 букв вместо 26, и предохранитель молча не срабатывает.
 
 ## Потоки
 

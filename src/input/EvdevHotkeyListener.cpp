@@ -181,10 +181,19 @@ bool EvdevHotkeyListener::handleEvent(const struct input_event& ev)
         } else {
             m_activeMods |= bit;      // value 1 (нажатие) и 2 (автоповтор)
         }
+        // Модификатор, входящий в комбинацию хоткея, печатью не считается:
+        // иначе «ctrl+space» глушил бы сам себя на всём протяжении записи.
+        if ((m_modifiers & bit) == 0) {
+            emit keyActivity();
+        }
         return false;
     }
 
     if (ev.code != m_keyCode) {
+        // Любая другая клавиша — это признак того, что человек печатает.
+        // Автоповтор (value=2) тоже считаем: удержанная клавиша печатает
+        // непрерывно.
+        emit keyActivity();
         return false;
     }
 
@@ -207,6 +216,108 @@ bool EvdevHotkeyListener::handleEvent(const struct input_event& ev)
     }
 
     return false;
+}
+
+bool EvdevHotkeyListener::matchesDeviceSpec(const QStringList& specs,
+                                           const QString& deviceName,
+                                           const QString& devicePath)
+{
+    for (const QString& spec : specs) {
+        const QString s = spec.trimmed();
+        if (s.isEmpty()) {
+            continue;
+        }
+        if (devicePath.compare(s, Qt::CaseInsensitive) == 0
+            || devicePath.contains(s, Qt::CaseInsensitive)
+            || deviceName.contains(s, Qt::CaseInsensitive)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool EvdevHotkeyListener::looksLikeFullKeyboard(const unsigned char* keyBits, int numBytes)
+{
+    if (!keyBits || numBytes <= 0) {
+        return false;
+    }
+    const auto has = [keyBits, numBytes](int code) {
+        if (code < 0 || (code / 8) >= numBytes) {
+            return false;
+        }
+        return (keyBits[code / 8] & (1u << (code % 8))) != 0;
+    };
+
+    // ВНИМАНИЕ: коды букв в input-event-codes.h НЕ идут подряд
+    // (KEY_A=30, KEY_B=48, KEY_Z=44), поэтому перебирать диапазон
+    // KEY_A..KEY_Z нельзя — вместо 26 букв там окажется 11.
+    static const int kLetters[] = {
+        KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J,
+        KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T,
+        KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z
+    };
+    static const int kDigits[] = {
+        KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0
+    };
+
+    // Признак полноценной клавиатуры — буквы И цифры. Педали, footswitch'и,
+    // мультимедийные пульты и «вторые клавиатуры» из 3–4 кнопок под это
+    // не попадают, их перехватывать можно.
+    int letters = 0;
+    for (int c : kLetters) {
+        if (has(c)) {
+            ++letters;
+        }
+    }
+    if (letters < 20) {
+        return false;
+    }
+    int digits = 0;
+    for (int c : kDigits) {
+        if (has(c)) {
+            ++digits;
+        }
+    }
+    return digits >= 5;
+}
+
+bool EvdevHotkeyListener::shouldGrab(const Options& options,
+                                     const QString& deviceName,
+                                     const QString& devicePath,
+                                     const unsigned char* keyBits,
+                                     int numBytes,
+                                     QString* reason)
+{
+    const auto explain = [reason](const QString& text) {
+        if (reason) {
+            *reason = text;
+        }
+    };
+
+    if (!options.grab) {
+        explain(QStringLiteral("grab=false — только наблюдение"));
+        return false;
+    }
+
+    if (!options.grabDevices.isEmpty()) {
+        if (matchesDeviceSpec(options.grabDevices, deviceName, devicePath)) {
+            explain(QStringLiteral("устройство перечислено в [hotkey] grab_devices"));
+            return true;
+        }
+        explain(QStringLiteral("нет в [hotkey] grab_devices"));
+        return false;
+    }
+
+    // Список пуст: не даем перехватить то, что похоже на основную клавиатуру.
+    if (looksLikeFullKeyboard(keyBits, numBytes)) {
+        explain(QStringLiteral("похоже на полноценную клавиатуру — перехват "
+                               "отключён, чтобы не оставить систему без ввода; "
+                               "перечислите устройство в [hotkey] grab_devices, "
+                               "если это действительно нужно"));
+        return false;
+    }
+    explain(QStringLiteral("устройство не похоже на основную клавиатуру"));
+    return true;
 }
 
 bool EvdevHotkeyListener::openDevices(QString* error)
@@ -254,28 +365,36 @@ bool EvdevHotkeyListener::openDevices(QString* error)
             continue;
         }
 
-        char devName[256] = {0};
-        if (::ioctl(fd, EVIOCGNAME(sizeof(devName) - 1), devName) < 0) {
-            std::strncpy(devName, "unknown", sizeof(devName) - 1);
+        char devNameRaw[256] = {0};
+        if (::ioctl(fd, EVIOCGNAME(sizeof(devNameRaw) - 1), devNameRaw) < 0) {
+            std::strncpy(devNameRaw, "unknown", sizeof(devNameRaw) - 1);
         }
-        m_deviceNames << QStringLiteral("%1 (%2)").arg(path, QString::fromLocal8Bit(devName));
+        const QString devName = QString::fromLocal8Bit(devNameRaw);
+        m_deviceNames << QStringLiteral("%1 (%2)").arg(path, devName);
 
-        if (m_options.grab) {
+        QString grabReason;
+        if (shouldGrab(m_options, devName, path, keyBits,
+                       static_cast<int>(sizeof(keyBits)), &grabReason)) {
             int grab = 1;
             if (::ioctl(fd, EVIOCGRAB, &grab) == 0) {
                 m_grabbedFds << fd;
                 qWarning().noquote()
-                    << QStringLiteral("EvdevHotkey: устройство %1 ПЕРЕХВАЧЕНО эксклюзивно "
-                                      "(EVIOCGRAB). Остальные приложения, включая X-сервер, "
-                                      "перестанут получать с него ВСЕ клавиши. Это имеет смысл "
-                                      "только для выделенной педали или второй клавиатуры.")
-                           .arg(path);
+                    << QStringLiteral("EvdevHotkey: устройство %1 (%2) ПЕРЕХВАЧЕНО эксклюзивно "
+                                      "(EVIOCGRAB) — %3. Остальные приложения, включая X-сервер, "
+                                      "перестанут получать с него ВСЕ клавиши. Основная "
+                                      "клавиатура так перехватываться не должна.")
+                           .arg(path, devName, grabReason);
             } else {
                 qWarning().noquote()
                     << QStringLiteral("EvdevHotkey: не смог перехватить %1 (%2), "
                                       "работаю в режиме наблюдения")
                            .arg(path, QString::fromLocal8Bit(std::strerror(errno)));
             }
+        } else if (m_options.grab) {
+            // Пользователь просил перехват, но политика не позволила — говорим об этом
+            qInfo().noquote()
+                << QStringLiteral("EvdevHotkey: %1 (%2) НЕ перехвачено: %3")
+                       .arg(path, devName, grabReason);
         }
 
         auto* notifier = new QSocketNotifier(fd, QSocketNotifier::Read, this);

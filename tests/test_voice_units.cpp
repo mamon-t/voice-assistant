@@ -5,6 +5,9 @@
 
 #include <QtTest/QtTest>
 #include <QSignalSpy>
+#include <QVector>
+#include <QDate>
+#include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QDir>
 
@@ -17,8 +20,11 @@
 #include "commands/CommandParser.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "audio/TypingGuard.h"
 #include "audio/WavWriter.h"
+#include "core/OutputTarget.h"
 #include "input/EvdevHotkeyListener.h"
+#include "output/FileInjector.h"
 #include "output/XdotoolInjector.h"
 #include "spellcheck/HunspellChecker.h"
 #include "text/TextPostProcessor.h"
@@ -555,6 +561,426 @@ private slots:
         inj.setClipboardRestoreMs(250);
         QVERIFY(inj.initialize());
         QVERIFY(inj.typeText(QStringLiteral("тест")));   // в dry-run буфер не трогается
+    }
+
+
+    // ---------------- Заметки: FileInjector ----------------
+
+    void notesFormatEntryIsPure()
+    {
+        const QDateTime when(QDate(2026, 10, 3), QTime(14, 5, 6));
+        QCOMPARE(FileInjector::formatEntry(QStringLiteral("текст"),
+                                           QStringLiteral("HH:mm:ss"), true, when),
+                 QStringLiteral("- 14:05:06 — текст"));
+        QCOMPARE(FileInjector::formatEntry(QStringLiteral("текст"), QString(), false, when),
+                 QStringLiteral("текст"));
+        QCOMPARE(FileInjector::dailyFileName(QDate(2026, 1, 2), true),
+                 QStringLiteral("2026-01-02.md"));
+        QCOMPARE(FileInjector::dailyFileName(QDate(2026, 1, 2), false),
+                 QStringLiteral("2026-01-02.txt"));
+    }
+
+    void notesEraseLastWord()
+    {
+        QCOMPARE(FileInjector::eraseLastWord(QStringLiteral("раз два три")),
+                 QStringLiteral("раз два"));
+        QCOMPARE(FileInjector::eraseLastWord(QStringLiteral("одно")), QString());
+        QCOMPARE(FileInjector::eraseLastWord(QString()), QString());
+        // маркер списка остаётся: «- слово» -> «- »
+        QCOMPARE(FileInjector::eraseLastWord(QStringLiteral("- слово")),
+                 QStringLiteral("- "));
+        // как в редакторе: хвостовые пробелы съедаются первыми
+        QCOMPARE(FileInjector::eraseLastWord(QStringLiteral("текст   ")),
+                 QStringLiteral("текст"));
+    }
+
+    void notesWritesDailyMarkdownFile()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        FileInjector::Options opt;
+        opt.dir = dir.path();
+        FileInjector notes(opt);
+        QVERIFY(notes.initialize());
+        QVERIFY(notes.isAvailable());
+        QCOMPARE(notes.backendName(), QStringLiteral("файл заметок"));
+        QCOMPARE(notes.filePath(),
+                 QDir(dir.path()).filePath(
+                     FileInjector::dailyFileName(QDate::currentDate(), true)));
+
+        QVERIFY(notes.typeText(QStringLiteral("первая заметка")));
+        QVERIFY(notes.typeText(QStringLiteral("вторая")));
+        QVERIFY(notes.typeText(QString()));                 // пустой сегмент — не ошибка
+        QCOMPARE(notes.entries(), static_cast<qint64>(2));
+
+        QFile f(notes.filePath());
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QString content = QString::fromUtf8(f.readAll());
+        f.close();
+
+        const QStringList lines = content.split(QLatin1Char('\n'));
+        QVERIFY(lines.size() >= 4);
+        QVERIFY(lines.at(0).startsWith(QStringLiteral("# Заметки ")));   // заголовок дня
+        QCOMPARE(lines.at(1), QString());
+        QVERIFY(lines.at(2).startsWith(QStringLiteral("- ")));
+        QVERIFY(lines.at(2).contains(QStringLiteral(" — ")));           // метка времени
+        QVERIFY(lines.at(2).endsWith(QStringLiteral("первая заметка")));
+        QVERIFY(lines.at(3).endsWith(QStringLiteral("вторая")));
+        // заголовок пишется один раз, а не при каждом дописывании
+        QCOMPARE(content.count(QStringLiteral("# Заметки")), 1);
+        // кириллица не превратилась в кашу (грабля №6: QTextStream и Latin-1)
+        QVERIFY(content.contains(QStringLiteral("первая")));
+    }
+
+    void notesMultiLineSplitsIntoEntries()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        FileInjector::Options opt;
+        opt.dir = dir.path();
+        FileInjector notes(opt);
+        QVERIFY(notes.initialize());
+
+        QVERIFY(notes.typeText(QStringLiteral("первая\nвторая\n\nтретья")));
+        QCOMPARE(notes.entries(), static_cast<qint64>(3));
+
+        QFile f(notes.filePath());
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QString content = QString::fromUtf8(f.readAll());
+        f.close();
+        QCOMPARE(content.count(QStringLiteral("\n- ")), 3);
+    }
+
+    void notesExplicitPlainFile()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.path() + QStringLiteral("/moi-zametki.txt");
+
+        FileInjector::Options opt;
+        opt.file            = path;
+        opt.markdown        = false;
+        opt.timestampFormat = QString();
+        FileInjector notes(opt);
+        QVERIFY(notes.initialize());
+        QCOMPARE(notes.filePath(), path);
+
+        QVERIFY(notes.typeText(QStringLiteral("просто текст")));
+
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        // явный файл: ни заголовка дня, ни маркера, ни метки времени
+        QCOMPARE(QString::fromUtf8(f.readAll()), QStringLiteral("просто текст\n"));
+        f.close();
+    }
+
+    void notesSendKeyEditsFile()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        FileInjector::Options opt;
+        opt.dir = dir.path();
+        FileInjector notes(opt);
+        QVERIFY(notes.initialize());
+
+        QVERIFY(notes.typeText(QStringLiteral("альфа бета гамма")));
+
+        // «удали слово» стирает последнее слово последней заметки
+        QVERIFY(notes.sendKey(QStringLiteral("ctrl+BackSpace")));
+        QFile f(notes.filePath());
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QString content = QString::fromUtf8(f.readAll());
+        f.close();
+        QVERIFY(content.contains(QStringLiteral("альфа бета")));
+        QVERIFY(!content.contains(QStringLiteral("гамма")));
+
+        // «новая строка» добавляет пустую строку
+        QVERIFY(notes.sendKey(QStringLiteral("Return")));
+        QVERIFY(notes.filePath().isEmpty() || true);
+        QFile f2(notes.filePath());
+        QVERIFY(f2.open(QIODevice::ReadOnly));
+        content = QString::fromUtf8(f2.readAll());
+        f2.close();
+        QVERIFY(content.endsWith(QStringLiteral("\n\n")));
+
+        // неприменимая к файлу клавиша — не ошибка, файл не меняется
+        QVERIFY(notes.sendKey(QStringLiteral("shift+Home")));
+        QFile f3(notes.filePath());
+        QVERIFY(f3.open(QIODevice::ReadOnly));
+        QCOMPARE(QString::fromUtf8(f3.readAll()), content);
+        f3.close();
+    }
+
+    // ---------------- Цель вывода в командах ----------------
+
+    void parseTargetCommands()
+    {
+        CommandParser p;
+
+        const auto notes = p.parse(QStringLiteral("Заметка."));   // регистр и точка
+        QVERIFY(notes.has_value());
+        QCOMPARE(notes->type, Command::Type::SetTarget);
+        QCOMPARE(notes->target, OutputTarget::Notes);
+
+        const auto focus = p.parse(QStringLiteral("в редактор"));
+        QVERIFY(focus.has_value());
+        QCOMPARE(focus->target, OutputTarget::Focus);
+
+        // словом внутри фразы команда не считается — иначе «сделать заметку
+        // на полях» переключало бы цель вывода
+        QVERIFY(!p.parse(QStringLiteral("сделать заметку на полях")).has_value());
+
+        // все фразы из списка действительно лежат в словаре
+        const QStringList phrases = CommandDictionary::targetCommandPhrases();
+        QVERIFY(phrases.size() >= 4);
+        for (const QString& phrase : phrases) {
+            QVERIFY2(p.dictionary()->contains(CommandParser::normalize(phrase)),
+                     qPrintable(phrase));
+        }
+    }
+
+    void targetCommandsCanBeDisabled()
+    {
+        CommandDictionary d;
+        d.loadDefaults();
+        const QStringList phrases = CommandDictionary::targetCommandPhrases();
+
+        int removed = 0;
+        for (const QString& phrase : phrases) {
+            if (d.removeCommand(phrase)) {
+                ++removed;
+            }
+        }
+        QCOMPARE(removed, phrases.size());
+        for (const QString& phrase : phrases) {
+            QVERIFY(!d.contains(CommandParser::normalize(phrase)));
+        }
+        // остальной словарь не пострадал
+        QVERIFY(d.contains(CommandParser::normalize(QStringLiteral("удали слово"))));
+        QVERIFY(d.contains(CommandParser::normalize(QStringLiteral("режим диктовки"))));
+        // повторное удаление — не ошибка
+        QVERIFY(!d.removeCommand(phrases.first()));
+    }
+
+    void outputTargetNames()
+    {
+        QCOMPARE(outputTargetToString(OutputTarget::Notes), QStringLiteral("notes"));
+        QCOMPARE(outputTargetToString(OutputTarget::Focus), QStringLiteral("focus"));
+        QCOMPARE(stringToOutputTarget(QStringLiteral("notes")),  OutputTarget::Notes);
+        QCOMPARE(stringToOutputTarget(QStringLiteral("NOTES")),  OutputTarget::Notes);
+        QCOMPARE(stringToOutputTarget(QStringLiteral("заметки")), OutputTarget::Notes);
+        QCOMPARE(stringToOutputTarget(QStringLiteral("focus")),  OutputTarget::Focus);
+        // неизвестное значение = активное окно, а не заметки: молча поменять
+        // цель вывода было бы слишком дорогим сюрпризом
+        QCOMPARE(stringToOutputTarget(QString()),            OutputTarget::Focus);
+        QCOMPARE(stringToOutputTarget(QStringLiteral("что угодно")), OutputTarget::Focus);
+        QVERIFY(!outputTargetTitle(OutputTarget::Notes).isEmpty());
+    }
+
+    // ---------------- Глушитель печати ----------------
+
+    void typingGuardBlocksOnlyWhileTyping()
+    {
+        TypingGuard g(200);
+        QVERIFY(g.isEnabled());
+        QVERIFY(!g.blocked(0));            // нажатий ещё не было — не глушим
+        g.noteKeyActivity(1000);
+        QVERIFY(g.blocked(1100));          // 100 мс после нажатия
+        QVERIFY(g.blocked(1199));
+        QVERIFY(!g.blocked(1200));         // ровно guardMs — уже можно
+
+        g.countDropped(1600);
+        g.countDropped(1600);
+        QCOMPARE(g.droppedChunks(),  static_cast<qint64>(2));
+        QCOMPARE(g.droppedSamples(), static_cast<qint64>(3200));
+
+        g.reset();
+        QVERIFY(!g.blocked(1010));         // счётчик нажатий сброшен
+        QCOMPARE(g.droppedChunks(), static_cast<qint64>(0));
+
+        TypingGuard off;                   // по умолчанию выключен
+        QVERIFY(!off.isEnabled());
+        off.noteKeyActivity(5);
+        QVERIFY(!off.blocked(6));
+
+        TypingGuard negative(-10);         // мусор в конфиге не ломает тракт
+        QCOMPARE(negative.guardMs(), 0);
+        negative.noteKeyActivity(1);
+        QVERIFY(!negative.blocked(2));
+    }
+
+    // ---------------- Хоткей: события печати ----------------
+
+    void hotkeyReportsTypingActivity()
+    {
+        auto ev = [](quint16 type, quint16 code, qint32 value) {
+            struct input_event e;
+            std::memset(&e, 0, sizeof(e));
+            e.type = type; e.code = code; e.value = value;
+            return e;
+        };
+
+        // Комбинация: её собственный модификатор печатью не считается,
+        // иначе «ctrl+space» глушил бы сам себя всю запись.
+        EvdevHotkeyListener::Options opt;
+        opt.key = QStringLiteral("ctrl+space");
+        EvdevHotkeyListener l(opt);
+        QVERIFY(l.configure());
+
+        QSignalSpy activity(&l, &IHotkeyListener::keyActivity);
+        QSignalSpy pressed(&l, &IHotkeyListener::pressed);
+
+        l.handleEvent(ev(EV_KEY, KEY_LEFTCTRL, 1));
+        QCOMPARE(activity.count(), 0);
+        l.handleEvent(ev(EV_KEY, KEY_SPACE, 1));
+        QCOMPARE(activity.count(), 0);
+        QCOMPARE(pressed.count(), 1);
+        l.handleEvent(ev(EV_KEY, KEY_SPACE, 2));     // автоповтор хоткея
+        QCOMPARE(activity.count(), 0);
+
+        l.handleEvent(ev(EV_KEY, KEY_A, 1));         // чужая клавиша — это печать
+        QCOMPARE(activity.count(), 1);
+        l.handleEvent(ev(EV_KEY, KEY_A, 2));         // удержанная клавиша печатает
+        QCOMPARE(activity.count(), 2);
+        l.handleEvent(ev(EV_KEY, KEY_LEFTSHIFT, 1)); // чужой модификатор — тоже
+        QCOMPARE(activity.count(), 3);
+        l.handleEvent(ev(EV_SYN, SYN_REPORT, 0));    // не-клавишные события — нет
+        l.handleEvent(ev(EV_REL, REL_X, 5));
+        QCOMPARE(activity.count(), 3);
+
+        // Одиночная клавиша: любой модификатор считается печатью
+        EvdevHotkeyListener::Options opt2;
+        opt2.key = QStringLiteral("F8");
+        EvdevHotkeyListener l2(opt2);
+        QVERIFY(l2.configure());
+        QSignalSpy activity2(&l2, &IHotkeyListener::keyActivity);
+        l2.handleEvent(ev(EV_KEY, KEY_LEFTCTRL, 1));
+        QCOMPARE(activity2.count(), 1);
+        l2.handleEvent(ev(EV_KEY, KEY_F8, 1));       // сам хоткей — не печать
+        QCOMPARE(activity2.count(), 1);
+        l2.handleEvent(ev(EV_KEY, KEY_F8, 0));
+        QCOMPARE(activity2.count(), 1);
+    }
+
+    // ---------------- Политика EVIOCGRAB ----------------
+
+    void grabPolicyNeverTakesMainKeyboard()
+    {
+        const int bytes = KEY_MAX / 8 + 1;
+
+        // Полноценная клавиатура: буквы и цифры. Заполняем весь диапазон
+        // 0..127, потому что коды букв в input-event-codes.h не подряд
+        // (KEY_A=30, KEY_B=48, KEY_Z=44).
+        QVector<unsigned char> full(bytes, 0);
+        for (int c = 0; c < 128; ++c) {
+            full[c / 8] = static_cast<unsigned char>(full[c / 8] | (1u << (c % 8)));
+        }
+        // Педаль / footswitch: две кнопки
+        QVector<unsigned char> pedal(bytes, 0);
+        pedal[KEY_F8 / 8]    = static_cast<unsigned char>(pedal[KEY_F8 / 8]    | (1u << (KEY_F8 % 8)));
+        pedal[KEY_ENTER / 8] = static_cast<unsigned char>(pedal[KEY_ENTER / 8] | (1u << (KEY_ENTER % 8)));
+
+        QVERIFY(EvdevHotkeyListener::looksLikeFullKeyboard(full.data(), bytes));
+        QVERIFY(!EvdevHotkeyListener::looksLikeFullKeyboard(pedal.data(), bytes));
+        QVERIFY(!EvdevHotkeyListener::looksLikeFullKeyboard(nullptr, 0));
+
+        const QString kbName = QStringLiteral("AT Translated Set 2 keyboard");
+        const QString kbPath = QStringLiteral("/dev/input/event3");
+        const QString pdName = QStringLiteral("USB Foot Switch");
+        const QString pdPath = QStringLiteral("/dev/input/event9");
+
+        EvdevHotkeyListener::Options opt;
+        opt.key = QStringLiteral("F8");
+
+        // grab=false — только наблюдение, клавиатура не блокируется никогда
+        QVERIFY(!EvdevHotkeyListener::shouldGrab(opt, kbName, kbPath, full.data(), bytes));
+        QVERIFY(!EvdevHotkeyListener::shouldGrab(opt, pdName, pdPath, pedal.data(), bytes));
+
+        opt.grab = true;
+        QString reason;
+        QVERIFY(!EvdevHotkeyListener::shouldGrab(opt, kbName, kbPath, full.data(), bytes, &reason));
+        QVERIFY(!reason.isEmpty());                        // объяснение для лога
+        QVERIFY(EvdevHotkeyListener::shouldGrab(opt, pdName, pdPath, pedal.data(), bytes));
+
+        // Список сужает grab до перечисленного
+        opt.grabDevices = QStringList{QStringLiteral("foot switch")};
+        QVERIFY(EvdevHotkeyListener::shouldGrab(opt, pdName, pdPath, pedal.data(), bytes));
+        QVERIFY(!EvdevHotkeyListener::shouldGrab(opt, kbName, kbPath, full.data(), bytes));
+        // не перечисленное устройство не перехватывается, даже если это не клавиатура
+        QVERIFY(!EvdevHotkeyListener::shouldGrab(opt,
+                    QStringLiteral("Sony Interactive Controller"),
+                    QStringLiteral("/dev/input/event5"), pedal.data(), bytes));
+
+        // Явно названная клавиатура перехватывается: человек этого хотел
+        opt.grabDevices = QStringList{QStringLiteral("/dev/input/event3")};
+        QVERIFY(EvdevHotkeyListener::shouldGrab(opt, kbName, kbPath, full.data(), bytes));
+
+        // matchesDeviceSpec: подстрока имени или путь, регистр не важен
+        QVERIFY(EvdevHotkeyListener::matchesDeviceSpec(
+            QStringList{QStringLiteral("FOOT")}, pdName, pdPath));
+        QVERIFY(EvdevHotkeyListener::matchesDeviceSpec(
+            QStringList{QStringLiteral("/dev/input/event9")}, pdName, pdPath));
+        QVERIFY(!EvdevHotkeyListener::matchesDeviceSpec(QStringList(), pdName, pdPath));
+        QVERIFY(!EvdevHotkeyListener::matchesDeviceSpec(
+            QStringList{QStringLiteral("   ")}, pdName, pdPath));
+    }
+
+    // ---------------- Конфиг: заметки, глушитель, grab_devices ----------------
+
+    void configNotesAndTypingGuard()
+    {
+        QTemporaryFile f;
+        QVERIFY(f.open());
+        {
+            QTextStream out(&f);
+            out.setCodec("UTF-8");
+            out << QStringLiteral("[notes]\n")
+                << QStringLiteral("dir=~/zametki\n")
+                << QStringLiteral("voice_commands=false\n")
+                << QStringLiteral("start_target=notes\n")
+                << QStringLiteral("timestamp=\n")
+                << QStringLiteral("markdown=false\n")
+                << QStringLiteral("\n[output]\n")
+                << QStringLiteral("pin_window=true\n")
+                << QStringLiteral("\n[audio]\n")
+                << QStringLiteral("typing_guard_ms=250\n")
+                << QStringLiteral("\n[hotkey]\n")
+                << QStringLiteral("grab=true\n")
+                << QStringLiteral("grab_devices=/dev/input/event9, Foot Switch\n");
+        }
+        f.close();
+
+        const ConfigManager cfg(f.fileName());
+        QVERIFY(cfg.notesEnabled());
+        QCOMPARE(cfg.notesDir(), QDir::cleanPath(QDir::homePath() + QStringLiteral("/zametki")));
+        QVERIFY(!cfg.notesVoiceCommands());
+        QCOMPARE(cfg.notesStartTarget(), QStringLiteral("notes"));
+        QCOMPARE(cfg.notesTimestampFormat(), QString());
+        QVERIFY(!cfg.notesMarkdown());
+        QVERIFY(cfg.pinWindow());
+        QCOMPARE(cfg.typingGuardMs(), 250);
+        QVERIFY(cfg.hotkeyGrab());
+        // значение с запятыми QSettings отдаёт списком — и оно не должно
+        // превратиться в пустую строку (грабля №9)
+        QCOMPARE(cfg.hotkeyGrabDevices(),
+                 (QStringList{QStringLiteral("/dev/input/event9"),
+                              QStringLiteral("Foot Switch")}));
+
+        // Значения по умолчанию
+        const ConfigManager def(QStringLiteral("/tmp/нет-такого-файла-va-notes.ini"));
+        QVERIFY(def.notesEnabled());
+        QVERIFY(def.notesDir().endsWith(QStringLiteral("/notes")));
+        QCOMPARE(def.notesFile(), QString());
+        QCOMPARE(def.notesTimestampFormat(), QStringLiteral("HH:mm:ss"));
+        QVERIFY(def.notesMarkdown());
+        QVERIFY(def.notesDayHeader());
+        QVERIFY(def.notesVoiceCommands());
+        QCOMPARE(def.notesStartTarget(), QStringLiteral("focus"));
+        QVERIFY(!def.pinWindow());
+        QCOMPARE(def.typingGuardMs(), 0);
+        QVERIFY(!def.hotkeyGrab());                 // клавиатура не блокируется
+        QVERIFY(def.hotkeyGrabDevices().isEmpty());
     }
 
     void injectorDryRun()

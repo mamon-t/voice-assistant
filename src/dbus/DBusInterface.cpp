@@ -22,6 +22,16 @@ DBusInterface::DBusInterface(ApplicationController* controller)
             this, [this](const QString& message) {
         emit errorOccurred(message);
     });
+
+    connect(m_controller, &ApplicationController::outputTargetChanged,
+            this, [this](OutputTarget target) {
+        emit outputTargetChanged(outputTargetToString(target));
+    });
+
+    connect(m_controller, &ApplicationController::noteWritten,
+            this, [this](const QString& path, const QString& text) {
+        emit noteWritten(path, text);
+    });
 }
 
 void DBusInterface::startRecording() {
@@ -62,4 +72,20 @@ bool DBusInterface::isMicChecking() const {
 
 QString DBusInterface::hotkeyStatus() const {
     return m_controller->hotkeyDescription();
+}
+
+void DBusInterface::setOutputTarget(const QString& target) {
+    m_controller->setOutputTarget(stringToOutputTarget(target));
+}
+
+QString DBusInterface::getOutputTarget() const {
+    return m_controller->outputTargetName();
+}
+
+void DBusInterface::toggleOutputTarget() {
+    m_controller->toggleOutputTarget();
+}
+
+QString DBusInterface::notesFile() const {
+    return m_controller->notesFilePath();
 }
