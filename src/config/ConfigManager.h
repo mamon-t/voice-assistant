@@ -64,6 +64,8 @@ public:
     // --- постобработка текста ---
     bool autoPunctuate() const;
     bool voicePunctuation() const;
+    bool capitalizeSentences() const;   // [text] capitalize
+    bool addFinalDot() const;           // [text] add_final_dot
 
     // --- вывод текста (ITextInjector) ---
     QString injectorMethod() const;    // [output] method: auto | xdotool | clipboard
@@ -81,6 +83,17 @@ public:
     QString spellcheckLang() const;           // [spellcheck] lang (ru_RU)
     QString spellcheckDictionaryDir() const;  // [spellcheck] dictionary_dir
     int     spellcheckMaxSuggestions() const; // [spellcheck] max_suggestions
+
+    // --- проверка микрофона (запись тракта в WAV) ---
+    QString micCheckDir() const;        // [audio] mic_check_dir
+    QString micCheckSource() const;     // [audio] mic_check_source: agc | raw
+    QString micCheckPrefix() const;     // [audio] mic_check_prefix
+
+    // --- глобальный хоткей микрофона ---
+    QString hotkeyBackend() const;      // [hotkey] backend: evdev | off
+    QString hotkeyKey() const;          // [hotkey] key: KEY_F8, ctrl+space, ...
+    bool    hotkeyGrab() const;         // [hotkey] grab: перехватывать клавишу (EVIOCGRAB)
+    QString hotkeyMode() const;         // [hotkey] mode: push_to_talk | toggle
 
     // --- отладка ---
     bool audioDebugLog() const;        // [audio] debug_log

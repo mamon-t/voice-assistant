@@ -18,6 +18,10 @@ public slots:
     void setMode(const QString& mode);
     QString getMode() const;
     void reloadHotwords();
+    QString startMicCheck();      // путь к файлу записи
+    void stopMicCheck();
+    bool isMicChecking() const;
+    QString hotkeyStatus() const;
 
 signals:
     void modeChanged(const QString& mode);

@@ -14,9 +14,14 @@
 #include <QStringList>
 #include <QTextStream>
 
+#include "audio/QtAudioCapture.h"
+#include "audio/WavWriter.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "input/EvdevHotkeyListener.h"
 #include "output/XdotoolInjector.h"
+
+#include <QTimer>
 #include "spellcheck/HunspellChecker.h"
 
 #include <cstdio>
@@ -255,8 +260,67 @@ int runDiagnostics(const QStringList& args)
     }
     std::printf("\n");
 
-    std::printf("Постобработка : auto_punctuate=%s voice_punctuation=%s\n",
+    // --- хоткей ---
+    std::printf("Хоткей\n");
+    if (cfg->hotkeyBackend() == QLatin1String("off")) {
+        std::printf("  backend   : off (управление из трея и по D-Bus)\n");
+    } else {
+        EvdevHotkeyListener::Options hopt;
+        hopt.key  = cfg->hotkeyKey();
+        hopt.grab = cfg->hotkeyGrab();
+        EvdevHotkeyListener hk(hopt);
+        QString hkError;
+        // configure() не трогает /dev/input — валидируется только спецификация клавиши
+        if (!hk.configure(&hkError)) {
+            std::printf("  клавиша   : %s  НЕ РАЗОБРАНА: %s\n",
+                        qPrintable(cfg->hotkeyKey()), qPrintable(hkError));
+            ++problems;
+        } else {
+            std::printf("  клавиша   : %s  OK\n", qPrintable(cfg->hotkeyKey()));
+        }
+        std::printf("  режим     : %s, grab=%s\n",
+                    qPrintable(cfg->hotkeyMode()),
+                    cfg->hotkeyGrab()
+                        ? "true (ЭКСКЛЮЗИВНО: клавиатура уйдёт из-под X!)"
+                        : "false");
+        if (QFileInfo::exists(QStringLiteral("/dev/input"))) {
+            const QDir di(QStringLiteral("/dev/input"));
+            const QStringList events =
+                di.entryList({QStringLiteral("event*")}, QDir::System | QDir::Files);
+            int readable = 0;
+            for (const QString& e : events) {
+                if (QFileInfo(di.filePath(e)).isReadable()) {
+                    ++readable;
+                }
+            }
+            std::printf("  /dev/input: %d устройств event*, доступно для чтения: %d\n",
+                        static_cast<int>(events.size()), readable);
+            if (readable == 0) {
+                std::printf("              -> нужен доступ: sudo usermod -aG input $USER,"
+                            " затем перелогин\n");
+                ++problems;
+            }
+        } else {
+            std::printf("  /dev/input: НЕТ (evdev недоступен)\n");
+            ++problems;
+        }
+    }
+    std::printf("\n");
+
+    // --- запись микрофона ---
+    std::printf("Запись микрофона\n");
+    const QString recDir = cfg->micCheckDir();
+    std::printf("  каталог   : %s  %s\n", qPrintable(recDir),
+                QDir(recDir).exists() ? "[есть]" : "[будет создан]");
+    std::printf("  источник  : %s (agc = то, что слышит ASR; raw = сырой микрофон)\n",
+                qPrintable(cfg->micCheckSource()));
+    std::printf("  из консоли: ./src/voice-assistant --record 15 ~/mic.wav\n\n");
+
+    std::printf("Постобработка : auto_punctuate=%s capitalize=%s add_final_dot=%s "
+                "voice_punctuation=%s\n",
                 cfg->autoPunctuate() ? "true" : "false",
+                cfg->capitalizeSentences() ? "true" : "false",
+                cfg->addFinalDot() ? "true" : "false",
                 cfg->voicePunctuation() ? "true" : "false");
     std::printf("Команды       : editing_in_dictation=%s\n",
                 cfg->editingCommandsInDictation() ? "true" : "false");
@@ -287,6 +351,81 @@ int main(int argc, char *argv[])
     if (rawArgs.contains(QStringLiteral("--check"))) {
         QCoreApplication app(argc, argv);
         return runDiagnostics(QCoreApplication::arguments());
+    }
+
+    // --record <секунды> [файл.wav] — сырая запись с микрофона, без GUI и без AGC.
+    // Отделяет проблемы микрофона/AGC от проблем модели: тот же файл потом
+    // прогоняется через ./tools/vad-asr-test всеми профилями.
+    const int recordIdx = rawArgs.indexOf(QStringLiteral("--record"));
+    if (recordIdx >= 0) {
+        QCoreApplication app(argc, argv);
+        const QStringList args = QCoreApplication::arguments();
+
+        double seconds = 10.0;
+        if (recordIdx + 1 < args.size()) {
+            bool ok = false;
+            const double v = args.at(recordIdx + 1).toDouble(&ok);
+            if (ok && v > 0.0 && v <= 3600.0) {
+                seconds = v;
+            } else {
+                std::fprintf(stderr,
+                             "--record: недопустимая длительность '%s' (нужно 0.1..3600 с)\n",
+                             qPrintable(args.at(recordIdx + 1)));
+                return 2;
+            }
+        }
+        const QString out = (recordIdx + 2 < args.size())
+            ? args.at(recordIdx + 2)
+            : QDir(QDir::homePath()).filePath(WavWriter::defaultFileName(QStringLiteral("mic-raw")));
+
+        QtAudioCapture capture;
+        WavWriter writer;
+        bool opened = false;
+        int  exitCode = 0;
+
+        QObject::connect(&capture, &IAudioCapture::audioDataReady,
+                         [&](const QByteArray& data, int sampleRate) {
+            if (!opened) {
+                if (!writer.open(out, sampleRate, 1, 16)) {
+                    std::fprintf(stderr, "%s\n", qPrintable(writer.lastError()));
+                    exitCode = 1;
+                    app.quit();
+                    return;
+                }
+                opened = true;
+                std::printf("Пишу %s (%d Гц, моно, 16 бит), %.1f с...\n",
+                            qPrintable(out), sampleRate, seconds);
+                std::fflush(stdout);
+            }
+            writer.write(data);
+        });
+        QObject::connect(&capture, &IAudioCapture::errorOccurred, [&](const QString& msg) {
+            std::fprintf(stderr, "Ошибка захвата: %s\n", qPrintable(msg));
+            exitCode = 1;
+            app.quit();
+        });
+
+        if (!capture.initialize()) {
+            std::fprintf(stderr, "Не удалось инициализировать захват звука\n");
+            return 1;
+        }
+        capture.start();
+
+        QTimer::singleShot(static_cast<int>(seconds * 1000.0), [&]() {
+            capture.stop();
+            const double wrote = writer.seconds();
+            const QString path = writer.filePath();
+            const long long bytes = static_cast<long long>(writer.dataBytes());
+            writer.close();
+            std::printf("Сохранено: %s (%.2f с, %lld байт PCM)\n",
+                        qPrintable(path), wrote, bytes);
+            std::printf("Дальше:  ./tools/vad-asr-test %s --config "
+                        "~/.config/voice-assistant/settings.ini\n", qPrintable(path));
+            app.quit();
+        });
+
+        app.exec();
+        return exitCode;
     }
 
     QApplication app(argc, argv);

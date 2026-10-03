@@ -2,6 +2,9 @@
 
 #include "audio/Agc.h"
 #include "audio/QtAudioCapture.h"
+#include "audio/WavWriter.h"
+#include "input/EvdevHotkeyListener.h"
+#include "input/IHotkeyListener.h"
 #include "commands/CommandDictionary.h"
 #include "commands/CommandParser.h"
 #include "config/ConfigManager.h"
@@ -13,6 +16,7 @@
 #include "spellcheck/ISpellChecker.h"
 
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <cmath>
 #include <cstdint>
@@ -118,6 +122,9 @@ ApplicationController::ApplicationController(QObject* parent)
     connect(m_audioCapture.get(), &IAudioCapture::errorOccurred,
             this, &ApplicationController::onAudioError);
 
+    m_micCheckSource = m_config->micCheckSource();
+    m_hotkeyMode     = m_config->hotkeyMode();
+
     // 7. Речевой пайплайн (VAD -> ASR -> пунктуация) -----------------------------
     if (!buildPipeline()) {
         // Без ASR приложение работать не может. Не делаем вид, что всё в порядке:
@@ -126,6 +133,9 @@ ApplicationController::ApplicationController(QObject* parent)
         emit modeChanged(m_mode);
         return;
     }
+
+    // 8. Глобальный хоткей (не критично: без него остаются трей и D-Bus)
+    setupHotkey();
 }
 
 void ApplicationController::reportError(const QString& message)
@@ -241,7 +251,9 @@ void ApplicationController::stopRecording()
 {
     if (m_mode != Mode::Off) {
         if (m_pipeline) m_pipeline->flush();     // вытолкнуть хвост последней фразы
-        if (m_audioCapture) m_audioCapture->stop();
+        if (m_audioCapture && !isMicChecking()) {
+            m_audioCapture->stop();   // запись микрофона держит захват сама
+        }
         m_audioBuffer.clear();
         m_mode = Mode::Off;
         qDebug() << "Recording stopped";
@@ -271,7 +283,9 @@ void ApplicationController::setMode(Mode mode)
         if (m_audioCapture) m_audioCapture->start();
     } else if (mode == Mode::Off) {
         if (m_pipeline) m_pipeline->flush();
-        if (m_audioCapture) m_audioCapture->stop();
+        if (m_audioCapture && !isMicChecking()) {
+            m_audioCapture->stop();
+        }
         m_audioBuffer.clear();
     }
 
@@ -364,6 +378,11 @@ void ApplicationController::onAudioDataReady(const QByteArray& data, int sampleR
                                                                : QStringLiteral("NO"));
         }
 
+        // Запись тракта для диагностики (работает в любом режиме)
+        if (m_wavWriter && m_wavWriter->isOpen()) {
+            m_wavWriter->write(m_micCheckSource == QLatin1String("raw") ? chunk : processed);
+        }
+
         // VAD в sherpa-onnx требует ровно 16 кГц моно int16 и сам не ресемплит
         if (m_mode != Mode::Off && m_pipeline) {
             m_pipeline->processAudio(processed, sampleRate);
@@ -375,6 +394,158 @@ void ApplicationController::onAudioError(const QString& message)
 {
     qCritical() << "Audio error:" << message;
     emit errorOccurred(message);
+}
+
+// ---------------------------------------------------------------------------
+// Проверка микрофона: запись тракта в WAV
+// ---------------------------------------------------------------------------
+
+bool ApplicationController::isMicChecking() const
+{
+    return m_wavWriter && m_wavWriter->isOpen();
+}
+
+QString ApplicationController::micCheckFile() const
+{
+    return isMicChecking() ? m_wavWriter->filePath() : QString();
+}
+
+bool ApplicationController::startMicCheck(QString* outFile)
+{
+    if (isMicChecking()) {
+        if (outFile) {
+            *outFile = m_wavWriter->filePath();
+        }
+        return true;
+    }
+    if (!m_audioCapture) {
+        reportError(QStringLiteral("Запись микрофона невозможна: захват звука не создан"));
+        return false;
+    }
+
+    const QString dir  = m_config ? m_config->micCheckDir()
+                                  : QDir::homePath() + QStringLiteral("/voice-assistant-recordings");
+    const QString name = WavWriter::defaultFileName(
+        m_config ? m_config->micCheckPrefix() : QStringLiteral("mic-check"));
+    const QString path = QDir(dir).filePath(name);
+
+    m_wavWriter = std::make_unique<WavWriter>();
+    // Захват отдаёт 16 кГц моно int16 — ровно то, что нужно WAV'у и ASR
+    if (!m_wavWriter->open(path, 16000, 1, 16)) {
+        reportError(m_wavWriter->lastError());
+        m_wavWriter.reset();
+        return false;
+    }
+
+    if (m_agc) {
+        m_agc->reset();
+    }
+    m_micCheckOwnsCapture = !m_audioCapture->isRunning();
+    if (m_micCheckOwnsCapture) {
+        m_audioCapture->start();   // режим не меняем: это диагностика, не диктовка
+    }
+
+    if (outFile) {
+        *outFile = path;
+    }
+    qInfo().noquote() << QStringLiteral("Запись микрофона начата: %1 (источник=%2)")
+                             .arg(path, m_micCheckSource);
+    emit micCheckStarted(path);
+    return true;
+}
+
+void ApplicationController::stopMicCheck()
+{
+    if (!isMicChecking()) {
+        return;
+    }
+
+    const QString path   = m_wavWriter->filePath();
+    const double  secs   = m_wavWriter->seconds();
+    m_wavWriter->close();
+    m_wavWriter.reset();
+
+    if (m_micCheckOwnsCapture && m_audioCapture && m_mode == Mode::Off) {
+        m_audioCapture->stop();
+    }
+    m_micCheckOwnsCapture = false;
+
+    qInfo().noquote() << QStringLiteral("Запись сохранена: %1 (%2 с)")
+                             .arg(path).arg(secs, 0, 'f', 2);
+    emit micCheckFinished(path, secs);
+}
+
+// ---------------------------------------------------------------------------
+// Глобальный хоткей
+// ---------------------------------------------------------------------------
+
+void ApplicationController::setupHotkey()
+{
+    const QString backend = m_config ? m_config->hotkeyBackend() : QStringLiteral("off");
+    if (backend == QLatin1String("off") || backend.isEmpty()) {
+        qInfo().noquote() << QStringLiteral("Хоткей: выключен ([hotkey] backend=off)");
+        return;
+    }
+    if (backend != QLatin1String("evdev")) {
+        reportError(QStringLiteral("Неизвестный [hotkey] backend='%1' (доступны: evdev, off)")
+                        .arg(backend));
+        return;
+    }
+
+    EvdevHotkeyListener::Options opt;
+    opt.key  = m_config->hotkeyKey();
+    opt.grab = m_config->hotkeyGrab();
+
+    auto listener = std::make_unique<EvdevHotkeyListener>(opt);
+    connect(listener.get(), &IHotkeyListener::errorOccurred,
+            this, &ApplicationController::errorOccurred);
+    connect(listener.get(), &IHotkeyListener::pressed,  this, &ApplicationController::onHotkeyPressed);
+    connect(listener.get(), &IHotkeyListener::released, this, &ApplicationController::onHotkeyReleased);
+
+    QString err;
+    if (!listener->start(&err)) {
+        // Не смертельно: трей и D-Bus продолжают работать
+        reportError(QStringLiteral("Хоткей не запущен: %1").arg(err));
+        return;
+    }
+    m_hotkey = std::move(listener);
+}
+
+bool ApplicationController::isHotkeyActive() const
+{
+    return m_hotkey && m_hotkey->isActive();
+}
+
+QString ApplicationController::hotkeyDescription() const
+{
+    if (!m_hotkey) {
+        return QStringLiteral("выключен");
+    }
+    return QStringLiteral("%1, клавиша %2, режим %3")
+        .arg(m_hotkey->backendName(), m_config->hotkeyKey(), m_hotkeyMode);
+}
+
+void ApplicationController::onHotkeyPressed()
+{
+    if (m_hotkeyMode == QLatin1String("toggle")) {
+        if (m_mode == Mode::Off) {
+            startRecording();
+        } else {
+            stopRecording();
+        }
+        return;
+    }
+    // push-to-talk: держим клавишу — идёт запись
+    if (m_mode == Mode::Off) {
+        startRecording();
+    }
+}
+
+void ApplicationController::onHotkeyReleased()
+{
+    if (m_hotkeyMode != QLatin1String("toggle") && m_mode != Mode::Off) {
+        stopRecording();   // внутри flush() — хвост фразы не теряется
+    }
 }
 
 // ---------------------------------------------------------------------------

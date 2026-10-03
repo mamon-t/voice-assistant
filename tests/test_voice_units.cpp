@@ -4,8 +4,12 @@
 // XdotoolInjector (в режиме VOICE_ASSISTANT_DRYRUN=1 — без X-сервера).
 
 #include <QtTest/QtTest>
+#include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QDir>
+
+#include <linux/input.h>
+#include <cstring>
 #include <QFile>
 #include <QTextStream>
 
@@ -13,6 +17,8 @@
 #include "commands/CommandParser.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "audio/WavWriter.h"
+#include "input/EvdevHotkeyListener.h"
 #include "output/XdotoolInjector.h"
 #include "spellcheck/HunspellChecker.h"
 #include "text/TextPostProcessor.h"
@@ -343,6 +349,201 @@ private slots:
 
         // числа не считаются ошибками
         QVERIFY(c.check(QStringLiteral("2026 42 3.14")).isEmpty());
+    }
+
+
+    // ---------------- WavWriter ----------------
+
+    void wavWriterHeaderFields()
+    {
+        const QByteArray h = WavWriter::makeHeader(48000, 2, 16, 192000);
+        QCOMPARE(h.size(), 44);
+        QCOMPARE(h.mid(0, 4),  QByteArray("RIFF"));
+        QCOMPARE(h.mid(8, 4),  QByteArray("WAVE"));
+        QCOMPARE(h.mid(12, 4), QByteArray("fmt "));
+        QCOMPARE(h.mid(36, 4), QByteArray("data"));
+
+        auto rd32 = [&h](int o) { quint32 v; std::memcpy(&v, h.constData() + o, 4); return qFromLittleEndian(v); };
+        auto rd16 = [&h](int o) { quint16 v; std::memcpy(&v, h.constData() + o, 2); return qFromLittleEndian(v); };
+
+        QCOMPARE(rd32(4),  quint32(192000 + 36));   // RIFF size
+        QCOMPARE(rd16(20), quint16(1));             // PCM
+        QCOMPARE(rd16(22), quint16(2));             // channels
+        QCOMPARE(rd32(24), quint32(48000));         // sample rate
+        QCOMPARE(rd32(28), quint32(48000 * 2 * 2)); // byte rate
+        QCOMPARE(rd16(32), quint16(4));             // block align
+        QCOMPARE(rd16(34), quint16(16));            // bits
+        QCOMPARE(rd32(40), quint32(192000));        // data size
+    }
+
+    void wavWriterRoundTrip()
+    {
+        QTemporaryFile tf;
+        QVERIFY(tf.open());
+        const QString path = tf.fileName();
+        tf.close();
+
+        // 2 x 0.1 c осмысленных данных
+        QByteArray pcm(3200, '\0');
+        for (int i = 0; i < 1600; ++i) {
+            const qint16 v = static_cast<qint16>((i * 37) % 20000 - 10000);
+            std::memcpy(pcm.data() + i * 2, &v, 2);
+        }
+
+        {
+            WavWriter w;
+            QVERIFY(w.open(path, 16000, 1, 16));
+            QVERIFY(w.isOpen());
+            QVERIFY(w.write(pcm));
+            QVERIFY(w.write(pcm));
+            QCOMPARE(w.dataBytes(), static_cast<qint64>(6400));
+            QCOMPARE(w.seconds(), 0.2);
+            w.close();
+        }
+
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QByteArray all = f.readAll();
+
+        // размер = заголовок + данные
+        QCOMPARE(all.size(), 44 + 6400);
+        // заголовок проставлен при close() и совпадает с эталонным
+        QCOMPARE(all.left(44), WavWriter::makeHeader(16000, 1, 16, 6400));
+        // данные не повреждены
+        QCOMPARE(all.mid(44), pcm + pcm);
+        QCOMPARE(all.mid(44).size(), 6400);
+    }
+
+    void wavWriterRejectsBadInput()
+    {
+        WavWriter w;
+        QVERIFY(!w.open(QString(), 16000));
+        QVERIFY(!w.open(QStringLiteral("/tmp/va-test-bad.wav"), 16000, 1, 8));   // не 16 бит
+        QVERIFY(!w.open(QStringLiteral("/tmp/va-test-bad.wav"), 0));
+        QVERIFY(!w.write(QByteArray("данные")));   // не открыт
+        QVERIFY(!w.isOpen());
+        QVERIFY(!w.lastError().isEmpty());
+    }
+
+    void wavWriterFileNameHasTimestamp()
+    {
+        const QString a = WavWriter::defaultFileName(QStringLiteral("mic-check"));
+        QVERIFY(a.startsWith(QStringLiteral("mic-check-")));
+        QVERIFY(a.endsWith(QStringLiteral(".wav")));
+        QCOMPARE(a.size(), int(QStringLiteral("mic-check-20261003-042501.wav").size()));
+    }
+
+    // ---------------- EvdevHotkeyListener ----------------
+
+    void hotkeyParseKey()
+    {
+        int code = -1;
+        quint32 mods = 12345;
+        QString err;
+
+        QVERIFY(EvdevHotkeyListener::parseKey(QStringLiteral("KEY_F8"), &code, &mods, &err));
+        QCOMPARE(code, int(KEY_F8));
+        QCOMPARE(mods, quint32(EvdevHotkeyListener::ModNone));
+
+        QVERIFY(EvdevHotkeyListener::parseKey(QStringLiteral("f8"), &code, &mods, &err));
+        QCOMPARE(code, int(KEY_F8));          // регистр и префикс KEY_ не важны
+
+        QVERIFY(EvdevHotkeyListener::parseKey(QStringLiteral("66"), &code, &mods, &err));
+        QCOMPARE(code, int(KEY_F8));          // числовой код: KEY_F8 == 66
+
+        QVERIFY(EvdevHotkeyListener::parseKey(QStringLiteral("ctrl+space"), &code, &mods, &err));
+        QCOMPARE(code, int(KEY_SPACE));
+        QVERIFY(mods & EvdevHotkeyListener::ModCtrl);
+
+        QVERIFY(EvdevHotkeyListener::parseKey(QStringLiteral("Ctrl+Alt+Shift+F13"), &code, &mods, &err));
+        QCOMPARE(code, int(KEY_F13));
+        QCOMPARE(mods, quint32(EvdevHotkeyListener::ModCtrl | EvdevHotkeyListener::ModAlt
+                               | EvdevHotkeyListener::ModShift));
+
+        QVERIFY(!EvdevHotkeyListener::parseKey(QStringLiteral("неведомая"), &code, &mods, &err));
+        QVERIFY(!err.isEmpty());
+        QVERIFY(!EvdevHotkeyListener::parseKey(QString(), &code, &mods, &err));
+        QVERIFY(!EvdevHotkeyListener::parseKey(QStringLiteral("ctrl+неведомая"), &code, &mods, &err));
+        QVERIFY(!EvdevHotkeyListener::parseKey(QStringLiteral("ctrl+ctrl"), &code, &mods, &err));
+    }
+
+    void hotkeyHandlesSyntheticEvents()
+    {
+        EvdevHotkeyListener::Options opt;
+        opt.key = QStringLiteral("F8");
+        EvdevHotkeyListener l(opt);
+        QVERIFY(l.configure());          // без /dev/input — только разбор опций
+
+        QSignalSpy pressed(&l, &IHotkeyListener::pressed);
+        QSignalSpy released(&l, &IHotkeyListener::released);
+
+        auto ev = [](quint16 type, quint16 code, qint32 value) {
+            struct input_event e;
+            std::memset(&e, 0, sizeof(e));
+            e.type = type; e.code = code; e.value = value;
+            return e;
+        };
+
+        QVERIFY(l.handleEvent(ev(EV_KEY, KEY_F8, 1)));
+        QCOMPARE(pressed.count(), 1);
+
+        // автоповтор (value=2) не должен порождать второе нажатие —
+        // иначе push-to-talk дёргался бы непрерывно
+        QVERIFY(!l.handleEvent(ev(EV_KEY, KEY_F8, 2)));
+        QCOMPARE(pressed.count(), 1);
+
+        QVERIFY(l.handleEvent(ev(EV_KEY, KEY_F8, 0)));
+        QCOMPARE(released.count(), 1);
+
+        // повторное отпускание без нажатия — ничего
+        QVERIFY(!l.handleEvent(ev(EV_KEY, KEY_F8, 0)));
+        QCOMPARE(released.count(), 1);
+
+        // чужая клавиша и не-клавишные события игнорируются
+        QVERIFY(!l.handleEvent(ev(EV_KEY, KEY_A, 1)));
+        QVERIFY(!l.handleEvent(ev(EV_SYN, SYN_REPORT, 0)));
+        QVERIFY(!l.handleEvent(ev(EV_REL, REL_X, 5)));
+        QCOMPARE(pressed.count(), 1);
+    }
+
+    void hotkeyRequiresModifiers()
+    {
+        EvdevHotkeyListener::Options opt;
+        opt.key = QStringLiteral("ctrl+space");
+        EvdevHotkeyListener l(opt);
+        QVERIFY(l.configure());
+
+        QSignalSpy pressed(&l, &IHotkeyListener::pressed);
+        auto ev = [](quint16 type, quint16 code, qint32 value) {
+            struct input_event e;
+            std::memset(&e, 0, sizeof(e));
+            e.type = type; e.code = code; e.value = value;
+            return e;
+        };
+
+        l.handleEvent(ev(EV_KEY, KEY_SPACE, 1));          // без Ctrl — не наша комбинация
+        QCOMPARE(pressed.count(), 0);
+
+        l.handleEvent(ev(EV_KEY, KEY_LEFTCTRL, 1));
+        QVERIFY(l.handleEvent(ev(EV_KEY, KEY_SPACE, 1))); // с левым Ctrl
+        QCOMPARE(pressed.count(), 1);
+
+        l.handleEvent(ev(EV_KEY, KEY_SPACE, 0));
+        l.handleEvent(ev(EV_KEY, KEY_LEFTCTRL, 0));
+        l.handleEvent(ev(EV_KEY, KEY_RIGHTCTRL, 1));      // правый Ctrl тоже считается
+        QVERIFY(l.handleEvent(ev(EV_KEY, KEY_SPACE, 1)));
+        QCOMPARE(pressed.count(), 2);
+    }
+
+    void hotkeyConfigureRejectsBadKey()
+    {
+        EvdevHotkeyListener::Options opt;
+        opt.key = QStringLiteral("такой-клавиши-нет");
+        EvdevHotkeyListener l(opt);
+        QString err;
+        QVERIFY(!l.configure(&err));
+        QVERIFY(err.contains(QStringLiteral("неизвестная клавиша")));
+        QVERIFY(!l.isActive());
     }
 
     // ---------------- XdotoolInjector (dry-run) ----------------

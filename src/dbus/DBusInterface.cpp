@@ -43,3 +43,23 @@ QString DBusInterface::getMode() const {
 void DBusInterface::reloadHotwords() {
     m_controller->reloadHotwords();
 }
+
+QString DBusInterface::startMicCheck() {
+    QString path;
+    if (!m_controller->startMicCheck(&path)) {
+        return QString();
+    }
+    return path;
+}
+
+void DBusInterface::stopMicCheck() {
+    m_controller->stopMicCheck();
+}
+
+bool DBusInterface::isMicChecking() const {
+    return m_controller->isMicChecking();
+}
+
+QString DBusInterface::hotkeyStatus() const {
+    return m_controller->hotkeyDescription();
+}

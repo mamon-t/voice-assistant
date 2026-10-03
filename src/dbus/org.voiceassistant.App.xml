@@ -13,6 +13,16 @@
       <arg name="mode" type="s" direction="out"/>
     </method>
     <method name="reloadHotwords"/>
+    <method name="startMicCheck">
+      <arg name="path" type="s" direction="out"/>  <!-- "" если не started -->
+    </method>
+    <method name="stopMicCheck"/>
+    <method name="isMicChecking">
+      <arg name="recording" type="b" direction="out"/>
+    </method>
+    <method name="hotkeyStatus">
+      <arg name="status" type="s" direction="out"/>
+    </method>
     
     <!-- Сигналы -->
     <signal name="modeChanged">

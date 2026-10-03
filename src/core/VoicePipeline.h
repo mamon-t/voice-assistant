@@ -110,5 +110,6 @@ private:
     TextPostProcessor m_post;
     QStringList m_userHotwords;
     float m_hotwordsScore = 2.0f;
+    bool m_hotwordsApplied = false;
     bool m_ready = false;
 };

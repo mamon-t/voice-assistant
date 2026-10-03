@@ -17,6 +17,8 @@ class ITextInjector;
 class CommandParser;
 class HotwordsManager;
 class ISpellChecker;
+class IHotkeyListener;
+class WavWriter;
 
 // Сердце приложения: аудиопоток -> AGC -> VoicePipeline (VAD -> ASR -> пунктуация),
 // затем маршрутизация результата: команда или вставка текста.
@@ -43,6 +45,20 @@ public:
     // --- подсказки пользователя ---
     void reloadHotwords();
 
+    // --- проверка микрофона: запись тракта в WAV ---
+    // Пишет те же чанки, что уходят в ASR (по умолчанию после AGC — см.
+    // [audio] mic_check_source), поэтому файл можно прогнать офлайн:
+    //   ./tools/vad-asr-test запись.wav --config ~/.config/voice-assistant/settings.ini
+    // Работает и в Mode::Off: захват запускается специально и режим не меняется.
+    bool    startMicCheck(QString* outFile = nullptr);
+    void    stopMicCheck();
+    bool    isMicChecking() const;
+    QString micCheckFile() const;
+
+    // --- глобальный хоткей ---
+    bool    isHotkeyActive() const;
+    QString hotkeyDescription() const;
+
     // Последняя ошибка, в том числе возникшая в конструкторе (тогда её ещё
     // некому было принять сигналом). Пустая строка — ошибок не было.
     QString lastError() const { return m_lastError; }
@@ -62,6 +78,8 @@ signals:
     void textRecognized(const QString& text);        // что услышали (после постобработки)
     void commandExecuted(const QString& description); // для логов и UI
     void spellcheckFinished(const QString& text, const QStringList& errors);
+    void micCheckStarted(const QString& path);
+    void micCheckFinished(const QString& path, double seconds);
 
 private slots:
     void onAudioDataReady(const QByteArray& data, int sampleRate);
@@ -75,6 +93,9 @@ private:
     void executeCommand(const Command& cmd);
     void injectText(const QString& text);
     void runSpellcheck(const QString& text);
+    void setupHotkey();
+    void onHotkeyPressed();
+    void onHotkeyReleased();
 
     Mode m_mode = Mode::Off;
 
@@ -86,6 +107,12 @@ private:
     std::unique_ptr<CommandParser>   m_commands;
     std::unique_ptr<HotwordsManager> m_hotwords;
     std::unique_ptr<ISpellChecker>   m_spellChecker;
+    std::unique_ptr<IHotkeyListener> m_hotkey;
+    std::unique_ptr<WavWriter>       m_wavWriter;
+
+    bool    m_micCheckOwnsCapture = false;   // захват запущен специально для записи
+    QString m_micCheckSource;                // "agc" | "raw"
+    QString m_hotkeyMode;                    // "push_to_talk" | "toggle"
 
     QByteArray m_audioBuffer;
     static constexpr int TARGET_CHUNK_SIZE = 1600; // 50 мс при 16 кГц

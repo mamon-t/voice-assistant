@@ -86,6 +86,8 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 | ASR | `IRecognizer` | `TransducerRecognizer`, `NemoCtcRecognizer`, `WhisperRecognizer` |
 | Ввод текста | `ITextInjector` | `XdotoolInjector` |
 | Правописание | `ISpellChecker` | `HunspellChecker` (hunspell, C API) |
+| Глобальный хоткей | `IHotkeyListener` | `EvdevHotkeyListener` (`/dev/input/event*`) |
+| Запись аудио | — | `WavWriter` (PCM16 → WAV) |
 
 Конкретную реализацию ASR выбирает `RecognizerFactory::create(AsrProfile)`;
 остальное приложение знает только `IRecognizer`.
@@ -144,6 +146,47 @@ onTextReady(text) → injectText(text)
 `HunspellChecker` намеренно использует **C API** hunspell (`char*`), а не
 `hunspell.hxx` (`std::string`): C++ API зависит от `_GLIBCXX_USE_CXX11_ABI`
 и ломает линковку при сборке со старым ABI.
+
+## Проверка микрофона и запись в WAV
+
+`WavWriter` пишет заголовок сразу с нулевыми размерами и правит его в `close()`.
+Поэтому файл остаётся читаемым даже после аварийного завершения: размеры
+восстанавливаются из фактической длины — именно так поступает читатель
+в `tools/vad_asr_test.cpp`. Корректность заголовка проверена двумя способами:
+юнит-тестом на побайтовое совпадение с `makeHeader()` и внешним читателем
+(модуль `wave` из стандартной библиотеки Python).
+
+Два источника записи, и это не избыточность:
+
+| Источник | Как включить | Что показывает |
+|---|---|---|
+| сырой микрофон | `./src/voice-assistant --record N file.wav` | что реально отдаёт устройство, без AGC |
+| тракт после AGC | пункт в трее / D-Bus `startMicCheck` | то же, что слышит ASR |
+
+Сравнение двух записей одного текста отвечает на вопрос «AGC помогает или вредит».
+
+Запись работает и в `Mode::Off`: `startMicCheck()` сам запускает захват
+(флаг `m_micCheckOwnsCapture`) и не меняет режим, а `stopRecording()` не глушит
+захват, пока идёт запись.
+
+## Глобальный хоткей
+
+`EvdevHotkeyListener` читает `/dev/input/event*` напрямую, поэтому работает
+в X11, Wayland и TTY. Устройства отбираются по наличию нужной клавиши
+в битовой маске `EVIOCGBIT(EV_KEY)`; на каждый fd вешается свой
+`QSocketNotifier`.
+
+Логика разбора вынесена в `handleEvent(const struct input_event&)` и не зависит
+от дескрипторов, поэтому покрыта тестами на синтетических событиях:
+нажатие (`value=1`), отпускание (`value=0`), автоповтор (`value=2` — игнорируется,
+иначе push-to-talk дёргался бы непрерывно), чужие клавиши, не-клавишные события
+и модификаторы (левый и правый Ctrl считаются одним).
+
+`configure()` валидирует спецификацию клавиши **без** обращения к `/dev/input` —
+этим пользуется `--check`, которому права на устройства не нужны.
+
+`EVIOCGRAB` (`[hotkey] grab`) по умолчанию выключен: он забирает устройство
+эксклюзивно, и X-сервер перестаёт получать с него все клавиши.
 
 ## Потоки
 

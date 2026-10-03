@@ -33,8 +33,8 @@ VoicePipeline::Settings VoicePipeline::loadSettings(const ConfigManager& config)
     s.asr = config.activeAsrProfile();
 
     s.text.voicePunctuation    = config.voicePunctuation();
-    s.text.capitalizeSentences = config.autoPunctuate();
-    s.text.addFinalDot         = config.autoPunctuate();
+    s.text.capitalizeSentences = config.capitalizeSentences();
+    s.text.addFinalDot         = config.addFinalDot();
     s.text.collapseSpaces      = true;
 
     s.punctuationHotwordsScore = config.punctuationHotwordsScore();
@@ -104,8 +104,11 @@ bool VoicePipeline::initialize(QString* error)
 
     m_ready = true;
 
-    // Диктантные знаки сразу в hotwords: иначе ASR их проглатывает и пунктуация не появится
-    applyHotwords();
+    // Подсказки здесь НЕ применяем: ApplicationController всё равно вызовет
+    // setHotwords() со своим списком, и получилась бы двойная строка в логе
+    // (13 шт. от знаков, потом 31 шт. со словарём команд). Вместо этого
+    // applyHotwords() сработает лениво — перед первым декодированием, если
+    // список так никто и не задал (так работает tools/vad_asr_test).
 
     qInfo().noquote() << QString("VoicePipeline готов: VAD=%1 | ASR=%2 (%3) | потоков=%4 | пунктуация=%5")
                              .arg(m_settings.vadModelPath,
@@ -187,12 +190,26 @@ void VoicePipeline::applyHotwords()
     }
 
     m_asr->setHotwords(effective, m_hotwordsScore);
+    m_hotwordsApplied = true;
+
+    const int userCount = m_userHotwords.size();
+    qInfo().noquote()
+        << QStringLiteral("Hotwords: %1 пользовательских/командных + %2 диктантных знаков = %3 "
+                          "(score=%4)")
+               .arg(userCount)
+               .arg(effective.size() - userCount)
+               .arg(effective.size())
+               .arg(m_hotwordsScore, 0, 'f', 1);
 }
 
 void VoicePipeline::onSpeechSegment(const QByteArray& pcm16, int sampleRate)
 {
     if (!m_asr) {
         return;
+    }
+
+    if (!m_hotwordsApplied) {
+        applyHotwords();   // лениво: диктантные знаки должны попасть в ASR до первого декода
     }
 
     m_asr->acceptWaveform(pcm16, sampleRate);

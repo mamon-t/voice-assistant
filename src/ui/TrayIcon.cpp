@@ -5,6 +5,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QFileInfo>
 #include <QIcon>
 #include <QMenu>
 #include <QTimer>
@@ -58,6 +59,11 @@ void TrayIcon::buildMenu()
         });
     }
 
+    // --- Проверка микрофона: запись тракта в WAV ---
+    m_micCheckAction = menu->addAction(tr("Проверить микрофон (запись в WAV)"));
+    m_micCheckAction->setCheckable(true);
+    connect(m_micCheckAction, &QAction::triggered, this, &TrayIcon::onToggleMicCheck);
+
     menu->addSeparator();
 
     // --- Настройки и редактор hotwords ---
@@ -86,6 +92,23 @@ void TrayIcon::connectSignals()
     connect(m_controller, &ApplicationController::errorOccurred,
             this, &TrayIcon::onError);
 
+    // Запись микрофона завершена — сообщаем, куда лёг файл
+    connect(m_controller, &ApplicationController::micCheckFinished,
+            this, [this](const QString& path, double seconds) {
+        if (m_micCheckAction) {
+            m_micCheckAction->setChecked(false);
+            m_micCheckAction->setText(tr("Проверить микрофон (запись в WAV)"));
+        }
+        const QString msg = tr("%1 с записано в %2\nПрогнать: ./tools/vad-asr-test %3 --config "
+                               "~/.config/voice-assistant/settings.ini")
+                                .arg(seconds, 0, 'f', 1).arg(path, path);
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Запись микрофона сохранена"), msg, QSystemTrayIcon::Information, 15000);
+        } else {
+            qInfo().noquote() << msg;
+        }
+    });
+
     // Результаты проверки правописания показываем уведомлением: список слов
     // с вариантами исправления берём у контроллера, чтобы не тащить их сигналом.
     connect(m_controller, &ApplicationController::spellcheckFinished,
@@ -108,6 +131,26 @@ void TrayIcon::connectSignals()
             qInfo().noquote() << lines.join(QStringLiteral("; "));
         }
     });
+}
+
+void TrayIcon::onToggleMicCheck()
+{
+    if (!m_controller) {
+        return;
+    }
+    if (m_controller->isMicChecking()) {
+        m_controller->stopMicCheck();
+        if (m_micCheckAction) {
+            m_micCheckAction->setChecked(false);
+            m_micCheckAction->setText(tr("Проверить микрофон (запись в WAV)"));
+        }
+    } else {
+        QString path;
+        if (m_controller->startMicCheck(&path) && m_micCheckAction) {
+            m_micCheckAction->setChecked(true);
+            m_micCheckAction->setText(tr("Остановить запись: %1").arg(QFileInfo(path).fileName()));
+        }
+    }
 }
 
 void TrayIcon::onError(const QString& message)

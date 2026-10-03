@@ -298,6 +298,24 @@ bool ConfigManager::voicePunctuation() const
     return m_settings.value(QStringLiteral("text/voice_punctuation"), true).toBool();
 }
 
+bool ConfigManager::capitalizeSentences() const
+{
+    // auto_punctuate — общий выключатель (обратная совместимость),
+    // capitalize / add_final_dot позволяют оставить заглавные, но убрать точку.
+    if (!autoPunctuate()) {
+        return false;
+    }
+    return m_settings.value(QStringLiteral("text/capitalize"), true).toBool();
+}
+
+bool ConfigManager::addFinalDot() const
+{
+    if (!autoPunctuate()) {
+        return false;
+    }
+    return m_settings.value(QStringLiteral("text/add_final_dot"), true).toBool();
+}
+
 // ---------------------------------------------------------------------------
 // Вывод текста, команды, отладка
 // ---------------------------------------------------------------------------
@@ -361,6 +379,58 @@ QString ConfigManager::spellcheckDictionaryDir() const
 int ConfigManager::spellcheckMaxSuggestions() const
 {
     return m_settings.value(QStringLiteral("spellcheck/max_suggestions"), 5).toInt();
+}
+
+QString ConfigManager::micCheckDir() const
+{
+    const QString v = m_settings.value(QStringLiteral("audio/mic_check_dir")).toString().trimmed();
+    if (!v.isEmpty()) {
+        return resolvePath(v);
+    }
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+           + QStringLiteral("/recordings");
+}
+
+QString ConfigManager::micCheckSource() const
+{
+    const QString v = m_settings.value(QStringLiteral("audio/mic_check_source"),
+                                       QStringLiteral("agc")).toString().trimmed().toLower();
+    return (v == QLatin1String("raw")) ? QStringLiteral("raw") : QStringLiteral("agc");
+}
+
+QString ConfigManager::micCheckPrefix() const
+{
+    const QString v = m_settings.value(QStringLiteral("audio/mic_check_prefix"),
+                                       QStringLiteral("mic-check")).toString().trimmed();
+    return v.isEmpty() ? QStringLiteral("mic-check") : v;
+}
+
+QString ConfigManager::hotkeyBackend() const
+{
+    return m_settings.value(QStringLiteral("hotkey/backend"), QStringLiteral("evdev"))
+        .toString().trimmed().toLower();
+}
+
+QString ConfigManager::hotkeyKey() const
+{
+    return m_settings.value(QStringLiteral("hotkey/key"), QStringLiteral("KEY_F8"))
+        .toString().trimmed();
+}
+
+bool ConfigManager::hotkeyGrab() const
+{
+    // По умолчанию false и это принципиально: EVIOCGRAB забирает устройство
+    // эксклюзивно, и X-сервер перестаёт получать с него ВСЕ клавиши.
+    // Включать имеет смысл только для выделенной педали или второй клавиатуры.
+    return m_settings.value(QStringLiteral("hotkey/grab"), false).toBool();
+}
+
+QString ConfigManager::hotkeyMode() const
+{
+    const QString v = m_settings.value(QStringLiteral("hotkey/mode"),
+                                       QStringLiteral("push_to_talk")).toString().trimmed().toLower();
+    return (v == QLatin1String("toggle")) ? QStringLiteral("toggle")
+                                          : QStringLiteral("push_to_talk");
 }
 
 bool ConfigManager::audioDebugLog() const
