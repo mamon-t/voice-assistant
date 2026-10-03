@@ -5,11 +5,14 @@
 
 #include <QtTest/QtTest>
 #include <QTemporaryFile>
+#include <QDir>
 #include <QFile>
 #include <QTextStream>
 
 #include "commands/CommandDictionary.h"
 #include "commands/CommandParser.h"
+#include "config/AsrProfile.h"
+#include "config/ConfigManager.h"
 #include "output/XdotoolInjector.h"
 #include "text/TextPostProcessor.h"
 
@@ -204,7 +207,89 @@ private slots:
         QVERIFY(!phrases.contains(QStringLiteral("пробел")));   // его бустить не надо
     }
 
+    // ---------------- ConfigManager ----------------
+
+    void configReadsProfiles()
+    {
+        QTemporaryFile f;
+        QVERIFY(f.open());
+        {
+            QTextStream out(&f);
+            out.setCodec("UTF-8");
+            out << QStringLiteral("[asr]\n")
+                << QStringLiteral("active=ru\n")
+                << QStringLiteral("profiles=ru,en\n")
+                << QStringLiteral("num_threads=3\n")
+                << QStringLiteral("\n[asr_ru]\n")
+                << QStringLiteral("engine=transducer\n")
+                << QStringLiteral("encoder=models/ru/encoder.int8.onnx\n")
+                << QStringLiteral("decoder=/abs/ru/decoder.onnx\n")
+                << QStringLiteral("joiner=~/ru/joiner.onnx\n")
+                << QStringLiteral("tokens=ru/tokens.txt\n")
+                << QStringLiteral("bpe_vocab=ru/bpe.vocab\n")
+                << QStringLiteral("\n[asr_en]\n")
+                << QStringLiteral("engine=whisper\n")
+                << QStringLiteral("encoder=en/enc.onnx\n")
+                << QStringLiteral("decoder=en/dec.onnx\n")
+                << QStringLiteral("tokens=en/tokens.txt\n")
+                << QStringLiteral("language=en\n")
+                << QStringLiteral("\n[output]\n")
+                << QStringLiteral("method=clipboard\n")
+                << QStringLiteral("preserve_clipboard=false\n")
+                << QStringLiteral("clipboard_restore_ms=250\n");
+        }
+        f.close();
+
+        const ConfigManager cfg(f.fileName());
+
+        // значение с запятыми QSettings отдаёт как QStringList — проверяем, что
+        // ConfigManager это учитывает (на этом месте уже был баг)
+        QCOMPARE(cfg.asrProfileNames(), (QStringList{QStringLiteral("ru"), QStringLiteral("en")}));
+        QCOMPARE(cfg.activeAsrProfileName(), QStringLiteral("ru"));
+        QVERIFY(cfg.hasAsrProfile(QStringLiteral("ru")));
+        QVERIFY(!cfg.hasAsrProfile(QStringLiteral("нет-такого")));
+
+        const AsrProfile ru = cfg.asrProfile(QStringLiteral("ru"));
+        QCOMPARE(ru.engine, AsrProfile::Engine::Transducer);
+        QCOMPARE(ru.numThreads, 3);                              // унаследован от [asr]
+        QCOMPARE(ru.decodingMethod, QStringLiteral("modified_beam_search")); // дефолт transducer
+        QCOMPARE(ru.modelingUnit, QStringLiteral("bpe"));        // подставился из-за bpe_vocab
+        QVERIFY(ru.encoderPath.endsWith(QStringLiteral("/.voice_models/models/ru/encoder.int8.onnx")));
+        QCOMPARE(ru.decoderPath, QStringLiteral("/abs/ru/decoder.onnx"));  // абсолютный не трогаем
+        QVERIFY(ru.joinerPath.startsWith(QDir::homePath()));                // ~ раскрыт
+        QVERIFY(!ru.isValid());                                  // файлов нет -> профиль не готов
+
+        const AsrProfile en = cfg.asrProfile(QStringLiteral("en"));
+        QCOMPARE(en.engine, AsrProfile::Engine::Whisper);
+        QCOMPARE(en.language, QStringLiteral("en"));
+        QCOMPARE(en.decodingMethod, QStringLiteral("greedy_search"));
+
+        QCOMPARE(cfg.injectorMethod(), QStringLiteral("clipboard"));
+        QVERIFY(!cfg.preserveClipboard());
+        QCOMPARE(cfg.clipboardRestoreMs(), 250);
+    }
+
+    void configDefaultsWithoutFile()
+    {
+        const ConfigManager cfg(QStringLiteral("/tmp/нет-такого-файла-va.ini"));
+        QVERIFY(cfg.autoPunctuate());          // дефолты должны быть рабочими
+        QVERIFY(cfg.voicePunctuation());
+        QVERIFY(cfg.preserveClipboard());
+        QCOMPARE(cfg.clipboardRestoreMs(), 1000);
+        QCOMPARE(cfg.vadThreshold(), 0.5f);
+        QVERIFY(cfg.asrProfileNames().isEmpty());
+    }
+
     // ---------------- XdotoolInjector (dry-run) ----------------
+
+    void injectorClipboardOptions()
+    {
+        XdotoolInjector inj;
+        inj.setPreserveClipboard(true);
+        inj.setClipboardRestoreMs(250);
+        QVERIFY(inj.initialize());
+        QVERIFY(inj.typeText(QStringLiteral("тест")));   // в dry-run буфер не трогается
+    }
 
     void injectorDryRun()
     {

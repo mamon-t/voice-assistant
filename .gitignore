@@ -2,6 +2,7 @@
 build/
 build-*/
 cmake-build-*/
+venv/
 
 # IDE
 .vscode/

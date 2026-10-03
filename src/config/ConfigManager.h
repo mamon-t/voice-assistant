@@ -66,6 +66,8 @@ public:
     // --- вывод текста (ITextInjector) ---
     QString injectorMethod() const;    // [output] method: auto | xdotool | clipboard
     int     typingDelayMs() const;     // [output] typing_delay_ms
+    bool    preserveClipboard() const; // [output] preserve_clipboard
+    int     clipboardRestoreMs() const;// [output] clipboard_restore_ms
 
     // --- команды ---
     bool    editingCommandsInDictation() const;  // [commands] editing_in_dictation

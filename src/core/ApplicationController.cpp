@@ -65,9 +65,11 @@ ApplicationController::ApplicationController(QObject* parent)
         injector->setMethod(XdotoolInjector::Method::Auto);
     }
     injector->setTypingDelayMs(m_config->typingDelayMs());
+    injector->setPreserveClipboard(m_config->preserveClipboard());
+    injector->setClipboardRestoreMs(m_config->clipboardRestoreMs());
 
     if (!injector->initialize() || !injector->isAvailable()) {
-        emit errorOccurred(QStringLiteral(
+        reportError(QStringLiteral(
             "Ввод текста недоступен: нужен xdotool (X11) и, желательно, xclip. "
             "Для Wayland/TTY требуется ydotool."));
     }
@@ -76,8 +78,9 @@ ApplicationController::ApplicationController(QObject* parent)
     // 5. Аудиоподсистема --------------------------------------------------------
     m_audioCapture = std::make_unique<QtAudioCapture>();
     if (!m_audioCapture->initialize()) {
-        qCritical() << "Failed to initialize audio capture";
-        emit errorOccurred(QStringLiteral("Failed to initialize audio capture"));
+        reportError(QStringLiteral("Не удалось инициализировать захват звука"));
+        m_mode = Mode::Error;
+        emit modeChanged(m_mode);
         return;
     }
 
@@ -96,8 +99,24 @@ ApplicationController::ApplicationController(QObject* parent)
 
     // 6. Речевой пайплайн (VAD -> ASR -> пунктуация) -----------------------------
     if (!buildPipeline()) {
-        return;   // ошибка уже отправлена сигналом из buildPipeline()
+        // Без ASR приложение работать не может. Не делаем вид, что всё в порядке:
+        // переводимся в Mode::Error (трей покажет error.svg) и сообщаем наружу.
+        m_mode = Mode::Error;
+        emit modeChanged(m_mode);
+        return;
     }
+}
+
+void ApplicationController::reportError(const QString& message)
+{
+    m_lastError = message;
+    qCritical().noquote() << message;
+    emit errorOccurred(message);
+}
+
+bool ApplicationController::isReady() const
+{
+    return static_cast<bool>(m_pipeline);
 }
 
 ApplicationController::~ApplicationController()
@@ -125,8 +144,10 @@ bool ApplicationController::buildPipeline()
 
     QString err;
     if (!m_pipeline->initialize(&err)) {
-        emit errorOccurred(QStringLiteral("VoicePipeline: %1").arg(err));
         m_pipeline.reset();
+        reportError(QStringLiteral("Речевой тракт не запущен: %1. "
+                                   "Диагностика: ./src/voice-assistant --check")
+                        .arg(err));
         return false;
     }
 
@@ -170,6 +191,12 @@ Mode ApplicationController::mode() const
 
 void ApplicationController::startRecording()
 {
+    if (!m_pipeline) {
+        reportError(QStringLiteral(
+            "Запись не начата: речевой тракт не инициализирован. "
+            "Проверьте модели — ./src/voice-assistant --check"));
+        return;
+    }
     if (m_mode == Mode::Off) {
         if (m_agc)      m_agc->reset();
         if (m_pipeline) m_pipeline->reset();
@@ -198,6 +225,13 @@ void ApplicationController::stopRecording()
 void ApplicationController::setMode(Mode mode)
 {
     if (m_mode == mode) {
+        return;
+    }
+    if (mode != Mode::Off && !m_pipeline) {
+        reportError(QStringLiteral(
+            "Режим %1 не включён: речевой тракт не инициализирован. "
+            "Проверьте модели — ./src/voice-assistant --check")
+                        .arg(modeToString(mode)));
         return;
     }
 
@@ -238,7 +272,7 @@ bool ApplicationController::switchAsrProfile(const QString& profileName)
         return false;
     }
     if (!m_config->hasAsrProfile(profileName)) {
-        emit errorOccurred(QStringLiteral("Нет профиля ASR: %1").arg(profileName));
+        reportError(QStringLiteral("Нет профиля ASR: %1").arg(profileName));
         return false;
     }
 
@@ -365,11 +399,11 @@ void ApplicationController::onTextReady(const QString& text)
 void ApplicationController::injectText(const QString& text)
 {
     if (!m_injector || !m_injector->isAvailable()) {
-        emit errorOccurred(QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
+        reportError(QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
         return;
     }
     if (!m_injector->typeText(text)) {
-        emit errorOccurred(QStringLiteral("Не удалось вставить текст"));
+        reportError(QStringLiteral("Не удалось вставить текст"));
     }
 }
 
@@ -393,8 +427,8 @@ void ApplicationController::executeCommand(const Command& cmd)
     }
 
     if (!m_injector || !m_injector->isAvailable()) {
-        emit errorOccurred(QStringLiteral("Инжектор недоступен, команда «%1» не выполнена")
-                               .arg(desc));
+        reportError(QStringLiteral("Инжектор недоступен, команда «%1» не выполнена")
+                        .arg(desc));
         return;
     }
 

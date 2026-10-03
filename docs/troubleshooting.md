@@ -11,13 +11,58 @@
 | `error while loading shared libraries: libsherpa-onnx-cxx-api.so` | загрузчик не знает про `/usr/local/lib` | [раздел 5](#5-библиотеки-не-находятся-при-запуске) |
 | Русский распознаётся как латинская каша | выбрана модель без русского | [раздел 6](#6-русский-распознаётся-неразборчиво) |
 | Вместо «привет» печатается «ghbdtn» | `xdotool type` при английской раскладке | [раздел 7](#7-вместо-кириллицы-печатаются-латинские-буквы) |
+| Приложение работает, но речь не распознаётся | не инициализировался ASR: нет файлов модели | [раздел 0](#0-ничего-не-распознаётся-первое-что-проверить) |
 | Текст не печатается вообще | нет xdotool / Wayland | [раздел 8](#8-текст-не-вставляется) |
+| Буфер обмена затирается при диктовке | вставка идёт через буфер | `[output] preserve_clipboard=true` (по умолчанию включено) |
 | Нет сегментов, `Segments: 0` | не та частота, тишина, высокий порог VAD | [раздел 9](#9-сегменты-не-появляются) |
 | Подсказки не действуют | не transducer или не `modified_beam_search` | [раздел 10](#10-hotwords-не-работают) |
 | `Each line in vocab should contain two items` | вместо словаря ssentencepiece подсунули `bpe.model` | [раздел 11](#11-ошибка-про-две-колонки-в-vocab) |
 | Кириллица в своём конфиге читается кракозябрами | `QTextStream << "строка"` узким литералом | [раздел 12](#12-кракозябры-в-своих-файлах-команд) |
 
 ---
+
+## 0. Ничего не распознаётся: первое, что проверить
+
+```bash
+./src/voice-assistant --check
+```
+
+Инструмент печатает все пути из конфига с пометкой `OK (размер)` или `НЕТ ФАЙЛА`
+и итоговое число проблем. Самый частый случай — модель не скачана или лежит
+в другом каталоге:
+
+```
+  [zipformer-ru] * engine=transducer threads=2 decoding=modified_beam_search
+  encoder  : /home/…/.voice_models/sherpa-onnx-small-zipformer-ru-2024-09-18/encoder.int8.onnx  НЕТ ФАЙЛА
+  ИТОГ: профиль НЕ готов
+```
+
+При этом в логе запуска будет строка
+
+```
+VoicePipeline: профиль 'zipformer-ru': encoder не найден: …
+```
+
+и приложение переведётся в `Mode::Error` (в лотке — иконка `error.svg`, плюс
+всплывающее уведомление). Запись при этом не начинается: `startRecording()`
+и `setMode()` отказываются работать без инициализированного тракта и говорят об этом.
+
+Лечение — скачать модель (см. README, раздел «Модели») и перепроверить:
+
+```bash
+mkdir -p ~/.voice_models && cd ~/.voice_models
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2
+tar xf sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2 && rm sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2
+./src/voice-assistant --check        # должно стать «всё на месте»
+```
+
+Если файлы на месте, но тракт всё равно не поднимается — проверьте ABI
+([раздел 1](#1-segfault-при-создании-vad-или-asr)) и прогоните запись напрямую:
+
+```bash
+./tools/vad-asr-test ~/.voice_models/sherpa-onnx-small-zipformer-ru-2024-09-18/test_wavs/0.wav \
+    --config ~/.config/voice-assistant/settings.ini
+```
 
 ## 1. Segfault при создании VAD или ASR
 

@@ -1,10 +1,13 @@
 #include "ui/TrayIcon.h"
 #include "core/ApplicationController.h"
 
+#include <QDebug>
+
 #include <QAction>
+#include <QApplication>
 #include <QIcon>
 #include <QMenu>
-#include <QApplication>
+#include <QTimer>
 
 TrayIcon::TrayIcon(ApplicationController* controller, QWidget* parent)
     : QSystemTrayIcon(parent)
@@ -12,7 +15,15 @@ TrayIcon::TrayIcon(ApplicationController* controller, QWidget* parent)
 {
     buildMenu();
     connectSignals();
-    updateIcon(Mode::Off);
+    updateIcon(m_controller ? m_controller->mode() : Mode::Off);
+
+    // Ошибки, возникшие в конструкторе ApplicationController, сигналом мы уже
+    // не получим (подписка появилась позже). Догоняем их отложенно — к этому
+    // моменту значок в лотке уже создан и уведомление будет кому показать.
+    if (m_controller && !m_controller->lastError().isEmpty()) {
+        const QString msg = m_controller->lastError();
+        QTimer::singleShot(300, this, [this, msg]() { onError(msg); });
+    }
 }
 
 void TrayIcon::buildMenu()
@@ -72,6 +83,22 @@ void TrayIcon::connectSignals()
 {
     connect(m_controller, &ApplicationController::modeChanged,
             this, &TrayIcon::onModeChanged);
+    connect(m_controller, &ApplicationController::errorOccurred,
+            this, &TrayIcon::onError);
+}
+
+void TrayIcon::onError(const QString& message)
+{
+    if (message.isEmpty()) {
+        return;
+    }
+    if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+        showMessage(QStringLiteral("voice-assistant"), message,
+                    QSystemTrayIcon::Warning, 15000);
+    } else {
+        // нет лотка (чистый WM, ssh) — хотя бы в лог
+        qWarning().noquote() << message;
+    }
 }
 
 // --- Слоты ---

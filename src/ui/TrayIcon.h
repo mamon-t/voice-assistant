@@ -19,6 +19,7 @@ private slots:
     void onShowSettings();
     void onShowHotwordsEditor();
     void onModeChanged(Mode mode);
+    void onError(const QString& message);
 
 private:
     void buildMenu();

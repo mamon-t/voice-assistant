@@ -87,8 +87,12 @@ inline bool AsrProfile::isValid(QString* error) const
     const auto need = [&](const QString& path, const char* what) {
         if (path.isEmpty() || !QFile::exists(path)) {
             if (error) {
-                *error = QStringLiteral("профиль '%1': %2 не найден: %3")
-                             .arg(name, QString::fromLatin1(what), path);
+                *error = QStringLiteral(
+                         "профиль '%1': %2 не найден: %3\n"
+                         "  Модели скачиваются отдельно — см. docs/models.md "
+                         "(wget из релизов k2-fsa/sherpa-onnx в ~/.voice_models).\n"
+                         "  Диагностика: ./src/voice-assistant --check")
+                         .arg(name, QString::fromLatin1(what), path);
             }
             return false;
         }

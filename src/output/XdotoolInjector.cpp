@@ -1,9 +1,24 @@
 #include "output/XdotoolInjector.h"
 
+#include <QClipboard>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QGuiApplication>
 #include <QProcess>
 #include <QStandardPaths>
+#include <QTimer>
+
+namespace {
+
+// Буфер обмена доступен, только если создан QGuiApplication (в QApplication он есть).
+// В консольных инструментах с QCoreApplication его нет — не падаем, а пропускаем.
+QClipboard* clipboard()
+{
+    auto* gui = qobject_cast<QGuiApplication*>(QCoreApplication::instance());
+    return gui ? gui->clipboard() : nullptr;
+}
+
+}  // namespace
 
 namespace {
 
@@ -63,6 +78,16 @@ void XdotoolInjector::setMethod(Method method)
 void XdotoolInjector::setTypingDelayMs(int ms)
 {
     m_typingDelayMs = (ms >= 0) ? ms : 0;
+}
+
+void XdotoolInjector::setPreserveClipboard(bool preserve)
+{
+    m_preserveClipboard = preserve;
+}
+
+void XdotoolInjector::setClipboardRestoreMs(int ms)
+{
+    m_clipboardRestoreMs = (ms >= 0) ? ms : 1000;
 }
 
 QString XdotoolInjector::backendName() const
@@ -156,14 +181,35 @@ bool XdotoolInjector::typeViaClipboard(const QString& text)
     if (m_clipboardTool.isEmpty()) {
         return false;
     }
+
+    // Запоминаем, что лежало в буфере, чтобы вернуть после вставки
+    QString saved;
+    bool haveSaved = false;
+    if (m_preserveClipboard) {
+        if (QClipboard* cb = clipboard()) {
+            saved = cb->text();
+            haveSaved = true;
+        }
+    }
+
     if (!runProcess(m_clipboardTool, m_clipboardArgs, text.toUtf8())) {
         return false;
     }
-    // Небольшая пауза, чтобы буфер успел заполниться до вставки
     if (!runProcess(m_xdotool,
                     { QStringLiteral("key"), QStringLiteral("--clearmodifiers"),
                       QStringLiteral("ctrl+v") })) {
         return false;
+    }
+
+    if (haveSaved) {
+        // Возвращаем не сразу: целевое приложение должно успеть забрать текст
+        // из буфера по Ctrl+V. Задержка настраивается [output] clipboard_restore_ms.
+        const int delay = m_clipboardRestoreMs;
+        QTimer::singleShot(delay, [saved]() {
+            if (QClipboard* cb = clipboard()) {
+                cb->setText(saved);
+            }
+        });
     }
     return true;
 }

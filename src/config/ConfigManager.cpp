@@ -299,6 +299,16 @@ int ConfigManager::typingDelayMs() const
     return m_settings.value(QStringLiteral("output/typing_delay_ms"), 12).toInt();
 }
 
+bool ConfigManager::preserveClipboard() const
+{
+    return m_settings.value(QStringLiteral("output/preserve_clipboard"), true).toBool();
+}
+
+int ConfigManager::clipboardRestoreMs() const
+{
+    return m_settings.value(QStringLiteral("output/clipboard_restore_ms"), 1000).toInt();
+}
+
 bool ConfigManager::editingCommandsInDictation() const
 {
     return m_settings.value(QStringLiteral("commands/editing_in_dictation"), false).toBool();

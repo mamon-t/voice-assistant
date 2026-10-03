@@ -42,6 +42,13 @@ public:
     // --- подсказки пользователя ---
     void reloadHotwords();
 
+    // Последняя ошибка, в том числе возникшая в конструкторе (тогда её ещё
+    // некому было принять сигналом). Пустая строка — ошибок не было.
+    QString lastError() const { return m_lastError; }
+
+    // Готов ли тракт к работе (VAD и ASR созданы).
+    bool isReady() const;
+
 signals:
     void modeChanged(Mode mode);
     void errorOccurred(const QString& message);
@@ -73,6 +80,9 @@ private:
     QByteArray m_audioBuffer;
     static constexpr int TARGET_CHUNK_SIZE = 1600; // 50 мс при 16 кГц
 
+    void reportError(const QString& message);
+
+    QString m_lastError;
     bool m_skipNextText   = false;  // фраза оказалась командой — вставлять нечего
     bool m_audioDebugLog  = false;
     bool m_editCmdsInDictation = false;

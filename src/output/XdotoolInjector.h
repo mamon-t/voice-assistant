@@ -36,6 +36,13 @@ public:
     void setMethod(Method method);
     Method method() const { return m_method; }
     void setTypingDelayMs(int ms);
+
+    // Вставка идёт через буфер обмена, то есть затирает то, что там лежало.
+    // Если включено — прежний ТЕКСТ запоминается и возвращается обратно через
+    // restoreMs. Картинки и прочие mime-типы не сохраняются.
+    void setPreserveClipboard(bool preserve);
+    void setClipboardRestoreMs(int ms);
+
     QString backendName() const override;   // для логов и SettingsDialog
 
 private:
@@ -49,6 +56,9 @@ private:
     int     m_typingDelayMs = 12;
     bool    m_available     = false;
     bool    m_dryRun        = false;
+
+    bool    m_preserveClipboard = true;
+    int     m_clipboardRestoreMs = 1000;
 
     QString     m_xdotool;         // полный путь к xdotool
     QString     m_clipboardTool;   // xclip / xsel / wl-copy
