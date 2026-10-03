@@ -467,6 +467,57 @@ bool ConfigManager::pinWindow() const
     return m_settings.value(QStringLiteral("output/pin_window"), false).toBool();
 }
 
+QString ConfigManager::pinMode() const
+{
+    // По умолчанию activate: это единственный способ, который действительно
+    // печатает в любом приложении. Тихий откат к sendevent мы уже проходили —
+    // «лог виден, а в редакторе ничего».
+    return m_settings.value(QStringLiteral("output/pin_mode"),
+                            QStringLiteral("activate")).toString();
+}
+
+int ConfigManager::pinActivateMs() const
+{
+    const int v = m_settings.value(QStringLiteral("output/pin_activate_ms"), 80).toInt();
+    return (v < 0) ? 0 : v;
+}
+
+bool ConfigManager::pinRestoreFocus() const
+{
+    return m_settings.value(QStringLiteral("output/pin_restore_focus"), true).toBool();
+}
+
+QStringList ConfigManager::ownWindowClasses() const
+{
+    // Пусто быть не должно: тогда привязка к собственному меню трея снова
+    // проглотит текст. Поэтому список по умолчанию задаём здесь, а не в .ini,
+    // и возвращаем его же, если значение отсутствует или оказалось пустым.
+    static const QStringList kDefault = {
+        QStringLiteral("voice-assistant"),
+        QStringLiteral("VoiceAssistant"),
+        QStringLiteral("voiceassistant"),
+    };
+
+    // ВАЖНО: именно toStringList(). QSettings возвращает QStringList для
+    // значений с запятыми, а toString() для такого значения даёт ПУСТУЮ строку
+    // (грабля №9 в development-log.md — тест configPinWindowReadsIni это поймал).
+    const QVariant v = m_settings.value(QStringLiteral("output/own_window_class"));
+    if (!v.isValid()) {
+        return kDefault;
+    }
+    QStringList out;
+    if (v.userType() == QMetaType::QStringList) {
+        out = v.toStringList();
+    } else {
+        out = v.toString().split(QLatin1Char(','), Qt::SkipEmptyParts);
+    }
+    for (QString& s : out) {
+        s = s.trimmed();
+    }
+    out.removeAll(QString());
+    return out.isEmpty() ? kDefault : out;
+}
+
 // ---------------------------------------------------------------------------
 // Заметки (цель вывода Notes)
 // ---------------------------------------------------------------------------

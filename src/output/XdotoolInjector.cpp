@@ -6,6 +6,7 @@
 #include <QGuiApplication>
 #include <QProcess>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 
 namespace {
@@ -18,11 +19,12 @@ QClipboard* clipboard()
     return gui ? gui->clipboard() : nullptr;
 }
 
-}  // namespace
-
-namespace {
-
 int kProcessTimeoutMs = 5000;
+
+// Пауза после windowactivate, если [output] pin_activate_ms не задан.
+// 80 мс хватает openbox/KDE/GNOME, чтобы передать фокус приложению; на
+// медленной машине можно поднять до 200–300.
+int kDefaultActivateDelayMs = 80;
 
 }  // namespace
 
@@ -62,10 +64,17 @@ bool XdotoolInjector::initialize()
         return false;
     }
 
-    qInfo().noquote() << QString("XdotoolInjector: xdotool=%1, буфер=%2, режим=%3%4")
+    // Режим привязки пишем сюда, а не только в backendName(): в dry-run
+    // backendName() равен «dry-run», и без этой строки в логе не видно,
+    // каким способом пойдёт текст.
+    qInfo().noquote() << QString("XdotoolInjector: xdotool=%1, буфер=%2, режим=%3, "
+                                 "способ=%4, привязка к окну=%5%6")
                              .arg(m_xdotool,
                                   m_clipboardTool.isEmpty() ? QStringLiteral("нет") : m_clipboardTool,
                                   backendName(),
+                                  methodDescription(),
+                                  m_pinnedWindow.isEmpty() ? QStringLiteral("нет")
+                                                           : m_pinnedWindow,
                                   m_dryRun ? QStringLiteral(" (DRY RUN)") : QString());
     return true;
 }
@@ -100,16 +109,45 @@ void XdotoolInjector::setPinnedWindow(const QString& windowId)
     if (wid.isEmpty()) {
         qDebug().noquote() << QStringLiteral("XdotoolInjector: привязка к окну снята, "
                                             "вставка идёт в активное окно");
-    } else {
-        qInfo().noquote() << QStringLiteral("XdotoolInjector: вставка привязана к окну %1. "
-                                           "Если приложение игнорирует ввод — выключите "
-                                           "[output] pin_window (xdotool --window работает "
-                                           "через XSendEvent, его принимают не все)")
-                                 .arg(wid);
+        return;
     }
+
+    // Сразу показываем, ЧТО это за окно и КАК будет доставлен текст: баг
+    // «лог виден, а в редакторе ничего» лечится в первую очередь тем, что
+    // цель перестаёт быть неизвестной.
+    qInfo().noquote()
+        << QStringLiteral("XdotoolInjector: вставка привязана к окну %1, способ — %2")
+               .arg(describeWindow(wid),
+                    m_pinMode == PinMode::SendEvent
+                        ? QStringLiteral("синтетические события (--window), фокус не трогаем")
+                        : QStringLiteral("активация окна + настоящие события, фокус вернётся обратно"));
 }
 
-QString XdotoolInjector::activeWindowId()
+void XdotoolInjector::setPinMode(PinMode mode)
+{
+    m_pinMode = mode;
+}
+
+void XdotoolInjector::setPinRestoreFocus(bool restore)
+{
+    m_pinRestoreFocus = restore;
+}
+
+void XdotoolInjector::setPinActivateDelayMs(int ms)
+{
+    m_pinActivateDelayMs = (ms >= 0) ? ms : kDefaultActivateDelayMs;
+}
+
+void XdotoolInjector::setOwnWindowClasses(const QStringList& classes)
+{
+    m_ownWindowClasses = classes;
+}
+
+// ---------------------------------------------------------------------------
+// Диагностика окон
+// ---------------------------------------------------------------------------
+
+QString XdotoolInjector::runXdotool(const QStringList& args, int timeoutMs)
 {
     const QString xdotool = QStandardPaths::findExecutable(QStringLiteral("xdotool"));
     if (xdotool.isEmpty()) {
@@ -117,9 +155,9 @@ QString XdotoolInjector::activeWindowId()
     }
     QProcess proc;
     proc.setProgram(xdotool);
-    proc.setArguments({QStringLiteral("getactivewindow")});
+    proc.setArguments(args);
     proc.start();
-    if (!proc.waitForStarted(2000) || !proc.waitForFinished(2000)) {
+    if (!proc.waitForStarted(timeoutMs) || !proc.waitForFinished(timeoutMs)) {
         proc.kill();
         proc.waitForFinished(200);
         return QString();
@@ -128,6 +166,123 @@ QString XdotoolInjector::activeWindowId()
         return QString();
     }
     return QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+}
+
+QString XdotoolInjector::activeWindowId()
+{
+    return runXdotool({QStringLiteral("getactivewindow")});
+}
+
+QString XdotoolInjector::windowName(const QString& windowId)
+{
+    const QString wid = windowId.trimmed();
+    if (wid.isEmpty()) {
+        return QString();
+    }
+    return runXdotool({QStringLiteral("getwindowname"), wid});
+}
+
+QString XdotoolInjector::windowClass(const QString& windowId)
+{
+    const QString wid = windowId.trimmed();
+    if (wid.isEmpty()) {
+        return QString();
+    }
+    // getwindowclassname есть не во всех сборках xdotool — тогда берём WM_CLASS
+    // через xprop. Оба варианта возвращают пусто, если окна не существует.
+    QString cls = runXdotool({QStringLiteral("getwindowclassname"), wid});
+    if (!cls.isEmpty()) {
+        return cls;
+    }
+    const QString xprop = QStandardPaths::findExecutable(QStringLiteral("xprop"));
+    if (xprop.isEmpty()) {
+        return QString();
+    }
+    QProcess proc;
+    proc.setProgram(xprop);
+    proc.setArguments({QStringLiteral("-id"), wid, QStringLiteral("WM_CLASS")});
+    proc.start();
+    if (!proc.waitForStarted(1000) || !proc.waitForFinished(1000)) {
+        proc.kill();
+        proc.waitForFinished(200);
+        return QString();
+    }
+    const QString out = QString::fromUtf8(proc.readAllStandardOutput());
+    // WM_CLASS(STRING) = "kate", "Kate"
+    const int q1 = out.indexOf(QLatin1Char('"'));
+    const int q2 = out.indexOf(QLatin1Char('"'), q1 + 1);
+    if (q1 >= 0 && q2 > q1) {
+        return out.mid(q1 + 1, q2 - q1 - 1);
+    }
+    return QString();
+}
+
+qint64 XdotoolInjector::windowPid(const QString& windowId)
+{
+    const QString wid = windowId.trimmed();
+    if (wid.isEmpty()) {
+        return 0;
+    }
+    bool ok = false;
+    const qint64 pid = runXdotool({QStringLiteral("getwindowpid"), wid}).toLongLong(&ok);
+    return ok ? pid : 0;
+}
+
+bool XdotoolInjector::windowExists(const QString& windowId)
+{
+    const QString wid = windowId.trimmed();
+    if (wid.isEmpty()) {
+        return false;
+    }
+    // getwindowname — самый дешёвый способ проверить жизнь окна: на закрытом
+    // xdotool падает в BadWindow и возвращает ненулевой код. Заголовок при этом
+    // бывает пустым у окон без имени, поэтому на пустой строке дополнительно
+    // спрашиваем PID.
+    if (!runXdotool({QStringLiteral("getwindowname"), wid}).isEmpty()) {
+        return true;
+    }
+    return windowPid(wid) > 0;
+}
+
+QString XdotoolInjector::describeWindow(const QString& windowId)
+{
+    const QString wid = windowId.trimmed();
+    if (wid.isEmpty()) {
+        return QStringLiteral("(окно не определено)");
+    }
+    const QString name = windowName(wid);
+    if (name.isEmpty()) {
+        return QStringLiteral("%1 (без заголовка)").arg(wid);
+    }
+    return QStringLiteral("%1 «%2»").arg(wid, name);
+}
+
+WindowTarget XdotoolInjector::resolveTarget() const
+{
+    if (m_pinnedWindow.isEmpty()) {
+        WindowTarget t;
+        t.delivery = WindowTarget::Delivery::ActiveWindow;
+        return t;
+    }
+
+    // Окна самого помощника определяем по WM_CLASS, а не по PID: меню трея —
+    // это отдельное окно того же процесса, и его как раз вставлять нельзя.
+    QStringList own = m_ownWindowClasses;
+    if (own.isEmpty()) {
+        own << QStringLiteral("voice-assistant");
+    }
+    QStringList ownWids;
+    const QString cls = windowClass(m_pinnedWindow);
+    if (!cls.isEmpty() && own.contains(cls)) {
+        ownWids << m_pinnedWindow;
+    }
+
+    return decideWindowTarget(m_pinnedWindow,
+                              activeWindowId(),
+                              windowExists(m_pinnedWindow),
+                              m_pinMode,
+                              m_pinRestoreFocus,
+                              ownWids);
 }
 
 QString XdotoolInjector::backendName() const
@@ -146,9 +301,24 @@ QString XdotoolInjector::backendName() const
                                                    : QStringLiteral("xdotool type"); break;
     }
     if (!name.isEmpty() && !m_pinnedWindow.isEmpty()) {
-        name += QStringLiteral(" -> окно %1").arg(m_pinnedWindow);
+        name += QStringLiteral(" -> окно %1 (%2)")
+                    .arg(m_pinnedWindow,
+                         m_pinMode == PinMode::SendEvent ? QStringLiteral("sendevent")
+                                                         : QStringLiteral("activate"));
     }
     return name.isEmpty() ? QStringLiteral("unknown") : name;
+}
+
+QString XdotoolInjector::methodDescription() const
+{
+    switch (m_method) {
+    case Method::XdotoolType: return QStringLiteral("xdotool type");
+    case Method::Clipboard:   return QStringLiteral("буфер обмена + Ctrl+V");
+    case Method::Auto:        return m_clipboardTool.isEmpty()
+                                     ? QStringLiteral("auto -> xdotool type")
+                                     : QStringLiteral("auto -> буфер обмена + Ctrl+V");
+    }
+    return QStringLiteral("unknown");
 }
 
 bool XdotoolInjector::isAvailable() const
@@ -156,10 +326,107 @@ bool XdotoolInjector::isAvailable() const
     return m_available;
 }
 
+// ---------------------------------------------------------------------------
+// Доставка
+// ---------------------------------------------------------------------------
+
+XdotoolInjector::DeliveryScope::~DeliveryScope()
+{
+    if (!restore || restoreTo.isEmpty() || !self) {
+        return;
+    }
+    // Возвращаем фокус туда, где он был до вставки. Не aktivatе --sync
+    // намеренно: ждать подтверждения не нужно, а зависнуть на закрытом окне —
+    // очень даже. Ошибку логируем, но не считаем провалом вставки.
+    const bool ok = self->runProcess(self->m_xdotool,
+                                     {QStringLiteral("windowactivate"), restoreTo});
+    if (!ok) {
+        qWarning().noquote()
+            << QStringLiteral("XdotoolInjector: не вернул фокус окну %1").arg(restoreTo);
+    }
+}
+
+XdotoolInjector::DeliveryScope XdotoolInjector::enterTarget(const WindowTarget& t)
+{
+    DeliveryScope scope;
+    scope.self = this;
+    if (!t.needsActivation() || m_dryRun || m_xdotool.isEmpty()) {
+        return scope;
+    }
+
+    // --sync ждёт, пока WM действительно отдаст фокус. На закрытом окне он
+    // может ждать вечно, поэтому сначала проверяем, что окно живое, и держим
+    // короткий таймаут процесса (runProcess).
+    if (!runProcess(m_xdotool,
+                    {QStringLiteral("windowactivate"), QStringLiteral("--sync"), t.window})) {
+        // План Б: XSetInputFocus напрямую. Не требует поддержки EWMH
+        // оконным менеджером и не висит.
+        qWarning().noquote()
+            << QStringLiteral("XdotoolInjector: windowactivate --sync не сработал для %1, "
+                              "пробую windowfocus").arg(t.window);
+        if (!runProcess(m_xdotool, {QStringLiteral("windowfocus"), t.window})) {
+            m_lastError = QStringLiteral("не удалось активировать окно %1").arg(t.window);
+            return scope;
+        }
+    }
+    if (m_pinActivateDelayMs > 0) {
+        QThread::msleep(static_cast<unsigned long>(m_pinActivateDelayMs));
+    }
+    scope.restoreTo = t.restoreTo;
+    scope.restore   = !t.restoreTo.isEmpty();
+    return scope;
+}
+
+QStringList XdotoolInjector::windowArgs(const WindowTarget& t) const
+{
+    // При активации окно уже в фокусе: --window не нужен и даже вреден —
+    // с ним xdotool может уйти в XSendEvent вместо настоящих событий.
+    if (t.usesWindowFlag() && !t.window.isEmpty()) {
+        return {QStringLiteral("--window"), t.window};
+    }
+    return {};
+}
+
+void XdotoolInjector::warnIfPinLost(const WindowTarget& t) const
+{
+    // Привязка есть, а вставка пойдёт в активное окно. Значит, окно либо
+    // закрыли, либо это окно самого помощника (меню трея, настройки). Молчать
+    // здесь нельзя: именно из такого молчания и рождается «лог виден, а в
+    // редакторе ничего».
+    if (m_pinnedWindow.isEmpty() || t.delivery != WindowTarget::Delivery::ActiveWindow) {
+        return;
+    }
+    qWarning().noquote()
+        << QStringLiteral("XdotoolInjector: привязанное окно %1 недоступно "
+                          "(закрыто или принадлежит самому помощнику), "
+                          "текст пойдёт в активное окно")
+               .arg(describeWindow(m_pinnedWindow));
+}
+
+void XdotoolInjector::logDelivery(const QString& what, const WindowTarget& t, bool ok) const
+{
+    const QString where = (t.delivery == WindowTarget::Delivery::ActiveWindow)
+        ? QStringLiteral("активное окно %1").arg(activeWindowId())
+        : describeWindow(t.window);
+
+    if (ok) {
+        qInfo().noquote()
+            << QStringLiteral("XdotoolInjector: %1 -> %2 [%3]")
+                   .arg(what, where, deliveryToString(t.delivery));
+        return;
+    }
+    qWarning().noquote()
+        << QStringLiteral("XdotoolInjector: НЕ ВСТАВИЛ %1 -> %2 [%3]: %4")
+               .arg(what, where, deliveryToString(t.delivery),
+                    m_lastError.isEmpty() ? QStringLiteral("xdotool вернул ошибку") : m_lastError);
+}
+
 bool XdotoolInjector::typeText(const QString& text)
 {
+    m_lastError.clear();
     if (!m_available) {
-        qWarning() << "XdotoolInjector::typeText: инжектор не инициализирован";
+        m_lastError = QStringLiteral("инжектор не инициализирован");
+        qWarning() << "XdotoolInjector::typeText:" << m_lastError;
         return false;
     }
     if (text.isEmpty()) {
@@ -171,23 +438,37 @@ bool XdotoolInjector::typeText(const QString& text)
         return true;
     }
 
+    // Решение принимается ОДИН раз на всю вставку: иначе при откате
+    // «буфер не сработал -> xdotool type» окно активировалось бы дважды
+    // и фокус мигал бы на каждом сегменте.
+    const WindowTarget t = resolveTarget();
+    warnIfPinLost(t);
+    DeliveryScope scope = enterTarget(t);
+
     const bool preferClipboard =
         (m_method == Method::Clipboard)
         || (m_method == Method::Auto && !m_clipboardTool.isEmpty());
 
     if (preferClipboard && !m_clipboardTool.isEmpty()) {
-        if (typeViaClipboard(text)) {
+        if (typeViaClipboard(t, text)) {
+            logDelivery(QStringLiteral("текст (%1 симв.)").arg(text.size()), t, true);
             return true;
         }
-        qWarning() << "XdotoolInjector: буфер обмена не сработал, пробую xdotool type";
+        qWarning().noquote()
+            << QStringLiteral("XdotoolInjector: буфер обмена не сработал (%1), "
+                              "пробую xdotool type").arg(m_lastError);
     }
-    return typeViaXdotool(text);
+    const bool ok = typeViaXdotool(t, text);
+    logDelivery(QStringLiteral("текст (%1 симв.)").arg(text.size()), t, ok);
+    return ok;
 }
 
 bool XdotoolInjector::sendKey(const QString& key)
 {
+    m_lastError.clear();
     if (!m_available) {
-        qWarning() << "XdotoolInjector::sendKey: инжектор не инициализирован";
+        m_lastError = QStringLiteral("инжектор не инициализирован");
+        qWarning() << "XdotoolInjector::sendKey:" << m_lastError;
         return false;
     }
     if (key.isEmpty()) {
@@ -198,38 +479,54 @@ bool XdotoolInjector::sendKey(const QString& key)
         return true;
     }
     if (m_xdotool.isEmpty()) {
-        qWarning() << "XdotoolInjector::sendKey: xdotool не найден";
+        m_lastError = QStringLiteral("xdotool не найден");
+        qWarning() << "XdotoolInjector::sendKey:" << m_lastError;
         return false;
     }
 
-    QStringList args{ QStringLiteral("key") };
-    if (!m_pinnedWindow.isEmpty()) {
-        args << QStringLiteral("--window") << m_pinnedWindow;
-    }
-    args << QStringLiteral("--clearmodifiers") << key;
-    return runProcess(m_xdotool, args);
+    const WindowTarget t = resolveTarget();
+    warnIfPinLost(t);
+    DeliveryScope scope = enterTarget(t);
+    const bool ok = sendKeyTo(t, key);
+    logDelivery(QStringLiteral("клавиша %1").arg(key), t, ok);
+    return ok;
 }
 
-bool XdotoolInjector::typeViaXdotool(const QString& text)
+bool XdotoolInjector::sendKeyTo(const WindowTarget& t, const QString& key)
+{
+    QStringList args{ QStringLiteral("key") };
+    args << windowArgs(t) << QStringLiteral("--clearmodifiers") << key;
+    if (!runProcess(m_xdotool, args)) {
+        m_lastError = QStringLiteral("xdotool key %1 вернул ошибку").arg(key);
+        return false;
+    }
+    return true;
+}
+
+bool XdotoolInjector::typeViaXdotool(const WindowTarget& t, const QString& text)
 {
     if (m_xdotool.isEmpty()) {
+        m_lastError = QStringLiteral("xdotool не найден");
         return false;
     }
     // --file - читает текст из stdin: так мы не упираемся в лимит длины
     // аргумента командной строки и не воюем с экранированием кавычек.
     QStringList args{ QStringLiteral("type") };
-    if (!m_pinnedWindow.isEmpty()) {
-        args << QStringLiteral("--window") << m_pinnedWindow;
-    }
-    args << QStringLiteral("--clearmodifiers")
+    args << windowArgs(t)
+         << QStringLiteral("--clearmodifiers")
          << QStringLiteral("--delay") << QString::number(m_typingDelayMs)
          << QStringLiteral("--file") << QStringLiteral("-");
-    return runProcess(m_xdotool, args, text.toUtf8());
+    if (!runProcess(m_xdotool, args, text.toUtf8())) {
+        m_lastError = QStringLiteral("xdotool type вернул ошибку");
+        return false;
+    }
+    return true;
 }
 
-bool XdotoolInjector::typeViaClipboard(const QString& text)
+bool XdotoolInjector::typeViaClipboard(const WindowTarget& t, const QString& text)
 {
     if (m_clipboardTool.isEmpty()) {
+        m_lastError = QStringLiteral("нет инструмента буфера обмена (xclip/xsel/wl-copy)");
         return false;
     }
 
@@ -244,14 +541,10 @@ bool XdotoolInjector::typeViaClipboard(const QString& text)
     }
 
     if (!runProcess(m_clipboardTool, m_clipboardArgs, text.toUtf8())) {
+        m_lastError = QStringLiteral("%1 не принял текст").arg(m_clipboardTool);
         return false;
     }
-    QStringList pasteArgs{ QStringLiteral("key") };
-    if (!m_pinnedWindow.isEmpty()) {
-        pasteArgs << QStringLiteral("--window") << m_pinnedWindow;
-    }
-    pasteArgs << QStringLiteral("--clearmodifiers") << QStringLiteral("ctrl+v");
-    if (!runProcess(m_xdotool, pasteArgs)) {
+    if (!sendKeyTo(t, QStringLiteral("ctrl+v"))) {
         return false;
     }
 
@@ -301,11 +594,15 @@ bool XdotoolInjector::runProcess(const QString& program,
     }
 
     if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+        const QString err = QString::fromUtf8(proc.readAllStandardError()).trimmed();
         qWarning().noquote()
             << QString("XdotoolInjector: %1 вернул %2: %3")
                    .arg(program)
                    .arg(proc.exitCode())
-                   .arg(QString::fromUtf8(proc.readAllStandardError()).trimmed());
+                   .arg(err);
+        if (!err.isEmpty() && m_lastError.isEmpty()) {
+            m_lastError = err;
+        }
         return false;
     }
     return true;

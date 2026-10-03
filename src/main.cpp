@@ -13,6 +13,7 @@
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTextStream>
+#include <QThread>
 
 #include "audio/QtAudioCapture.h"
 #include "audio/WavWriter.h"
@@ -118,6 +119,58 @@ bool keyIsLikelyInUse(const QString& spec)
         return true;
     }
 }
+
+// Собирает инжектор так же, как ApplicationController: те же ключи конфига,
+// тот же порядок вызовов. Если здесь текст доходит, а в приложении нет —
+// дело не в xdotool, а в том, какое окно запоминается в начале записи.
+std::unique_ptr<XdotoolInjector> makeInjectorFromConfig(ConfigManager& cfg)
+{
+    auto inj = std::make_unique<XdotoolInjector>();
+    const QString method = cfg.injectorMethod();
+    if (method == QLatin1String("xdotool")) {
+        inj->setMethod(XdotoolInjector::Method::XdotoolType);
+    } else if (method == QLatin1String("clipboard")) {
+        inj->setMethod(XdotoolInjector::Method::Clipboard);
+    } else {
+        inj->setMethod(XdotoolInjector::Method::Auto);
+    }
+    inj->setTypingDelayMs(cfg.typingDelayMs());
+    inj->setPreserveClipboard(cfg.preserveClipboard());
+    inj->setClipboardRestoreMs(cfg.clipboardRestoreMs());
+    inj->setPinMode(stringToPinMode(cfg.pinMode()));
+    inj->setPinActivateDelayMs(cfg.pinActivateMs());
+    inj->setPinRestoreFocus(cfg.pinRestoreFocus());
+    inj->setOwnWindowClasses(cfg.ownWindowClasses());
+    inj->initialize();
+    return inj;
+}
+
+ConfigManager* makeConfigFromArgs(const QStringList& args)
+{
+    QString iniPath;
+    const int ci = args.indexOf(QStringLiteral("--config"));
+    if (ci >= 0 && ci + 1 < args.size()) {
+        iniPath = args.at(ci + 1);
+    }
+    return iniPath.isEmpty() ? new ConfigManager() : new ConfigManager(iniPath);
+}
+
+void printWindowLine(const char* label, const QString& wid)
+{
+    if (wid.isEmpty()) {
+        std::printf("%-14s: не определено (нет X-сервера или оконного менеджера)\n", label);
+        return;
+    }
+    const QString name  = XdotoolInjector::windowName(wid);
+    const QString cls   = XdotoolInjector::windowClass(wid);
+    const qint64  pid   = XdotoolInjector::windowPid(wid);
+    std::printf("%-14s: %s  заголовок=%s  WM_CLASS=%s  pid=%s\n",
+                label, qPrintable(wid),
+                name.isEmpty() ? qPrintable(QStringLiteral("(пусто)")) : qPrintable(name),
+                cls.isEmpty()  ? qPrintable(QStringLiteral("(нет)"))    : qPrintable(cls),
+                pid ? qPrintable(QString::number(pid)) : qPrintable(QStringLiteral("?")));
+}
+
 
 int runDiagnostics(const QStringList& args)
 {
@@ -264,11 +317,24 @@ int runDiagnostics(const QStringList& args)
                 cfg->clipboardRestoreMs());
     std::printf("  pin_window: %s\n", cfg->pinWindow() ? "true" : "false");
     if (cfg->pinWindow()) {
+        std::printf("  pin_mode  : %s (pin_activate_ms=%d, pin_restore_focus=%s)\n",
+                    qPrintable(cfg->pinMode()), cfg->pinActivateMs(),
+                    cfg->pinRestoreFocus() ? "true" : "false");
         std::printf("              -> вставка идёт в окно, активное В НАЧАЛЕ записи;\n"
-                    "                 можно переключиться и печатать в другом файле.\n"
-                    "                 xdotool --window работает через XSendEvent,\n"
-                    "                 некоторые приложения такие события игнорируют —\n"
-                    "                 проверьте на своём редакторе.\n");
+                    "                 можно переключиться и печатать в другом файле.\n");
+        if (stringToPinMode(cfg->pinMode()) == PinMode::Activate) {
+            std::printf("                 activate: окно активируется, текст печатается\n"
+                        "                 НАСТОЯЩИМИ событиями (работает везде), затем\n"
+                        "                 фокус возвращается. Забирает фокус на ~50-150 мс.\n");
+        } else {
+            std::printf("                 sendevent: xdotool --window, фокус не трогаем.\n"
+                        "                 ВНИМАНИЕ: такие события отбрасывают браузеры,\n"
+                        "                 LibreOffice, Java и часть терминалов, а xdotool\n"
+                        "                 всё равно возвращает 0. Проверить своё приложение:\n"
+                        "                   ./src/voice-assistant --type \"раз\" --pin-active --delay 3000\n");
+        }
+        printWindowLine("  сейчас", XdotoolInjector::activeWindowId());
+        std::printf("  подробно  : ./src/voice-assistant --pin-info\n");
     }
     std::printf("\n");
 
@@ -450,6 +516,157 @@ int runDiagnostics(const QStringList& args)
     return problems == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// Диагностика привязки к окну: --pin-info и --type
+//
+// Зачем. Главный симптом поломки вывода — «в логе всё успешно, а в редакторе
+// ничего». Чинится он только одним способом: сделать видимым, КУДА именно
+// уходит текст. Обе опции работают без микрофона, без моделей и без GUI,
+// поэтому проверяют ровно ту часть тракта, которая и ломается.
+// ---------------------------------------------------------------------------
+
+int runPinInfo(const QStringList& args)
+{
+    std::unique_ptr<ConfigManager> cfg(makeConfigFromArgs(args));
+
+    std::printf("voice-assistant --pin-info\n==========================\n\n");
+    std::printf("Конфиг        : %s\n", qPrintable(cfg->settingsPath()));
+    std::printf("XDG_SESSION_TYPE=%s\n",
+                qPrintable(qEnvironmentVariable("XDG_SESSION_TYPE",
+                                                QStringLiteral("(не задан)"))));
+    std::printf("DISPLAY       : %s\n",
+                qPrintable(qEnvironmentVariable("DISPLAY", QStringLiteral("(не задан)"))));
+
+    printWindowLine("Активное окно", XdotoolInjector::activeWindowId());
+
+    std::printf("\n[output]\n");
+    std::printf("method        : %s\n", qPrintable(cfg->injectorMethod()));
+    std::printf("pin_window    : %s\n", cfg->pinWindow() ? "true" : "false");
+    std::printf("pin_mode      : %s\n", qPrintable(cfg->pinMode()));
+    std::printf("pin_activate_ms=%d\n", cfg->pinActivateMs());
+    std::printf("pin_restore_focus=%s\n", cfg->pinRestoreFocus() ? "true" : "false");
+    std::printf("own_window_class=%s\n", qPrintable(cfg->ownWindowClasses().join(QStringLiteral(", "))));
+
+    std::unique_ptr<XdotoolInjector> inj(makeInjectorFromConfig(*cfg));
+    if (!inj->isAvailable()) {
+        std::printf("\nНЕТ xdotool — вывод текста невозможен (sudo apt install xdotool)\n");
+        return 1;
+    }
+    std::printf("\nИнжектор      : %s\n", qPrintable(inj->backendName()));
+    std::printf("Способ вставки: %s\n", qPrintable(inj->methodDescription()));
+
+    // Какое окно запомнил бы контроллер в начале записи
+    const QString wid = XdotoolInjector::activeWindowId();
+    std::printf("\nЧто запомнил бы pin_window в начале записи:\n");
+    if (wid.isEmpty()) {
+        std::printf("  НИЧЕГО — активное окно не определяется, привязки не будет.\n"
+                    "  Так бывает в Wayland-сессии (xdotool видит только XWayland)\n"
+                    "  или если не запущен оконный менеджер.\n");
+        return 1;
+    }
+    const QString cls = XdotoolInjector::windowClass(wid);
+    const bool isSelf = (!cls.isEmpty() && cfg->ownWindowClasses().contains(cls))
+                        || XdotoolInjector::windowPid(wid) == QCoreApplication::applicationPid();
+    if (isSelf) {
+        std::printf("  ОТКАЗ: окно %s принадлежит самому помощнику (WM_CLASS=%s).\n"
+                    "  Привязка к нему НЕ устанавливается: текст ушёл бы в меню\n"
+                    "  трея и пропал вместе с ним. Начинайте запись хоткеем.\n",
+                    qPrintable(wid), qPrintable(cls));
+        return 1;
+    }
+    std::printf("  окно %s — привязка установлена\n", qPrintable(wid));
+
+    std::printf("\nПроверка вставки:\n"
+                "  1) оставайтесь в редакторе и выполните\n"
+                "       ./src/voice-assistant --type \"проверка раз\" --pin-active --delay 3000\n"
+                "  2) за 3 секунды переключитесь в ДРУГОЕ окно (имитация «фокус ушёл»)\n"
+                "  3) текст должен появиться в редакторе, а фокус — вернуться обратно\n"
+                "  Если текста нет — смотрите предупреждения в выводе команды: там\n"
+                "  написано, какое окно выбрано и каким способом идёт вставка.\n"
+                "  См. docs/troubleshooting.md, раздел «pin_window не печатает».\n");
+    return 0;
+}
+
+int runTypeTest(QCoreApplication& app, const QStringList& args)
+{
+    const int ti = args.indexOf(QStringLiteral("--type"));
+    const QString text = (ti >= 0 && ti + 1 < args.size()) ? args.at(ti + 1) : QString();
+    if (text.isEmpty()) {
+        std::fprintf(stderr,
+                     "--type: нужен текст.\n"
+                     "Пример: ./src/voice-assistant --type \"проверка раз\" --pin-active --delay 3000\n");
+        return 2;
+    }
+
+    int delayMs = 0;
+    const int di = args.indexOf(QStringLiteral("--delay"));
+    if (di >= 0 && di + 1 < args.size()) {
+        bool ok = false;
+        const int v = args.at(di + 1).toInt(&ok);
+        if (ok && v >= 0 && v <= 60000) {
+            delayMs = v;
+        } else {
+            std::fprintf(stderr, "--delay: нужно число миллисекунд 0..60000\n");
+            return 2;
+        }
+    }
+    const bool pinActive = args.contains(QStringLiteral("--pin-active"));
+    QString pinWid;
+    const int wi = args.indexOf(QStringLiteral("--window"));
+    if (wi >= 0 && wi + 1 < args.size()) {
+        pinWid = args.at(wi + 1);
+    }
+
+    std::unique_ptr<ConfigManager> cfg(makeConfigFromArgs(args));
+    std::unique_ptr<XdotoolInjector> inj(makeInjectorFromConfig(*cfg));
+    if (!inj->isAvailable()) {
+        std::fprintf(stderr,
+                     "--type: xdotool не найден — вставлять текст нечем "
+                     "(sudo apt install xdotool)\n");
+        return 1;
+    }
+
+    std::printf("Конфиг        : %s\n", qPrintable(cfg->settingsPath()));
+    std::printf("Способ вставки: %s\n", qPrintable(inj->methodDescription()));
+    std::printf("pin_mode      : %s (pin_window=%s)\n",
+                qPrintable(cfg->pinMode()), cfg->pinWindow() ? "true" : "false");
+    printWindowLine("Активное окно", XdotoolInjector::activeWindowId());
+
+    if (pinActive) {
+        pinWid = XdotoolInjector::activeWindowId();
+    }
+    if (!pinWid.isEmpty()) {
+        inj->setPinnedWindow(pinWid);
+        printWindowLine("Привязка", pinWid);
+    } else {
+        std::printf("Привязка      : нет (текст пойдёт в активное окно)\n");
+    }
+
+    if (delayMs > 0) {
+        std::printf("\n%d мс на то, чтобы переключиться в другое окно...\n", delayMs);
+        std::fflush(stdout);
+    }
+
+    int rc = 0;
+    QTimer::singleShot(delayMs, [&]() {
+        printWindowLine("Фокус сейчас", XdotoolInjector::activeWindowId());
+        std::fflush(stdout);   // иначе строки инжектора (stderr) уедут выше
+        const bool ok = inj->typeText(text);
+        std::printf("\n%s\n", ok
+            ? qPrintable(QStringLiteral("ВСТАВЛЕНО: «%1» (%2 симв.)").arg(text).arg(text.size()))
+            : qPrintable(QStringLiteral("НЕ ВСТАВЛЕНО: %1").arg(inj->lastError())));
+        std::fflush(stdout);
+        // Даём целевому приложению забрать текст из буфера и дожить до
+        // восстановления буфера/возврата фокуса.
+        QTimer::singleShot(qMax(400, cfg->clipboardRestoreMs()), &app, &QCoreApplication::quit);
+        if (!ok) {
+            rc = 1;
+        }
+    });
+    app.exec();
+    return rc;
+}
+
 }  // namespace
 
 int main(int argc, char *argv[])
@@ -464,6 +681,21 @@ int main(int argc, char *argv[])
     if (rawArgs.contains(QStringLiteral("--check"))) {
         QCoreApplication app(argc, argv);
         return runDiagnostics(QCoreApplication::arguments());
+    }
+
+    // --pin-info — диагностика вывода: какое окно сейчас активно, что запомнил
+    // бы pin_window и каким способом пойдёт текст. Без микрофона и без GUI.
+    if (rawArgs.contains(QStringLiteral("--pin-info"))) {
+        QCoreApplication app(argc, argv);
+        return runPinInfo(QCoreApplication::arguments());
+    }
+
+    // --type "текст" [--pin-active] [--window WID] [--delay мс] [--config путь]
+    // — проверить вставку отдельно от распознавания. QApplication нужен, чтобы
+    // работал буфер обмена (сохранение и восстановление) — как в боевом режиме.
+    if (rawArgs.contains(QStringLiteral("--type"))) {
+        QApplication app(argc, argv);
+        return runTypeTest(app, QCoreApplication::arguments());
     }
 
     // --record <секунды> [файл.wav] — сырая запись с микрофона, без GUI и без AGC.

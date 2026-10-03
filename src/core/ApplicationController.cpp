@@ -16,6 +16,7 @@
 #include "text/TextPostProcessor.h"
 #include "spellcheck/ISpellChecker.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -93,6 +94,16 @@ ApplicationController::ApplicationController(QObject* parent)
     injector->setTypingDelayMs(m_config->typingDelayMs());
     injector->setPreserveClipboard(m_config->preserveClipboard());
     injector->setClipboardRestoreMs(m_config->clipboardRestoreMs());
+
+    // Как доставлять текст в привязанное окно. activate (по умолчанию) —
+    // окно активируется и текст печатается настоящими событиями: работает
+    // везде, но на ~50–150 мс забирает фокус. sendevent — прежнее поведение
+    // (xdotool --window): фокус не трогается, зато часть приложений такой
+    // ввод отбрасывает, и xdotool всё равно возвращает 0.
+    injector->setPinMode(stringToPinMode(m_config->pinMode()));
+    injector->setPinActivateDelayMs(m_config->pinActivateMs());
+    injector->setPinRestoreFocus(m_config->pinRestoreFocus());
+    injector->setOwnWindowClasses(m_config->ownWindowClasses());
 
     if (!injector->initialize() || !injector->isAvailable()) {
         reportError(QStringLiteral(
@@ -684,6 +695,20 @@ void ApplicationController::injectText(const QString& text)
         reportError(QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
         return;
     }
+
+    // Привязанное окно могли закрыть, пока шла запись (или это было всплывающее
+    // меню, которое уже исчезло). Тогда вставка ушла бы в никуда: снимаем
+    // привязку и честно пишем в лог, что текст пойдёт в активное окно.
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    if (xdotool && !m_pinnedWindow.isEmpty()
+        && !XdotoolInjector::windowExists(m_pinnedWindow)) {
+        qWarning().noquote()
+            << QStringLiteral("pin_window: окно %1 закрыто, привязка снята — "
+                              "текст пойдёт в активное окно").arg(m_pinnedWindow);
+        m_pinnedWindow.clear();
+        xdotool->clearPinnedWindow();
+    }
+
     // VAD отдаёт речь отдельными фразами, каждая вставляется своим вызовом.
     // Без разделителя получалось "…двадцать лет назад.Сегодня вот…" — добавляем
     // пробел, если предыдущая вставка им не закончилась.
@@ -694,7 +719,14 @@ void ApplicationController::injectText(const QString& text)
     }
 
     if (!m_injector->typeText(toType)) {
-        reportError(QStringLiteral("Не удалось вставить текст"));
+        // «Не удалось вставить текст» без адреса ни о чём не говорит, поэтому
+        // рядом всегда печатаем КУДА именно мы целились.
+        reportError(QStringLiteral("Не удалось вставить текст (%1 символ) в %2%3")
+                        .arg(toType.size())
+                        .arg(m_pinnedWindow.isEmpty()
+                                 ? QStringLiteral("активное окно")
+                                 : QStringLiteral("окно ") + m_pinnedWindow,
+                             xdotool ? QStringLiteral(": ") + xdotool->lastError() : QString()));
         return;
     }
     m_lastInjected = toType;
@@ -936,6 +968,32 @@ void ApplicationController::captureTargetWindow()
         qWarning().noquote()
             << QStringLiteral("pin_window: не удалось определить активное окно, "
                               "вставка пойдёт туда, где будет фокус");
+        xdotool->clearPinnedWindow();
+        m_pinnedWindow.clear();
+        return;
+    }
+
+    // ЗАЩИТА ОТ САМОЙ ОБИДНОЙ ПОЛОМКИ. Запись часто начинают кликом по меню
+    // трея, а в X11 всплывающее меню — это отдельное окно, и именно оно в этот
+    // момент активно. Привязка к нему означала, что весь продиктованный текст
+    // уезжает в меню, которое закрывается через мгновение вместе с текстом:
+    // в логе при этом «успех», а в редакторе ничего. Окна помощника узнаём по
+    // WM_CLASS ([output] own_window_class) и по PID собственного процесса.
+    const QString cls = XdotoolInjector::windowClass(wid);
+    const QStringList own = m_config ? m_config->ownWindowClasses() : QStringList();
+    const qint64 pid = XdotoolInjector::windowPid(wid);
+    const bool isSelf = (!cls.isEmpty() && own.contains(cls))
+                        || (pid != 0 && pid == QCoreApplication::applicationPid());
+    if (isSelf) {
+        qWarning().noquote()
+            << QStringLiteral("pin_window: активное окно %1 принадлежит самому помощнику "
+                              "(WM_CLASS=%2, pid=%3) — привязка НЕ установлена, текст пойдёт "
+                              "в окно, которое будет в фокусе на момент вставки. "
+                              "Начинайте запись хоткеем (%4), а не кликом по меню трея.")
+                   .arg(XdotoolInjector::describeWindow(wid),
+                        cls.isEmpty() ? QStringLiteral("?") : cls)
+                   .arg(pid)
+                   .arg(m_config ? m_config->hotkeyKey() : QStringLiteral("хоткей"));
         xdotool->clearPinnedWindow();
         m_pinnedWindow.clear();
         return;

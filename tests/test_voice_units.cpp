@@ -25,6 +25,7 @@
 #include "core/OutputTarget.h"
 #include "input/EvdevHotkeyListener.h"
 #include "output/FileInjector.h"
+#include "output/WindowTarget.h"
 #include "output/XdotoolInjector.h"
 #include "spellcheck/HunspellChecker.h"
 #include "text/TextPostProcessor.h"
@@ -316,6 +317,59 @@ private slots:
         QVERIFY(cfg.asrProfileNames().isEmpty());
     }
 
+    void configPinWindowDefaultsAreReliable()
+    {
+        // Без .ini способ доставки обязан быть «activate»: это единственный
+        // вариант, который печатает в любом приложении. Откат по умолчанию к
+        // sendevent — это и была причина «лог виден, а в редакторе ничего».
+        const ConfigManager cfg(QStringLiteral("/tmp/нет-такого-файла-va.ini"));
+        QVERIFY(!cfg.pinWindow());                          // привязка выключена
+        QCOMPARE(stringToPinMode(cfg.pinMode()), PinMode::Activate);
+        QCOMPARE(cfg.pinActivateMs(), 80);
+        QVERIFY(cfg.pinRestoreFocus());
+        QVERIFY(cfg.ownWindowClasses().contains(QStringLiteral("voice-assistant")));
+    }
+
+    void configPinWindowReadsIni()
+    {
+        QTemporaryFile f;
+        QVERIFY(f.open());
+        {
+            QTextStream out(&f);
+            out.setCodec("UTF-8");
+            out << QStringLiteral("[output]\n")
+                << QStringLiteral("pin_window=true\n")
+                << QStringLiteral("pin_mode=sendevent\n")
+                << QStringLiteral("pin_activate_ms=200\n")
+                << QStringLiteral("pin_restore_focus=false\n")
+                << QStringLiteral("own_window_class=voice-assistant, MyApp ,\n");
+        }
+        f.close();
+
+        const ConfigManager cfg(f.fileName());
+        QVERIFY(cfg.pinWindow());
+        QCOMPARE(stringToPinMode(cfg.pinMode()), PinMode::SendEvent);
+        QCOMPARE(cfg.pinActivateMs(), 200);
+        QVERIFY(!cfg.pinRestoreFocus());
+        // пробелы подрезаны, пустой хвост после запятой не попал в список
+        QCOMPARE(cfg.ownWindowClasses(),
+                 (QStringList{QStringLiteral("voice-assistant"), QStringLiteral("MyApp")}));
+    }
+
+    void configPinActivateMsIsClamped()
+    {
+        QTemporaryFile f;
+        QVERIFY(f.open());
+        {
+            QTextStream out(&f);
+            out.setCodec("UTF-8");
+            out << QStringLiteral("[output]\npin_activate_ms=-50\n");
+        }
+        f.close();
+        const ConfigManager cfg(f.fileName());
+        QCOMPARE(cfg.pinActivateMs(), 0);   // отрицательная пауза не имеет смысла
+    }
+
     // ---------------- HunspellChecker ----------------
 
     void spellSplitWords()
@@ -561,6 +615,137 @@ private slots:
         inj.setClipboardRestoreMs(250);
         QVERIFY(inj.initialize());
         QVERIFY(inj.typeText(QStringLiteral("тест")));   // в dry-run буфер не трогается
+    }
+
+    void injectorPinOptionsDoNotCrashDryRun()
+    {
+        // В dry-run привязка к окну не должна ничего вызывать наружу: ни
+        // xdotool, ни проверок существования окна. Иначе тесты без X-сервера
+        // начнут порождать процессы и падать.
+        XdotoolInjector inj;
+        inj.setPinMode(PinMode::Activate);
+        inj.setPinActivateDelayMs(10);
+        inj.setPinRestoreFocus(true);
+        inj.setOwnWindowClasses({QStringLiteral("voice-assistant")});
+        inj.setPinnedWindow(QStringLiteral("12345"));
+        QVERIFY(inj.initialize());
+        QCOMPARE(inj.pinnedWindow(), QStringLiteral("12345"));
+        QVERIFY(inj.typeText(QStringLiteral("привет")));
+        QVERIFY(inj.sendKey(QStringLiteral("Return")));
+        QCOMPARE(inj.backendName(), QStringLiteral("dry-run"));
+        inj.clearPinnedWindow();
+        QVERIFY(inj.pinnedWindow().isEmpty());
+    }
+
+    // ---------------- Куда вставлять: WindowTarget ----------------
+    //
+    // Здесь проверяется решение, которое раньше принималось «на глаз» внутри
+    // инжектора и потому не проверялось вовсе. Именно из-за него pin_window
+    // молча не печатал: xdotool --window шлёт синтетику (XSendEvent), часть
+    // приложений её отбрасывает, а код возврата всё равно 0.
+
+    void windowTargetNoPinGoesToActiveWindow()
+    {
+        const WindowTarget t = decideWindowTarget(QString(), QStringLiteral("111"),
+                                                  false, PinMode::Activate, true);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::ActiveWindow);
+        QVERIFY(t.window.isEmpty());
+        QVERIFY(!t.needsActivation());
+        QVERIFY(!t.usesWindowFlag());
+    }
+
+    void windowTargetPinnedButClosedFallsBackToActive()
+    {
+        // Окно закрыли, пока шла запись. Вставлять в него нельзя: xdotool
+        // вернёт BadWindow, а текст пропадёт. Откат на активное окно.
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("222"),
+                                                  /*pinnedAlive=*/false,
+                                                  PinMode::Activate, true);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::ActiveWindow);
+    }
+
+    void windowTargetRefusesOwnWindow()
+    {
+        // Меню трея в X11 — отдельное окно, и в начале записи активно именно
+        // оно. Привязка к нему = потерянный текст.
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("222"),
+                                                  true, PinMode::Activate, true,
+                                                  {QStringLiteral("111")});
+        QCOMPARE(t.delivery, WindowTarget::Delivery::ActiveWindow);
+    }
+
+    void windowTargetAlreadyFocusedNeedsNoActivation()
+    {
+        // Окно и так в фокусе: xdotool сам пошлёт настоящие события, поэтому
+        // активация и возврат фокуса не нужны.
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("111"),
+                                                  true, PinMode::Activate, true);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::SendEvent);
+        QCOMPARE(t.window, QStringLiteral("111"));
+        QVERIFY(t.restoreTo.isEmpty());
+    }
+
+    void windowTargetSendEventModeKeepsFocus()
+    {
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("222"),
+                                                  true, PinMode::SendEvent, true);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::SendEvent);
+        QCOMPARE(t.window, QStringLiteral("111"));
+        QVERIFY(t.usesWindowFlag());
+        QVERIFY(t.restoreTo.isEmpty());   // фокус не трогали — возвращать нечего
+    }
+
+    void windowTargetActivateModeRestoresFocus()
+    {
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("222"),
+                                                  true, PinMode::Activate, true);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::Activate);
+        QCOMPARE(t.window, QStringLiteral("111"));
+        QCOMPARE(t.restoreTo, QStringLiteral("222"));
+        QVERIFY(t.needsActivation());
+        QVERIFY(!t.usesWindowFlag());   // при активации --window вреден
+    }
+
+    void windowTargetActivateWithoutRestore()
+    {
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("222"),
+                                                  true, PinMode::Activate, /*allowRestore=*/false);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::Activate);
+        QVERIFY(t.restoreTo.isEmpty());
+    }
+
+    void windowTargetActivateWithUnknownActiveWindow()
+    {
+        // Фокус не определился: активировать всё равно надо, а возвращать некуда.
+        const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QString(),
+                                                  true, PinMode::Activate, true);
+        QCOMPARE(t.delivery, WindowTarget::Delivery::Activate);
+        QVERIFY(t.restoreTo.isEmpty());
+    }
+
+    void pinModeParsing()
+    {
+        QCOMPARE(stringToPinMode(QStringLiteral("activate")), PinMode::Activate);
+        QCOMPARE(stringToPinMode(QStringLiteral("sendevent")), PinMode::SendEvent);
+        QCOMPARE(stringToPinMode(QStringLiteral("send_event")), PinMode::SendEvent);
+        QCOMPARE(stringToPinMode(QStringLiteral("  SEND_EVENT ")), PinMode::SendEvent);
+        QCOMPARE(stringToPinMode(QStringLiteral("window")), PinMode::SendEvent);
+        // неизвестное -> activate: тихий откат к нерабочему варианту уже был
+        QCOMPARE(stringToPinMode(QStringLiteral("что-то странное")), PinMode::Activate);
+        QCOMPARE(stringToPinMode(QString()), PinMode::Activate);
+        QCOMPARE(pinModeToString(PinMode::SendEvent), QStringLiteral("sendevent"));
+        QCOMPARE(pinModeToString(PinMode::Activate), QStringLiteral("activate"));
+    }
+
+    void deliveryNamesAreHumanReadable()
+    {
+        // По логу должно быть понятно, почему текст не дошёл, поэтому названия
+        // способов — слова, а не термины X11.
+        QVERIFY(!deliveryToString(WindowTarget::Delivery::SendEvent).isEmpty());
+        QVERIFY(deliveryToString(WindowTarget::Delivery::Activate)
+                    .contains(QStringLiteral("настоящ")));
+        QVERIFY(deliveryToString(WindowTarget::Delivery::ActiveWindow)
+                    .contains(QStringLiteral("активное")));
     }
 
 

@@ -78,6 +78,19 @@ public:
     // в другой файл и печатать там, пока диктовка продолжается.
     bool    pinWindow() const;           // [output] pin_window
 
+    // КАК доставлять текст в привязанное окно — см. output/WindowTarget.h.
+    //   activate  (по умолчанию) — окно активируется, текст печатается
+    //             настоящими событиями, фокус возвращается. Работает везде.
+    //   sendevent — прежнее поведение (xdotool --window, XSendEvent): фокус не
+    //             трогается, зато браузеры/LibreOffice/Java такой ввод часто
+    //             отбрасывают, и xdotool всё равно возвращает 0.
+    QString pinMode() const;             // [output] pin_mode
+    int     pinActivateMs() const;       // [output] pin_activate_ms
+    bool    pinRestoreFocus() const;     // [output] pin_restore_focus
+    // WM_CLASS окон самого помощника: привязываться к ним нельзя, иначе текст
+    // уходит в меню трея и пропадает вместе с ним. Список через запятую.
+    QStringList ownWindowClasses() const;// [output] own_window_class
+
     // --- заметки: вторая цель вывода (OutputTarget::Notes) ---
     bool    notesEnabled() const;          // [notes] enabled
     QString notesDir() const;              // [notes] dir   (один файл на день)

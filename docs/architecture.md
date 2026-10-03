@@ -88,6 +88,7 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 | VAD | `IVad` | `SileroVad` |
 | ASR | `IRecognizer` | `TransducerRecognizer`, `NemoCtcRecognizer`, `WhisperRecognizer` |
 | Ввод текста | `ITextInjector` | `XdotoolInjector` (окно), `FileInjector` (файл заметок) |
+| Выбор окна для вставки | `WindowTarget` (чистая функция) | `decideWindowTarget()` — способ доставки и куда вернуть фокус |
 | Правописание | `ISpellChecker` | `HunspellChecker` (hunspell, C API) |
 | Глобальный хоткей | `IHotkeyListener` | `EvdevHotkeyListener` (`/dev/input/event*`) |
 | Запись аудио | — | `WavWriter` (PCM16 → WAV) |
@@ -105,6 +106,36 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 3. Добавить профиль в `settings.ini`.
 
 Контроллер, пайплайн и UI при этом не меняются.
+
+### Как выбирается окно для вставки
+
+`output/WindowTarget.h` — единственный модуль вывода без единой зависимости от
+X11: ни `QProcess`, ни `xdotool`, ни задержек. Только решение.
+
+```
+pinned (WID из начала записи) + active (WID сейчас) + «окно живо» + pin_mode
+        │
+        ▼  decideWindowTarget()
+WindowTarget { delivery, window, restoreTo }
+        │
+        ├── ActiveWindow — привязки нет / окно закрыли / это окно помощника
+        ├── SendEvent    — xdotool … --window WID (синтетика, фокус не трогаем)
+        └── Activate     — windowactivate --sync → пауза → печать настоящими
+                           событиями БЕЗ --window → возврат фокуса в restoreTo
+```
+
+Зачем вынесено отдельно. `xdotool … --window WID` шлёт настоящие события
+(XTest), только если окно уже в фокусе; иначе — `XSendEvent`, который браузеры,
+LibreOffice и Java отбрасывают, а `xdotool` всё равно возвращает `0`. Пока это
+решение жило внутри `typeViaClipboard()`/`typeViaXdotool()` вперемешку с
+`QProcess`, проверить его было нельзя — и оно ломалось молча. Чистая функция
+покрыта тестами (8 сценариев), а инжектор лишь исполняет её вердикт.
+
+`DeliveryScope` (RAII) активует окно в конструкторе и возвращает фокус в
+деструкторе. Скоуп один на всю вставку: при откате «буфер обмена не сработал →
+`xdotool type`» окно активировалось бы дважды и фокус мигал бы на каждом
+сегменте. Поэтому `resolveTarget()` вызывается один раз, а результат передаётся
+в оба способа доставки.
 
 ### Как добавить способ ввода текста (Wayland/TTY)
 
