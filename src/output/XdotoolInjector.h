@@ -121,7 +121,11 @@ private:
         bool restore = false;
         ~DeliveryScope();
     };
-    DeliveryScope enterTarget(const WindowTarget& t);
+    // t передаётся по ссылке и может быть ПОНИЖЕНА до SendEvent: если активация
+    // не удалась (или WM отрапортовал успех, а фокус не переехал), печать
+    // настоящими событиями без --window ушла бы в КАКОЕ ПОПАЛО окно. Синтетика
+    // в правильное окно лучше, чем настоящие события в неправильное.
+    DeliveryScope enterTarget(WindowTarget& t);
 
     bool typeViaXdotool(const WindowTarget& t, const QString& text);
     bool typeViaClipboard(const WindowTarget& t, const QString& text);
@@ -151,6 +155,7 @@ private:
     bool        m_pinRestoreFocus = true;
     int         m_pinActivateDelayMs = 80;
     QStringList m_ownWindowClasses;
+    bool        m_warnedSyntheticTyping = false;   // разовое предупреждение, см. typeViaXdotool
 
     QString     m_lastError;
 

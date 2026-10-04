@@ -406,6 +406,27 @@ void ApplicationController::reloadHotwords()
     }
 }
 
+void ApplicationController::reloadHotkey()
+{
+    // Останавливаем старый слушатель (деструктор закрывает fd устройств)
+    // и поднимаем новый с текущими [hotkey] key/mode из ini. Ошибки не
+    // смертельны: setupHotkey() сам пишет reportError, трей и D-Bus работают.
+    if (m_hotkey) {
+        m_hotkey->stop();
+        m_hotkey.reset();
+    }
+    if (m_mode != Mode::Off && m_hotkeyMode != m_config->hotkeyMode()) {
+        // Режим сменился посреди записи (push_to_talk <-> toggle): safer
+        // остановить запись, иначе отпускание клавиши в новом режиме не
+        // остановит диктовку.
+        stopRecording();
+    }
+    m_hotkeyMode = m_config->hotkeyMode();
+    setupHotkey();
+    qInfo().noquote()
+        << QStringLiteral("Хоткей перезапущен: %1").arg(hotkeyDescription());
+}
+
 // ---------------------------------------------------------------------------
 // Аудио
 // ---------------------------------------------------------------------------

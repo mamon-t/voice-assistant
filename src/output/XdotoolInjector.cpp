@@ -208,9 +208,17 @@ QString XdotoolInjector::windowClass(const QString& windowId)
         return QString();
     }
     const QString out = QString::fromUtf8(proc.readAllStandardOutput());
-    // WM_CLASS(STRING) = "kate", "Kate"
+    // WM_CLASS(STRING) = "res_name", "res_class" — нужен ВТОРОЙ поле:
+    // getwindowclassname возвращает именно res_class, запасной путь обязан
+    // вести себя так же. (У Qt res_name — имя бинарника, res_class —
+    // applicationName; сравниваем мы с [output] own_window_class.)
     const int q1 = out.indexOf(QLatin1Char('"'));
     const int q2 = out.indexOf(QLatin1Char('"'), q1 + 1);
+    const int q3 = out.indexOf(QLatin1Char('"'), q2 + 1);
+    const int q4 = out.indexOf(QLatin1Char('"'), q3 + 1);
+    if (q3 >= 0 && q4 > q3) {
+        return out.mid(q3 + 1, q4 - q3 - 1);
+    }
     if (q1 >= 0 && q2 > q1) {
         return out.mid(q1 + 1, q2 - q1 - 1);
     }
@@ -265,8 +273,9 @@ WindowTarget XdotoolInjector::resolveTarget() const
         return t;
     }
 
-    // Окна самого помощника определяем по WM_CLASS, а не по PID: меню трея —
-    // это отдельное окно того же процесса, и его как раз вставлять нельзя.
+    // Окна самого помощника определяем прежде всего по WM_CLASS: меню трея —
+    // это отдельное окно того же процесса, и в него вставлять нельзя. PID —
+    // страховка на случай, когда класс не прочитался.
     QStringList own = m_ownWindowClasses;
     if (own.isEmpty()) {
         own << QStringLiteral("voice-assistant");
@@ -274,6 +283,13 @@ WindowTarget XdotoolInjector::resolveTarget() const
     QStringList ownWids;
     const QString cls = windowClass(m_pinnedWindow);
     if (!cls.isEmpty() && own.contains(cls)) {
+        ownWids << m_pinnedWindow;
+    } else if (windowPid(m_pinnedWindow) == QCoreApplication::applicationPid()) {
+        // Страховка второго рубежа: WM_CLASS мог не прочитаться (в релизном
+        // xdotool нет getwindowclassname, а xprop не установлен), но PID
+        // доступен почти всегда. Окно собственного процесса легитимной целью
+        // не бывает — это либо меню лотка, либо диалог помощника. --pin-info
+        // проверяет PID по тем же причинам.
         ownWids << m_pinnedWindow;
     }
 
@@ -335,6 +351,12 @@ XdotoolInjector::DeliveryScope::~DeliveryScope()
     if (!restore || restoreTo.isEmpty() || !self) {
         return;
     }
+    // Даём целевому приложению обработать последние нажатия: возврат фокуса
+    // соревнуется с их обработкой, и Qt отбрасывает клавиши, пришедшие уже
+    // НЕактивному окну — теряется последний символ (поймано e2e-стендом:
+    // «тест три чере» вместо «тест три четыре» при возврате фокуса вплотную
+    // к последнему нажатию).
+    QThread::msleep(60);
     // Возвращаем фокус туда, где он был до вставки. Не aktivatе --sync
     // намеренно: ждать подтверждения не нужно, а зависнуть на закрытом окне —
     // очень даже. Ошибку логируем, но не считаем провалом вставки.
@@ -346,13 +368,27 @@ XdotoolInjector::DeliveryScope::~DeliveryScope()
     }
 }
 
-XdotoolInjector::DeliveryScope XdotoolInjector::enterTarget(const WindowTarget& t)
+XdotoolInjector::DeliveryScope XdotoolInjector::enterTarget(WindowTarget& t)
 {
     DeliveryScope scope;
     scope.self = this;
     if (!t.needsActivation() || m_dryRun || m_xdotool.isEmpty()) {
         return scope;
     }
+
+    // Понижение до синтетики: настоящие события без --window уходят в окно,
+    // которое В ФОКУСЕ. Если активация не удалась, в фокусе не наше окно —
+    // текст ушёл бы в случайное место, а xdotool всё равно вернул бы 0.
+    // Синтетика в правильное окно лучше: Qt/GTK её принимают, а браузеры —
+    // нет, но тогда это видно в логе ([синтетика (--window)]).
+    const auto downgradeToSendEvent = [this, &t](const QString& why) {
+        qWarning().noquote()
+            << QStringLiteral("XdotoolInjector: %1 — переключаюсь на доставку "
+                              "через --window (синтетика): часть приложений её "
+                              "игнорирует, смотрите строку вставки в логе").arg(why);
+        t.delivery = WindowTarget::Delivery::SendEvent;
+        t.restoreTo.clear();
+    };
 
     // --sync ждёт, пока WM действительно отдаст фокус. На закрытом окне он
     // может ждать вечно, поэтому сначала проверяем, что окно живое, и держим
@@ -366,12 +402,37 @@ XdotoolInjector::DeliveryScope XdotoolInjector::enterTarget(const WindowTarget& 
                               "пробую windowfocus").arg(t.window);
         if (!runProcess(m_xdotool, {QStringLiteral("windowfocus"), t.window})) {
             m_lastError = QStringLiteral("не удалось активировать окно %1").arg(t.window);
+            downgradeToSendEvent(QStringLiteral("не удалось активировать окно"));
             return scope;
         }
     }
     if (m_pinActivateDelayMs > 0) {
         QThread::msleep(static_cast<unsigned long>(m_pinActivateDelayMs));
     }
+
+    // Доверяй, но проверяй: WM может отрапортовать об активации, не переместив
+    // фокус (наблюдено в openbox на свежепостроенных окнах, пока не выставлен
+    // _NET_WM_DESKTOP). Одна повторная попытка, затем понижение до синтетики.
+    // Пустой ответ getactivewindow провалом не считаем: значит, WM не
+    // рапортует активное окно вовсе, и проверять нечем.
+    const QString nowActive = activeWindowId();
+    if (!nowActive.isEmpty() && nowActive != t.window) {
+        qDebug().noquote()
+            << QStringLiteral("XdotoolInjector: фокус не переехал в окно %1 — "
+                              "повторяю активацию").arg(t.window);
+        runProcess(m_xdotool,
+                   {QStringLiteral("windowactivate"), QStringLiteral("--sync"), t.window});
+        if (m_pinActivateDelayMs > 0) {
+            QThread::msleep(static_cast<unsigned long>(m_pinActivateDelayMs));
+        }
+        const QString retry = activeWindowId();
+        if (!retry.isEmpty() && retry != t.window) {
+            downgradeToSendEvent(QStringLiteral("окно не стало активным после "
+                                                "двух попыток активации"));
+            return scope;
+        }
+    }
+
     scope.restoreTo = t.restoreTo;
     scope.restore   = !t.restoreTo.isEmpty();
     return scope;
@@ -389,11 +450,12 @@ QStringList XdotoolInjector::windowArgs(const WindowTarget& t) const
 
 void XdotoolInjector::warnIfPinLost(const WindowTarget& t) const
 {
-    // Привязка есть, а вставка пойдёт в активное окно. Значит, окно либо
-    // закрыли, либо это окно самого помощника (меню трея, настройки). Молчать
-    // здесь нельзя: именно из такого молчания и рождается «лог виден, а в
-    // редакторе ничего».
-    if (m_pinnedWindow.isEmpty() || t.delivery != WindowTarget::Delivery::ActiveWindow) {
+    // Привязка была, но цель отброшена: окно закрыли или это окно самого
+    // помощника (меню трея, настройки). Молчать здесь нельзя: именно из
+    // такого молчания и рождается «лог виден, а в редакторе ничего».
+    // ВНИМАНИЕ: «окно уже в фокусе» (pinLost == false при ActiveWindow) —
+    // нормальная доставка настоящими событиями, предупреждать не о чем.
+    if (m_pinnedWindow.isEmpty() || !t.pinLost) {
         return;
     }
     qWarning().noquote()
@@ -440,8 +502,9 @@ bool XdotoolInjector::typeText(const QString& text)
 
     // Решение принимается ОДИН раз на всю вставку: иначе при откате
     // «буфер не сработал -> xdotool type» окно активировалось бы дважды
-    // и фокус мигал бы на каждом сегменте.
-    const WindowTarget t = resolveTarget();
+    // и фокус мигал бы на каждом сегменте. Не const: enterTarget может
+    // понизить доставку до SendEvent, если активация не удалась.
+    WindowTarget t = resolveTarget();
     warnIfPinLost(t);
     DeliveryScope scope = enterTarget(t);
 
@@ -484,7 +547,7 @@ bool XdotoolInjector::sendKey(const QString& key)
         return false;
     }
 
-    const WindowTarget t = resolveTarget();
+    WindowTarget t = resolveTarget();
     warnIfPinLost(t);
     DeliveryScope scope = enterTarget(t);
     const bool ok = sendKeyTo(t, key);
@@ -509,6 +572,27 @@ bool XdotoolInjector::typeViaXdotool(const WindowTarget& t, const QString& text)
         m_lastError = QStringLiteral("xdotool не найден");
         return false;
     }
+
+    // Честное предупреждение про посимвольную печать (одноразовое). xdotool для
+    // символов вне текущей раскладки временно переназначает keycode; приложение
+    // получает MappingNotify и нажатия одновременно, и часть нажатий
+    // декодируется ещё СТАРОЙ раскладкой — символы случайно теряются или
+    // подменяются (проверено на Qt5/Xvfb: с --delay 5 теряется, с --delay 60
+    // нет; при sendevent в расфокусированное окно — чаще). Это свойство
+    // xdotool, а не наше; буфер обмена от него не зависит.
+    Q_UNUSED(t);
+    if (!m_warnedSyntheticTyping) {
+        m_warnedSyntheticTyping = true;
+        qWarning().noquote()
+            << QStringLiteral("XdotoolInjector: посимвольная печать (method=xdotool): "
+                              "для символов вне текущей раскладки xdotool временно "
+                              "переназначает keycode, и из-за гонки MappingNotify "
+                              "теряются отдельные символы (чаще при sendevent в "
+                              "расфокусированное окно). Если текст приходит с "
+                              "дырками — используйте [output] method=auto (буфер "
+                              "обмена) или добавьте русскую раскладку в keymap");
+    }
+
     // --file - читает текст из stdin: так мы не упираемся в лимит длины
     // аргумента командной строки и не воюем с экранированием кавычек.
     QStringList args{ QStringLiteral("type") };

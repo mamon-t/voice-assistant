@@ -34,3 +34,9 @@ target_link_libraries(vad-asr-test PRIVATE
     ${SHERPA_ONNX_CXX_LIBRARY}
     ${SHERPA_ONNX_C_LIBRARY}
 )
+
+# e2e-стенд привязки вывода к окну: тестовый Qt-пробник (см. tools/e2e).
+# Запуск сценариев — tools/e2e/run-e2e.sh (нужны Xvfb, openbox, xdotool, xclip).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/e2e/CMakeLists.txt")
+    add_subdirectory(e2e)
+endif()

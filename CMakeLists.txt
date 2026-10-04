@@ -72,6 +72,55 @@ if(SHERPA_ONNX_OLD_CXX_ABI)
                    "под предсобранные sherpa-onnx")
 endif()
 
+# ---------------------------------------------------------------------------
+# ABI-САМОПРОВЕРКА на этапе конфигурации.
+#
+# Рассинхрон флага и библиотеки не даёт ошибок компиляции: он всплывает либо
+# segfault'ом в рантайме (грабля №1), либо «undefined reference to
+# ...CreateStream(std::string const&)» при линковке — и то и другое дорого
+# диагностировать. Проверяем символы библиотеки тем же способом, что описан
+# выше (nm | grep ERKSs), и падаем сразу с готовой командой исправления.
+#
+# Как читать ошибку ld, если она всё-таки случилась:
+#   «std::string const&»                    -> объекты old-ABI (флаг ON),
+#                                              а библиотека new-ABI
+#   «std::__cxx11::basic_string<...> const&» -> объекты new-ABI (флаг OFF),
+#                                              а библиотека old-ABI
+# ---------------------------------------------------------------------------
+find_program(NM_EXECUTABLE nm)
+if(NM_EXECUTABLE AND SHERPA_ONNX_CXX_LIBRARY)
+    execute_process(COMMAND ${NM_EXECUTABLE} -D --defined-only ${SHERPA_ONNX_CXX_LIBRARY}
+                    OUTPUT_VARIABLE SHERPA_ABI_SYMBOLS ERROR_QUIET)
+    string(LENGTH "${SHERPA_ABI_SYMBOLS}" _syms_len)
+    if(_syms_len GREATER 0)   # nm отработал — можно верить результату
+        string(REGEX MATCHALL "ERKSs" _old_abi_hits "${SHERPA_ABI_SYMBOLS}")
+        list(LENGTH _old_abi_hits _old_abi_count)
+        if(_old_abi_count EQUAL 0 AND SHERPA_ONNX_OLD_CXX_ABI)
+            message(FATAL_ERROR
+                "ABI-проверка: ${SHERPA_ONNX_CXX_LIBRARY} собрана с НОВЫМ ABI libstdc++ "
+                "(в символах нет 'ERKSs'), а SHERPA_ONNX_OLD_CXX_ABI=ON — линковка упадёт "
+                "с «undefined reference to ...CreateStream(std::string const&)».\n"
+                "Исправление: rm -rf build (или хотя бы build/CMakeCache.txt и CMakeFiles) "
+                "и переконфигурировать БЕЗ флага: cmake ..\n"
+                "Так обычно и есть, когда sherpa-onnx собиралась из исходников тем же g++, "
+                "что и проект.")
+        elseif(_old_abi_count GREATER 0 AND NOT SHERPA_ONNX_OLD_CXX_ABI)
+            message(FATAL_ERROR
+                "ABI-проверка: ${SHERPA_ONNX_CXX_LIBRARY} собрана со СТАРЫМ ABI libstdc++ "
+                "(в символах есть 'ERKSs': ${_old_abi_count} шт.), а "
+                "SHERPA_ONNX_OLD_CXX_ABI=OFF — будет segfault в Create() (грабля №1).\n"
+                "Исправление: rm -rf build и cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON\n"
+                "Так обычно и есть с официальными предсобранными sherpa-onnx.")
+        else()
+            message(STATUS "ABI-проверка sherpa-onnx: OK (old-ABI символов: "
+                           "${_old_abi_count}, флаг SHERPA_ONNX_OLD_CXX_ABI="
+                           "${SHERPA_ONNX_OLD_CXX_ABI})")
+        endif()
+    else()
+        message(STATUS "ABI-проверка sherpa-onnx: пропущена (nm не вернул символы)")
+    endif()
+endif()
+
 # Чтобы бинарник запускался и без `sudo ldconfig` (библиотеки стоят в /usr/local/lib)
 list(APPEND CMAKE_BUILD_RPATH "/usr/local/lib")
 list(APPEND CMAKE_INSTALL_RPATH "/usr/local/lib")

@@ -21,8 +21,9 @@
 //
 //   sendevent — xdotool … --window WID. Фокус НЕ трогается, можно печатать
 //               руками в другом окне прямо во время диктовки. Работает, пока
-//               приложение принимает синтетические события (Qt, GTK — да;
-//               браузеры и LibreOffice — как повезёт).
+//               приложение принимает синтетические события (Qt — да; GTK —
+//               как повезёт: XED на Cinnamon синтетический Ctrl+V проигнорировал;
+//               браузеры и LibreOffice — скорее нет).
 //   activate  — окно сначала активируется (xdotool windowactivate), события
 //               идут настоящими (XTest), затем фокус возвращается обратно.
 //               Работает в ЛЮБОМ приложении, но на 50–150 мс забирает фокус.
@@ -32,7 +33,7 @@
 // Способ доставки и окно, в которое пойдёт текст.
 struct WindowTarget {
     enum class Delivery {
-        ActiveWindow,  // привязки нет — печатаем туда, где фокус сейчас
+        ActiveWindow,  // привязки нет (или окно уже в фокусе) — печатаем туда, где фокус
         SendEvent,     // xdotool … --window WID (синтетические события)
         Activate       // активировать окно, напечатать настоящими, вернуть фокус
     };
@@ -40,6 +41,10 @@ struct WindowTarget {
     Delivery delivery = Delivery::ActiveWindow;
     QString  window;        // WID цели; пуста при Delivery::ActiveWindow
     QString  restoreTo;     // куда вернуть фокус после Activate (пуста = не возвращать)
+    bool     pinLost = false;  // привязка была, но цель отброшена (окно закрыто
+                               // или принадлежит помощнику) — для честного
+                               // предупреждения в логе; «окно уже в фокусе»
+                               // потерей привязки НЕ считается
 
     bool usesWindowFlag() const { return delivery == Delivery::SendEvent; }
     bool needsActivation() const { return delivery == Delivery::Activate; }
@@ -119,6 +124,7 @@ inline WindowTarget decideWindowTarget(const QString& pinned,
     // Откатываемся на активное окно — лучше вставка не туда, чем никуда.
     if (!pinnedAlive) {
         t.delivery = WindowTarget::Delivery::ActiveWindow;
+        t.pinLost  = true;
         return t;
     }
 
@@ -126,15 +132,21 @@ inline WindowTarget decideWindowTarget(const QString& pinned,
     // Вставка туда — это всегда потерянный текст, поэтому привязку игнорируем.
     if (selfWindows.contains(p)) {
         t.delivery = WindowTarget::Delivery::ActiveWindow;
+        t.pinLost  = true;
         return t;
     }
 
-    // Окно и так в фокусе: xdotool сам пошлёт настоящие события (внутри него
-    // есть проверка «если целевое окно == сфокусированное, берём XTest»),
-    // поэтому активация и возврат фокуса не нужны.
+    // Окно и так в фокусе: не нужна ни активация, ни --window. Без --window
+    // xdotool ВСЕГДА шлёт настоящие события (XTest) в сфокусированное окно —
+    // это самый надёжный путь из существующих. Раньше здесь стояла доставка
+    // через --window в расчёте, что «xdotool сам переключится на XTest, раз
+    // окно сфокусировано»: на Xvfb+openbox+Qt это подтверждалось замером
+    // (real=5, synthetic=0), но на живом Cinnamon + XED (GTK3) такая вставка
+    // молча не доходила — «ВСТАВЛЕНО» в логе, редактор пуст (грабля №29).
+    // Поведение, замеренное под одним WM, нельзя переносить на все: когда
+    // есть путь, от WM не зависящий, выбираем его.
     if (!a.isEmpty() && a == p) {
-        t.delivery   = WindowTarget::Delivery::SendEvent;
-        t.window     = p;
+        t.delivery = WindowTarget::Delivery::ActiveWindow;
         return t;
     }
 

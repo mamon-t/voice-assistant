@@ -1,5 +1,8 @@
 #include "ui/TrayIcon.h"
 #include "core/ApplicationController.h"
+#include "config/ConfigManager.h"
+#include "ui/HotwordsEditor.h"
+#include "ui/SettingsDialog.h"
 
 #include <QDebug>
 
@@ -200,12 +203,42 @@ void TrayIcon::onToggleRecording()
 
 void TrayIcon::onShowSettings()
 {
-    // TODO: SettingsDialog
+    if (!m_controller) {
+        return;
+    }
+    SettingsDialog dialog;
+    // settingsApplied испускается после записи ini — применяем на лету:
+    // модель, цель вывода и хоткей перечитываются без перезапуска.
+    connect(&dialog, &SettingsDialog::settingsApplied, this, [this]() {
+        const ConfigManager cfg;   // свежий экземпляр: читает уже сохранённый ini
+
+        const QString profile = cfg.activeAsrProfileName();
+        if (profile != m_controller->activeAsrProfile()) {
+            // Пересоздание пайплайна занимает 1–2 с; ошибки прилетят через
+            // errorOccurred (их показывает showMessage ниже по подписке).
+            m_controller->switchAsrProfile(profile);
+        }
+
+        m_controller->setOutputTarget(
+            cfg.notesStartTarget() == QLatin1String("notes") ? OutputTarget::Notes
+                                                             : OutputTarget::Focus);
+        syncNotesAction();
+
+        m_controller->reloadHotkey();
+    });
+    dialog.exec();
 }
 
 void TrayIcon::onShowHotwordsEditor()
 {
-    // TODO: HotwordsEditor
+    if (!m_controller) {
+        return;
+    }
+    HotwordsEditor dialog;
+    connect(&dialog, &HotwordsEditor::hotwordsUpdated, this, [this]() {
+        m_controller->reloadHotwords();
+    });
+    dialog.exec();
 }
 
 void TrayIcon::onModeChanged(Mode mode)

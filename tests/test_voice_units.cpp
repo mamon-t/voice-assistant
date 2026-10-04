@@ -652,6 +652,7 @@ private slots:
         QVERIFY(t.window.isEmpty());
         QVERIFY(!t.needsActivation());
         QVERIFY(!t.usesWindowFlag());
+        QVERIFY(!t.pinLost);   // привязки не было — терять нечего, без предупреждений
     }
 
     void windowTargetPinnedButClosedFallsBackToActive()
@@ -662,6 +663,7 @@ private slots:
                                                   /*pinnedAlive=*/false,
                                                   PinMode::Activate, true);
         QCOMPARE(t.delivery, WindowTarget::Delivery::ActiveWindow);
+        QVERIFY(t.pinLost);    // в лог должно попасть предупреждение
     }
 
     void windowTargetRefusesOwnWindow()
@@ -672,17 +674,23 @@ private slots:
                                                   true, PinMode::Activate, true,
                                                   {QStringLiteral("111")});
         QCOMPARE(t.delivery, WindowTarget::Delivery::ActiveWindow);
+        QVERIFY(t.pinLost);    // в лог должно попасть предупреждение
     }
 
     void windowTargetAlreadyFocusedNeedsNoActivation()
     {
-        // Окно и так в фокусе: xdotool сам пошлёт настоящие события, поэтому
-        // активация и возврат фокуса не нужны.
+        // Окно и так в фокусе: не нужна ни активация, ни --window. Печать без
+        // --window — это всегда настоящие события (XTest) в сфокусированное
+        // окно. Прежняя доставка «--window в сфокусированное окно» на живом
+        // Cinnamon + XED (GTK3) молча не доходила (грабля №29).
         const WindowTarget t = decideWindowTarget(QStringLiteral("111"), QStringLiteral("111"),
                                                   true, PinMode::Activate, true);
-        QCOMPARE(t.delivery, WindowTarget::Delivery::SendEvent);
-        QCOMPARE(t.window, QStringLiteral("111"));
+        QCOMPARE(t.delivery, WindowTarget::Delivery::ActiveWindow);
+        QVERIFY(t.window.isEmpty());
         QVERIFY(t.restoreTo.isEmpty());
+        QVERIFY(!t.pinLost);   // окно в фокусе — привязка НЕ потеряна
+        QVERIFY(!t.usesWindowFlag());
+        QVERIFY(!t.needsActivation());
     }
 
     void windowTargetSendEventModeKeepsFocus()
