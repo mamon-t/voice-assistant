@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
-project(voice-assistant VERSION 0.0.1 LANGUAGES CXX)
+project(voice-assistant VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt5 5.13 REQUIRED COMPONENTS Core Widgets Multimedia DBus)
+find_package(Qt5 5.13 REQUIRED COMPONENTS Core Widgets Multimedia DBus Network)
 
 # ---------------------------------------------------------------------------
 # sherpa-onnx: ОДИН источник и для VAD (Silero), и для ASR (zipformer-ru / Whisper).
@@ -135,3 +135,89 @@ endif()
 if(EXISTS "${CMAKE_SOURCE_DIR}/tools/CMakeLists.txt")
     add_subdirectory(tools)
 endif()
+
+# ---------------------------------------------------------------------------
+# Установка и пакеты (.deb / .rpm через CPack).
+#
+# Карта файлов (важна для ЧИСТОГО сноса — всё системное удаляет dpkg/rpm,
+# в домашний каталог пакет не лезет ни при установке, ни при удалении):
+#   /usr/bin/voice-assistant, /usr/bin/vad-asr-test
+#   /usr/lib/voice-assistant/          — sherpa-onnx + onnxruntime + hunspell
+#                                        (RPATH бинарника: $ORIGIN/../lib/voice-assistant)
+#   /usr/share/applications/voice-assistant.desktop
+#   /usr/share/metainfo/voice-assistant.metainfo.xml
+#   /usr/share/icons/hicolor/scalable/apps/voice-assistant.svg
+#   /usr/share/voice-assistant/settings.ini.default
+#   /usr/share/doc/voice-assistant/    — README, LICENSE, docs/*.md
+# Пользовательские данные (пакет их НЕ трогает, в т.ч. при purge — политика
+# дистрибутивов; очистка одной командой описана в README):
+#   ~/.config/voice-assistant/         — настройки, подсказки, свои команды
+#   ~/.local/share/voice-assistant/    — заметки, записи микрофона
+#   ~/.voice_models/                   — модели (качает приложение, не пакет)
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+
+install(FILES dist/voice-assistant.desktop
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+install(FILES dist/voice-assistant.metainfo.xml
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo)
+install(FILES resources/icons/mic-on.svg
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
+        RENAME voice-assistant.svg)
+install(FILES config/settings.ini
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/voice-assistant
+        RENAME settings.ini.default)
+install(FILES README.md LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(DIRECTORY docs/
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs
+        FILES_MATCHING PATTERN "*.md")
+
+# ---------------------------------------------------------------------------
+# CPack: cpack -G DEB   и/или   cpack -G RPM
+# ---------------------------------------------------------------------------
+set(CPACK_PACKAGE_NAME "voice-assistant")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_CONTACT "Mikhail Alekseev <2988373@gmail.com>")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/mamon-t/voice-assistant")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Offline voice dictation into any application (X11; evdev hotkey works in Wayland/TTY)")
+set(CPACK_PACKAGE_DESCRIPTION
+    "Голосовой помощник для набора и правки текста диктовкой. Полностью офлайн:
+Silero VAD + zipformer-ru / GigaAM / Whisper через sherpa-onnx. Глобальный
+хоткей через evdev (X11, Wayland, TTY), вставка в любое окно X11 (буфер обмена
++ Ctrl+V или xdotool, с привязкой к окну начала записи), голосовые команды
+правки и пунктуация, проверка правописания hunspell, вторая цель вывода —
+файл заметок (диктовка не мешает печатать руками). Модели (~110 МБ)
+скачиваются при первом запуске из меню лотка или командой
+voice-assistant --download-model zipformer-ru.")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+set(CPACK_STRIP_FILES TRUE)
+
+# --- DEB ---
+set(CPACK_DEBIAN_PACKAGE_SECTION "sound")
+# hunspell намеренно НЕ в зависимостях: libhunspell-1.7.so.0 кладём в
+# /usr/lib/voice-assistant (в Ubuntu 24.04 пакет зовётся ...t64 — общая
+# сборка под 22.04 не удовлетворила бы зависимость на 22.04+24.04 сразу).
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "libc6, libstdc++6, libqt5core5a, libqt5gui5, libqt5widgets5, libqt5multimedia5, libqt5dbus5, libqt5network5, xdotool, xclip, x11-utils")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS
+    "hunspell-ru, x11-xkb-utils, pulseaudio")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_SOURCE_DIR}/dist/packaging/postinst")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+
+# --- RPM ---
+set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+set(CPACK_RPM_PACKAGE_GROUP "Applications/Productivity")
+set(CPACK_RPM_PACKAGE_REQUIRES
+    "qt5-qtbase, qt5-qtmultimedia, xdotool, xclip, xorg-x11-utils")
+set(CPACK_RPM_PACKAGE_SUGGESTS "hunspell-ru, x11-xkb-utils")
+set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
+    "${CMAKE_SOURCE_DIR}/dist/packaging/postinst")
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+# свои библиотеки в /usr/lib/voice-assistant: не давать rpmbuild ругаться
+# на нерезолвимые soname sherpa/onnxruntime (они рядом с бинарником, RPATH)
+set(CPACK_RPM_SPEC_MORE_DEFINE "%define _build_id_links none")
+
+include(CPack)

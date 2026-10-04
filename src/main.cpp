@@ -21,6 +21,8 @@
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
 #include "input/EvdevHotkeyListener.h"
+#include "models/ModelCatalog.h"
+#include "models/ModelDownloader.h"
 #include "output/FileInjector.h"
 #include "output/XdotoolInjector.h"
 
@@ -667,6 +669,107 @@ int runTypeTest(QCoreApplication& app, const QStringList& args)
     return rc;
 }
 
+// --download-model <id|all|list> — загрузка моделей из консоли.
+// Тот же путь, что и GUI-мастер: каталог в ModelCatalog, проверка sha256,
+// докачка .part после обрыва. Нужно для установки без GUI (ssh, скрипты)
+// и для тестировщиков, которые любят терминал.
+int runDownloadModel(QCoreApplication& app, const QStringList& args)
+{
+    const int di = args.indexOf(QStringLiteral("--download-model"));
+    const QString what = (di >= 0 && di + 1 < args.size()
+                          && !args.at(di + 1).startsWith(QLatin1String("--")))
+        ? args.at(di + 1) : QStringLiteral("list");
+
+    std::unique_ptr<ConfigManager> cfg(makeConfigFromArgs(args));
+    const QString destDir = cfg->modelsPath();
+
+    if (what == QLatin1String("list")) {
+        std::printf("Каталог моделей (установщик: %s)\n\n", qPrintable(destDir));
+        for (const ModelPackage& p : modelCatalog()) {
+            const bool installed = isModelPackageInstalled(p, destDir);
+            std::printf("  %-14s %7.1f МБ  %s  %s\n", qPrintable(p.id),
+                        p.sizeBytes / (1024.0 * 1024.0),
+                        installed ? "[установлен]" : "[нет]        ",
+                        qPrintable(p.title));
+        }
+        std::printf("\nСкачать:  voice-assistant --download-model zipformer-ru\n"
+                    "Всё сразу: voice-assistant --download-model all\n"
+                    "Заново:    voice-assistant --download-model <id> --force\n"
+                    "(silero-vad обязателен и добавляется автоматически)\n");
+        return 0;
+    }
+
+    QList<ModelPackage> queue;
+    if (what == QLatin1String("all")) {
+        queue = modelCatalog();
+    } else {
+        const ModelPackage* p = findModelPackage(what);
+        if (!p) {
+            std::fprintf(stderr,
+                         "--download-model: неизвестная модель '%s'. Список: "
+                         "voice-assistant --download-model list\n", qPrintable(what));
+            return 2;
+        }
+        queue << *p;
+        // VAD обязателен: без него не работает ни один профиль
+        const ModelPackage* vad = findModelPackage(QStringLiteral("silero-vad"));
+        if (vad && !isModelPackageInstalled(*vad, destDir)) {
+            queue.prepend(*vad);
+        }
+    }
+
+    ModelDownloader downloader;
+    int exitCode = 0;
+    QObject::connect(&downloader, &ModelDownloader::progress,
+                     [](const QString& id, qint64 received, qint64 total) {
+        const int pct = total > 0 ? int(received * 100 / total) : 0;
+        std::printf("\r  %s: %6.1f / %.1f МБ (%3d%%)   ", qPrintable(id),
+                    received / (1024.0 * 1024.0), total / (1024.0 * 1024.0), pct);
+        std::fflush(stdout);
+    });
+    QObject::connect(&downloader, &ModelDownloader::packageFinished,
+                     [](const QString& id) {
+        std::printf("\r  ✔ %s установлен (sha256 совпал)                          \n",
+                    qPrintable(id));
+    });
+    QObject::connect(&downloader, &ModelDownloader::packageFailed,
+                     [&exitCode](const QString& id, const QString& error) {
+        exitCode = 1;
+        std::printf("\n  ✖ %s: %s\n", qPrintable(id), qPrintable(error));
+    });
+    QObject::connect(&downloader, &ModelDownloader::finished,
+                     [&app, &exitCode, cfgPtr = cfg.get(), destDir](bool allOk) {
+        if (allOk) {
+            // Активный профиль не готов, а рекомендованный только что скачан —
+            // делаем его активным, чтобы «скачал и сразу диктую» работало.
+            const QString rec = recommendedInstalledProfile(destDir);
+            const AsrProfile active = cfgPtr->asrProfile(cfgPtr->activeAsrProfileName());
+            QString err;
+            if (!rec.isEmpty() && !active.isValid(&err) && rec != cfgPtr->activeAsrProfileName()) {
+                cfgPtr->setActiveAsrProfileName(rec);
+                std::printf("Активный профиль ASR установлен: %s\n", qPrintable(rec));
+            }
+        } else if (exitCode == 0) {
+            exitCode = 1;
+        }
+        app.quit();
+    });
+
+    std::printf("Куда: %s\n", qPrintable(destDir));
+    // --force — переустановить, даже если каталог выглядит установленным
+    // (лечит полураспакованные каталоги от старых версий/ручных tar).
+    const bool force = args.contains(QStringLiteral("--force"));
+    // ВАЖНО: запуск из singleShot(0), то есть уже внутри exec(). Если всё
+    // уже установлено, finished() испускается синхронно — quit(), вызванный
+    // ДО exec(), теряется, и консольная команда зависала бы навсегда
+    // (поймано живым тестом: повторный --download-model после обрыва).
+    QTimer::singleShot(0, [&downloader, queue, destDir, force]() {
+        downloader.download(queue, destDir, force);
+    });
+    app.exec();
+    return exitCode;
+}
+
 }  // namespace
 
 int main(int argc, char *argv[])
@@ -688,6 +791,13 @@ int main(int argc, char *argv[])
     if (rawArgs.contains(QStringLiteral("--pin-info"))) {
         QCoreApplication app(argc, argv);
         return runPinInfo(QCoreApplication::arguments());
+    }
+
+    // --download-model <id|all|list> [--config путь] — скачивание моделей
+    // из консоли: тот же каталог, sha256 и докачка, что и в GUI-мастере.
+    if (rawArgs.contains(QStringLiteral("--download-model"))) {
+        QCoreApplication app(argc, argv);
+        return runDownloadModel(app, QCoreApplication::arguments());
     }
 
     // --type "текст" [--pin-active] [--window WID] [--delay мс] [--config путь]
@@ -824,7 +934,10 @@ int main(int argc, char *argv[])
 
     QApplication app(argc, argv);
     app.setApplicationName("voice-assistant");
-    app.setApplicationVersion("0.0.1");
+#ifndef VOICE_ASSISTANT_VERSION
+#define VOICE_ASSISTANT_VERSION "0.0.0-dev"   // вне CMake-сборки (например, ручной g++)
+#endif
+    app.setApplicationVersion(QStringLiteral(VOICE_ASSISTANT_VERSION));
 
     // Трей-приложение: значок в лотке окном НЕ считается, поэтому без этой
     // строки закрытие ЛЮБОГО диалога (Настройки, Редактор подсказок) Qt трактует
@@ -843,6 +956,21 @@ int main(int argc, char *argv[])
             << QStringLiteral("Речевой тракт не запущен: %1\n"
                               "Запустите './src/voice-assistant --check', чтобы увидеть, "
                               "каких файлов не хватает.").arg(controller.lastError());
+    }
+
+    // Первый запуск после установки пакета: моделей нет — сразу показываем
+    // мастер загрузки (отложенно, чтобы лоток успел появиться). Отказ не
+    // фатален: пункт «Скачать модели...» в меню лотка остаётся, а консольный
+    // путь — voice-assistant --download-model zipformer-ru.
+    {
+        const ConfigManager cfgForModels;
+        if (!QFileInfo::exists(cfgForModels.sileroVadPath())) {
+            qInfo().noquote()
+                << QStringLiteral("Модели не найдены (%1) — открываю мастер загрузки; "
+                                  "из консоли: voice-assistant --download-model list")
+                       .arg(cfgForModels.modelsPath());
+            QTimer::singleShot(700, &trayIcon, &TrayIcon::showModelDownloader);
+        }
     }
 
     // D-Bus: адаптор соответствует src/dbus/org.voiceassistant.App.xml.

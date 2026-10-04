@@ -52,6 +52,11 @@
   что отделяет проблемы микрофона и AGC от проблем модели.
 * **Переключаемые профили ASR** — модель меняется одной строкой в конфиге или
   на лету из D-Bus/трея: быстрый zipformer-ru для тишины, GigaAM v3 для шума.
+* **Мастер загрузки моделей** — при первом запуске приложение само предложит
+  скачать модели (список с размером и описанием, sha256, докачка при обрыве,
+  атомарная распаковка); из консоли — `--download-model`.
+* **Готовые пакеты .deb/.rpm** — sherpa-onnx/onnxruntime/hunspell едут внутри
+  пакета, чистое удаление (см. «Установка»).
 * **Внешнее управление по D-Bus** — сервис `org.voiceassistant.App`.
 
 ## Требования
@@ -69,6 +74,26 @@
 | Свободное место | ~300 МБ | модели (VAD 0.6 МБ + ASR 110–208 МБ) |
 
 ## Установка
+
+### 0. Готовые пакеты (рекомендуется)
+
+Скачайте `.deb` (Debian/Ubuntu/Mint) или `.rpm` (Fedora/openSUSE) со страницы
+[Releases](https://github.com/mamon-t/voice-assistant/releases):
+
+```bash
+sudo apt install ./voice-assistant_0.9.0_amd64.deb    # Debian/Ubuntu/Mint
+sudo dnf install ./voice-assistant-0.9.0-1.x86_64.rpm # Fedora
+```
+
+Пакет самодостаточен: sherpa-onnx, onnxruntime и hunspell едут внутри
+(`/usr/lib/voice-assistant/`, RPATH `$ORIGIN`), системные библиотеки не
+подменяются. При первом запуске помощник предложит **мастер загрузки моделей**
+(~110 МБ, проверка sha256, докачка при обрыве); из консоли то же самое —
+`voice-assistant --download-model zipformer-ru`. Для глобального хоткея
+потребуется `sudo usermod -aG input $USER` и перелогин (postinst об этом
+напомнит). Удаление: `sudo apt remove voice-assistant` — системные файлы
+сносятся начисто; пользовательские данные (настройки, заметки, модели)
+остаются в домашнем каталоге — как их убрать, см. конец раздела.
 
 ### 1. Системные зависимости
 
@@ -113,6 +138,18 @@ nm -D --defined-only /usr/local/lib/libsherpa-onnx-cxx-api.so | grep -c ERKSs
 
 ### 3. Модели
 
+Основной способ — **мастер загрузки в самом приложении**: при первом запуске
+без моделей он откроется сам (или лоток → «Скачать модели...»). Проверка
+sha256, докачка при обрыве, профиль автоматически становится активным.
+Из консоли:
+
+```bash
+voice-assistant --download-model list            # что есть и что установлено
+voice-assistant --download-model zipformer-ru    # VAD добавится автоматически
+```
+
+Вручную (альтернатива, например без GUI):
+
 ```bash
 mkdir -p ~/.voice_models && cd ~/.voice_models
 
@@ -149,6 +186,16 @@ mkdir -p build && cd build
 cmake ..              # + -DSHERPA_ONNX_OLD_CXX_ABI=ON, если проверка ABI дала >0
 make -j$(nproc)
 ctest --output-on-failure
+```
+
+### Полное удаление (пакет и данные)
+
+`sudo apt remove voice-assistant` (или `dnf remove`) сносит все системные
+файлы начисто. Пользовательские данные пакет не трогает ни при remove, ни при
+purge — так устроены дистрибутивы. Убираются одной командой:
+
+```bash
+rm -rf ~/.config/voice-assistant ~/.local/share/voice-assistant ~/.voice_models
 ```
 
 ## Быстрый старт
@@ -271,6 +318,7 @@ profiles=zipformer-ru,gigaam-v3,gigaam-v3-ctc,whisper-base
 | `./src/voice-assistant --record N file.wav` | запись с микрофона в WAV без GUI (сырой тракт, без AGC) |
 | `./src/voice-assistant --note "текст"` | дописать заметку в файл из консоли (без микрофона и X) |
 | `./src/voice-assistant --pin-info` | диагностика вывода: активное окно, WM_CLASS, PID, `pin_mode`, что запомнил бы `pin_window` |
+| `voice-assistant --download-model list\|<id>\|all [--force]` | каталог моделей и загрузка: sha256, докачка, атомарная распаковка |
 | `./src/voice-assistant --type "текст" [--pin-active] [--window WID] [--delay мс]` | проверить вставку отдельно от распознавания |
 | `./tools/vad-asr-test … --notes` | то же, но заметками становятся сегменты из WAV: прогон записи в файл заметок |
 
@@ -287,7 +335,7 @@ cd build && ctest --output-on-failure
 ```
 
 * `CommandParserTest` — разбор команд;
-* `VoiceUnitsTest` — 62 проверки: словарь и нормализация команд, постобработка текста
+* `VoiceUnitsTest` — 66 проверок: словарь и нормализация команд, постобработка текста
   (голосовые знаки, заглавные, пробелы), разбор `settings.ini` с профилями и путями,
   инжектор в режиме dry-run, правописание по настоящему словарю
   (пропускается через `QSKIP`, если hunspell или словаря нет),
@@ -305,7 +353,9 @@ cd build && ctest --output-on-failure
   X11, поэтому проверяется без дисплея. Файл своих команд покрыт через
   `CommandDictionary::parseLine` (валидные строки, комментарии, битые типы)
   и round-trip `commandToSpec` по всем встроенным командам — той же функцией
-  валидирует строки вкладка «Команды» перед сохранением.
+  валидирует строки вкладка «Команды» перед сохранением. Каталог моделей
+  (уникальность id, URL релизов, полные sha256, соответствие профилям) и
+  `sha256File` загрузчика проверены на эталонном значении из FIPS 180-2.
 
 Помимо модульных тестов есть e2e-стенд привязки вывода к окну —
 `tools/e2e/run-e2e.sh` (13 сценариев): поднимает Xvfb + openbox, открывает

@@ -16,11 +16,16 @@ class TrayIcon : public QSystemTrayIcon
 public:
     explicit TrayIcon(ApplicationController* controller, QWidget* parent = nullptr);
 
+    // Мастер загрузки моделей: вызывается из меню и из main() при первом
+    // запуске, если детектор речи не установлен.
+    void showModelDownloader();
+
 private slots:
     void onToggleRecording();
     void onShowSettings();
     void onShowHotwordsEditor();
     void onShowCommandsEditor();
+    void onShowModelDownloader();
     void onModeChanged(Mode mode);
     void onError(const QString& message);
     void onToggleMicCheck();

@@ -8,6 +8,7 @@
 #include <QVector>
 #include <QDate>
 #include <QTemporaryDir>
+#include <QSet>
 #include <QTemporaryFile>
 #include <QDir>
 
@@ -20,6 +21,8 @@
 #include "commands/CommandParser.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "models/ModelCatalog.h"
+#include "models/ModelDownloader.h"
 #include "audio/TypingGuard.h"
 #include "audio/WavWriter.h"
 #include "core/OutputTarget.h"
@@ -213,6 +216,106 @@ private slots:
                      qPrintable(phrase + QStringLiteral(": ") + err));
             QCOMPARE(cmd2.type, cmd->type);
         }
+    }
+
+    // ---------------- Каталог моделей и загрузчик ----------------
+    //
+    // Каталог вшит в код (URL + sha256 релизов sherpa-onnx), поэтому его
+    // целостность проверяется тестами: битая ссылка или несовпадение хэша
+    // в поле означают, что мастер загрузки не сможет поставить модели.
+
+    void modelCatalogIsConsistent()
+    {
+        const QList<ModelPackage>& c = modelCatalog();
+        QVERIFY(c.size() >= 5);
+        QSet<QString> ids;
+        QSet<QString> profiles;
+        for (const ModelPackage& p : c) {
+            QVERIFY(!p.id.isEmpty());
+            QVERIFY(!ids.contains(p.id));          // id уникальны (по ним ищет CLI)
+            ids.insert(p.id);
+            QVERIFY(p.url.startsWith(
+                QStringLiteral("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/")));
+            QCOMPARE(p.sha256.size(), 64);          // полный sha256, не обрезок
+            for (const QChar ch : p.sha256) {
+                QVERIFY(QStringLiteral("0123456789abcdef").contains(ch));
+            }
+            QVERIFY(p.sizeBytes > 0);
+            QVERIFY(!p.title.isEmpty());
+            QVERIFY(!p.description.isEmpty());
+            QVERIFY(!p.fileName.isEmpty());
+            if (p.required) {
+                QVERIFY(p.profileName.isEmpty());   // VAD — не ASR-профиль
+                QVERIFY(!p.isArchive());
+            } else {
+                QVERIFY(!p.profileName.isEmpty());
+                QVERIFY(!profiles.contains(p.profileName));
+                profiles.insert(p.profileName);
+            }
+            // installedName — то, что проверяет missingModelPackages
+            QCOMPARE(p.installedName(), p.isArchive() ? p.extractedDirName() : p.fileName);
+        }
+        QVERIFY(findModelPackage(QStringLiteral("silero-vad")));
+        QVERIFY(findModelPackage(QStringLiteral("silero-vad"))->required);
+        QVERIFY(findModelPackage(QStringLiteral("zipformer-ru")));
+        QVERIFY(findModelPackage(QStringLiteral("нет-такой")) == nullptr);
+    }
+
+    void modelCatalogCoversDefaultProfiles()
+    {
+        // Каждый профиль стандартного settings.ini обязан иметь пакет для
+        // скачивания: иначе мастер обещает профиль, который нельзя поставить.
+        const QStringList defaults = {
+            QStringLiteral("zipformer-ru"), QStringLiteral("gigaam-v3"),
+            QStringLiteral("gigaam-v3-ctc"), QStringLiteral("whisper-base")
+        };
+        for (const QString& prof : defaults) {
+            bool found = false;
+            for (const ModelPackage& p : modelCatalog()) {
+                found = found || (p.profileName == prof);
+            }
+            QVERIFY2(found, qPrintable(prof));
+        }
+    }
+
+    void modelMissingAndRecommended()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // Пустой каталог — не установлено ничего
+        QCOMPARE(missingModelPackages(dir.path()).size(), modelCatalog().size());
+        QVERIFY(recommendedInstalledProfile(dir.path()).isEmpty());
+
+        // «Устанавливаем» VAD-файл и каталог zipformer'а
+        {
+            QFile vad(dir.path() + QStringLiteral("/silero_vad.onnx"));
+            QVERIFY(vad.open(QIODevice::WriteOnly));
+            vad.write("dummy");
+        }
+        QVERIFY(QDir(dir.path()).mkdir(
+            QStringLiteral("sherpa-onnx-small-zipformer-ru-2024-09-18")));
+        {   // каталог обязан быть НЕ пустым: пустой — след обрыва распаковки
+            QFile marker(dir.path() + QStringLiteral(
+                "/sherpa-onnx-small-zipformer-ru-2024-09-18/encoder.int8.onnx"));
+            QVERIFY(marker.open(QIODevice::WriteOnly));
+            marker.write("dummy");
+        }
+
+        QCOMPARE(missingModelPackages(dir.path()).size(), modelCatalog().size() - 2);
+        QCOMPARE(recommendedInstalledProfile(dir.path()), QStringLiteral("zipformer-ru"));
+    }
+
+    void downloaderSha256File()
+    {
+        // sha256("abc") — эталонное значение из FIPS 180-2
+        QTemporaryFile f;
+        QVERIFY(f.open());
+        f.write("abc");
+        f.close();
+        QCOMPARE(ModelDownloader::sha256File(f.fileName()),
+                 QStringLiteral("ba7816bf8f01cfea414140de5dae2223"
+                                "b00361a396177a9cb410ff61f20015ad"));
+        QVERIFY(ModelDownloader::sha256File(QStringLiteral("/nonexistent/path")).isEmpty());
     }
 
     // ---------------- TextPostProcessor ----------------

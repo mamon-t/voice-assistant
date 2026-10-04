@@ -14,6 +14,29 @@
 [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models)
 и в репозиторий не входят.
 
+## Загрузка из самого приложения (основной способ)
+
+Мастер загрузки встроен: лоток → «Скачать модели...» (при первом запуске без
+моделей он открывается сам). Список профилей с размером и описанием, галочки,
+прогресс; каждый файл проверяется по **sha256** (хэши и URL вшиты в
+`src/models/ModelCatalog.h` и сверены фактическим скачиванием), обрыв связи не
+страшен — недокачанное остаётся в `.part` и **докачивается** с того же места.
+Распаковка атомарная: каталог модели появляется только целиком.
+
+Из консоли (без GUI — удобно по ssh и в скриптах):
+
+```bash
+voice-assistant --download-model list             # каталог: id, размер, статус
+voice-assistant --download-model zipformer-ru     # одна модель (+ VAD автоматически)
+voice-assistant --download-model all              # всё сразу (~640 МБ)
+voice-assistant --download-model zipformer-ru --force   # переустановить
+```
+
+После загрузки профиль автоматически становится активным, если текущий активный
+не готов. Каталог моделей: `~/.voice_models` (тот же, что и для ручной установки).
+
+## Ручная установка (альтернатива)
+
 ```bash
 mkdir -p ~/.voice_models && cd ~/.voice_models
 R=https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models

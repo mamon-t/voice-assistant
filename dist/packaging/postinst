@@ -1,0 +1,24 @@
+#!/bin/sh
+# Общий постинсталл для .deb (control-extra) и .rpm (%post).
+set -e
+
+cat <<'EOF'
+
+voice-assistant установлен.
+
+1. Глобальный хоткей требует доступа к /dev/input — добавьте себя в группу:
+       sudo usermod -aG input $USER
+   затем выйдите и войдите заново. Проверка: voice-assistant --check
+   (без этого приложение тоже работает — через значок в лотке и D-Bus).
+
+2. Модели распознавания (~110 МБ) скачиваются при первом запуске:
+   значок в лотке -> «Скачать модели...», либо из консоли:
+       voice-assistant --download-model zipformer-ru
+
+3. Диагностика в любой момент:  voice-assistant --check
+   Куда вставляется текст:       voice-assistant --pin-info
+
+Документация: /usr/share/doc/voice-assistant/
+
+EOF
+exit 0

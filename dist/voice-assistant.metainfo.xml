@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>voice-assistant.desktop</id>
+  <name>Voice Assistant</name>
+  <name xml:lang="ru">Голосовой помощник</name>
+  <summary>Offline voice dictation into any application</summary>
+  <summary xml:lang="ru">Офлайн-диктовка в любое приложение</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Push a global hotkey (evdev — works in X11, Wayland and TTY), speak,
+      and the transcribed text lands in the window you were working in.
+      Speech recognition (Silero VAD + zipformer-ru / GigaAM / Whisper via
+      sherpa-onnx) runs fully offline. Voice commands for editing,
+      punctuation by voice, spellcheck with hunspell, a notes-file output
+      target that never steals focus, and per-window pinned insertion.
+    </p>
+    <p xml:lang="ru">
+      Нажмите глобальный хоткей (evdev — работает в X11, Wayland и TTY),
+      продиктуйте текст — он попадёт в окно, в котором вы работали.
+      Распознавание (Silero VAD + zipformer-ru / GigaAM / Whisper через
+      sherpa-onnx) полностью офлайн. Голосовые команды правки, пунктуация
+      голосом, проверка правописания hunspell, вторая цель вывода «заметки
+      в файл» (не отнимает фокус) и привязка вставки к окну.
+    </p>
+  </description>
+  <launchable type="desktop-id">voice-assistant.desktop</launchable>
+  <provides>
+    <binary>voice-assistant</binary>
+  </provides>
+  <recommends>
+    <control>wayland</control>
+    <control>x11</control>
+  </recommends>
+</component>

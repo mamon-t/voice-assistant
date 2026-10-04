@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Voice Assistant
+Name[ru]=Голосовой помощник
+GenericName=Voice dictation
+GenericName[ru]=Голосовая диктовка
+Comment=Offline voice dictation into any application (X11)
+Comment[ru]=Офлайн-диктовка в любое приложение (X11)
+Exec=voice-assistant
+Icon=voice-assistant
+Terminal=false
+Categories=AudioVideo;Audio;Utility;Accessibility;
+Keywords=dictation;speech;voice;asr;offline;диктовка;речь;голос;

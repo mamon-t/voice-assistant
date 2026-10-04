@@ -1,0 +1,125 @@
+# Сборка пакетов .deb и .rpm + тесты.
+#
+# Запускается по тегу v* (и вручную). Артефакты прикрепляются к релизу.
+#
+# ВАЖНО про ABI: официальные ПРЕДСОБРАННЫЕ sherpa-onnx собраны со старым ABI
+# libstdc++ (грабля №1 в docs/development-log.md), поэтому пакеты собираются
+# с -DSHERPA_ONNX_OLD_CXX_ABI=ON и ВЕЗУТ библиотеки sherpa-onnx/onnxruntime/
+# hunspell с собой в /usr/lib/voice-assistant (RPATH $ORIGIN-относительный).
+# Это же снимает проблему переименования hunspell в Ubuntu 24.04 (t64):
+# пакет, собранный на 22.04, ставится и на 24.04.
+
+name: packages
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Зависимости сборки
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            qtbase5-dev qtmultimedia5-dev libhunspell-dev \
+            xdotool xclip x11-utils xvfb openbox x11-xkb-utils
+
+      - name: sherpa-onnx v1.13.8 (предсобранная, old ABI)
+        run: |
+          curl -sL -o /tmp/sherpa.tar.bz2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-linux-x64-shared.tar.bz2
+          cd /tmp && tar xf sherpa.tar.bz2
+          sudo cp -r sherpa-onnx-v1.13.8-linux-x64-shared/include/* /usr/local/include/
+          sudo cp -a sherpa-onnx-v1.13.8-linux-x64-shared/lib/* /usr/local/lib/
+          sudo ldconfig
+          # контроль: библиотека обязана быть old-ABI (иначе флаг ON неверен)
+          test "$(nm -D --defined-only /usr/local/lib/libsherpa-onnx-cxx-api.so | grep -c ERKSs)" -gt 0
+
+      - name: Сборка и модульные тесты
+        run: |
+          mkdir build && cd build
+          cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON -DCMAKE_BUILD_TYPE=Release
+          make -j"$(nproc)"
+          QT_QPA_PLATFORM=offscreen ctest --output-on-failure
+
+      - name: e2e: привязка вывода к окну (Xvfb + openbox)
+        run: bash tools/e2e/run-e2e.sh
+
+      - name: Пакет .deb + смоук установки
+        run: |
+          cd build
+          cpack -G DEB
+          sudo dpkg -i voice-assistant_*.deb
+          # моделей в CI нет — --check честно их и не находит; проверяем,
+          # что установленный бинарник запускается и каталог моделей читается
+          voice-assistant --download-model list
+          voice-assistant --check || true
+          sudo dpkg -r voice-assistant
+          test ! -e /usr/bin/voice-assistant   # снос чистый
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: build/voice-assistant_*.deb
+
+  rpm:
+    runs-on: ubuntu-latest
+    container: fedora:40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Зависимости сборки
+        run: |
+          dnf install -y gcc-c++ cmake make pkgconf-pkg-config tar bzip2 which \
+            qt5-qtbase-devel qt5-qtmultimedia-devel hunspell-devel rpm-build
+
+      - name: sherpa-onnx v1.13.8 (предсобранная, old ABI)
+        run: |
+          dnf install -y curl
+          curl -sL -o /tmp/sherpa.tar.bz2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-linux-x64-shared.tar.bz2
+          cd /tmp && tar xf sherpa.tar.bz2
+          cp -r sherpa-onnx-v1.13.8-linux-x64-shared/include/* /usr/local/include/
+          cp -a sherpa-onnx-v1.13.8-linux-x64-shared/lib/* /usr/local/lib/
+          ldconfig || true
+
+      - name: Сборка и модульные тесты
+        run: |
+          mkdir build && cd build
+          cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON -DCMAKE_BUILD_TYPE=Release
+          make -j"$(nproc)"
+          QT_QPA_PLATFORM=offscreen ctest --output-on-failure
+
+      - name: Пакет .rpm
+        run: |
+          cd build
+          cpack -G RPM
+          rpm -qpl voice-assistant-*.rpm | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: build/voice-assistant-*.rpm
+
+  release:
+    needs: [deb, rpm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            voice-assistant_*.deb
+            voice-assistant-*.rpm
+          generate_release_notes: true

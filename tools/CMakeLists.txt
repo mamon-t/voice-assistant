@@ -40,3 +40,10 @@ target_link_libraries(vad-asr-test PRIVATE
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/e2e/CMakeLists.txt")
     add_subdirectory(e2e)
 endif()
+
+# vad-asr-test тоже ставится в пакет: тестировщикам удобно прогонять записи
+# микрофона всеми профилями без сборки из исходников.
+include(GNUInstallDirs)
+install(TARGETS vad-asr-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+set_target_properties(vad-asr-test PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/voice-assistant")

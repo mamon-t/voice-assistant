@@ -1,0 +1,41 @@
+# Сборка и тесты на каждый push/PR (без упаковки — этим занимается packages.yml).
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            qtbase5-dev qtmultimedia5-dev libhunspell-dev \
+            xdotool xclip x11-utils xvfb openbox x11-xkb-utils
+
+      - name: sherpa-onnx v1.13.8 (предсобранная, old ABI)
+        run: |
+          curl -sL -o /tmp/sherpa.tar.bz2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-linux-x64-shared.tar.bz2
+          cd /tmp && tar xf sherpa.tar.bz2
+          sudo cp -r sherpa-onnx-v1.13.8-linux-x64-shared/include/* /usr/local/include/
+          sudo cp -a sherpa-onnx-v1.13.8-linux-x64-shared/lib/* /usr/local/lib/
+          sudo ldconfig
+
+      - name: Сборка
+        run: |
+          mkdir build && cd build
+          cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON -DCMAKE_BUILD_TYPE=Release
+          make -j"$(nproc)"
+
+      - name: Модульные тесты
+        run: cd build && QT_QPA_PLATFORM=offscreen ctest --output-on-failure
+
+      - name: e2e: привязка вывода к окну
+        run: bash tools/e2e/run-e2e.sh

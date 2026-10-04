@@ -1,6 +1,8 @@
 #include "ui/TrayIcon.h"
 #include "core/ApplicationController.h"
+#include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "ui/ModelDownloadDialog.h"
 #include "ui/SettingsDialog.h"
 
 #include <QDebug>
@@ -88,6 +90,12 @@ void TrayIcon::buildMenu()
     menu->addSeparator();
 
     // --- Настройки: один диалог, пункты меню открывают нужную вкладку ---
+    auto* modelsAction = menu->addAction(tr("Скачать модели..."));
+    modelsAction->setToolTip(tr("Мастер загрузки: список моделей с размером, "
+                                "проверка sha256, докачка при обрыве"));
+    connect(modelsAction, &QAction::triggered,
+            this, &TrayIcon::onShowModelDownloader);
+
     auto* settingsAction = menu->addAction(tr("Настройки..."));
     connect(settingsAction, &QAction::triggered,
             this, &TrayIcon::onShowSettings);
@@ -220,6 +228,51 @@ void TrayIcon::onShowHotwordsEditor()
 void TrayIcon::onShowCommandsEditor()
 {
     execSettingsDialog(SettingsDialog::TabCommands);
+}
+
+void TrayIcon::onShowModelDownloader()
+{
+    showModelDownloader();
+}
+
+void TrayIcon::showModelDownloader()
+{
+    if (!m_controller) {
+        return;
+    }
+    ModelDownloadDialog dialog;
+    // После успешной загрузки: если ТЕКУЩИЙ активный профиль не готов
+    // (модель не скачана), переключаем на рекомендованный из установленных.
+    // Работающий выбор не трогаем — пользователь мог скачать gigaam для шума,
+    // оставив zipformer активным.
+    connect(&dialog, &ModelDownloadDialog::modelsInstalled, this,
+            [this](const QString& recommended) {
+        const ConfigManager cfg;
+        const AsrProfile active = cfg.asrProfile(cfg.activeAsrProfileName());
+        QString err;
+        if (active.isValid(&err)) {
+            return;   // активный профиль и так готов
+        }
+        if (recommended.isEmpty() || recommended == cfg.activeAsrProfileName()) {
+            return;
+        }
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const bool ok = m_controller->switchAsrProfile(recommended);
+        QApplication::restoreOverrideCursor();
+        const QString msg = ok
+            ? tr("Активный профиль ASR: %1 (перезагружен без перезапуска).")
+                  .arg(recommended)
+            : tr("Не удалось активировать профиль %1: %2")
+                  .arg(recommended, m_controller->lastError());
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Модели установлены"), msg,
+                        ok ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning,
+                        ok ? 5000 : 15000);
+        } else {
+            qInfo().noquote() << msg;
+        }
+    });
+    dialog.exec();
 }
 
 void TrayIcon::execSettingsDialog(SettingsDialog::Tab tab)

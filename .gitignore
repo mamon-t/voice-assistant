@@ -10,7 +10,7 @@ venv/
 *.user
 
 # модели и аудио (скачиваются отдельно, в репозиторий не входят)
-models/
+/models/
 *.onnx
 *.wav
 !resources/**/*.svg
