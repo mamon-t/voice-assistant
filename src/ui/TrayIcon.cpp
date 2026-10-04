@@ -232,25 +232,37 @@ void TrayIcon::onShowSettings()
                       .arg(profile, m_controller->lastError());
         }
 
+        // Состояние применяем синхронно: к моменту возврата из диалога всё
+        // уже действует.
         m_controller->setOutputTarget(
             cfg.notesStartTarget() == QLatin1String("notes") ? OutputTarget::Notes
                                                              : OutputTarget::Focus);
         m_controller->reloadOutputSettings();
         m_controller->reloadHotkey();
         syncNotesAction();
-        updateTooltip();
 
+        // Тултип и уведомление — ОТЛОЖЕННО, на следующем витке event loop:
+        // здесь мы всё ещё внутри saveSettings() модального диалога (exec()
+        // не вернулся). Обращения к лотковому мосту (setToolTip/showMessage
+        // у QSystemTrayIcon на StatusNotifier) из стека сигнала сохранения,
+        // пока модальное окно живо и вот-вот начнёт разрушаться, — вероятный
+        // источник падения, закрытого пользователем на Cinnamon сразу после
+        // «Хоткей перезапущен». В отложенном виде они выполняются уже после
+        // уничтожения диалога.
         const QString body = modelReport.isEmpty()
             ? tr("Изменения вступили в силу без перезапуска.")
             : modelReport;
-        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
-            showMessage(tr("Настройки применены"), body,
-                        modelFailed ? QSystemTrayIcon::Warning
-                                    : QSystemTrayIcon::Information,
-                        modelFailed ? 15000 : 4000);
-        } else {
-            qInfo().noquote() << QStringLiteral("Настройки применены: %1").arg(body);
-        }
+        QTimer::singleShot(0, this, [this, body, modelFailed]() {
+            updateTooltip();
+            if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+                showMessage(tr("Настройки применены"), body,
+                            modelFailed ? QSystemTrayIcon::Warning
+                                        : QSystemTrayIcon::Information,
+                            modelFailed ? 15000 : 4000);
+            } else {
+                qInfo().noquote() << QStringLiteral("Настройки применены: %1").arg(body);
+            }
+        });
     });
     dialog.exec();
 }
