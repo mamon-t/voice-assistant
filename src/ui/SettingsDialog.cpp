@@ -1,10 +1,13 @@
 #include "SettingsDialog.h"
 
+#include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
 #include "input/EvdevHotkeyListener.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDebug>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -14,6 +17,8 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QSettings>
+#include <QSpinBox>
+#include <QStyle>
 #include <QTabWidget>
 #include <QVBoxLayout>
 
@@ -52,6 +57,47 @@ QString qtKeyToEvdevName(int key)
     }
 }
 
+// Суммарный размер файлов модели профиля (чего нет на диске — не считаем).
+qint64 profileModelSize(const AsrProfile& p)
+{
+    qint64 total = 0;
+    const auto add = [&total](const QString& path) {
+        if (path.isEmpty()) {
+            return;
+        }
+        const QFileInfo fi(path);
+        if (fi.exists() && fi.isFile()) {
+            total += fi.size();
+        }
+    };
+    switch (p.engine) {
+    case AsrProfile::Engine::Transducer:
+        add(p.encoderPath); add(p.decoderPath); add(p.joinerPath);
+        break;
+    case AsrProfile::Engine::NemoCtc:
+        add(p.ctcModelPath);
+        break;
+    case AsrProfile::Engine::Whisper:
+        add(p.encoderPath); add(p.decoderPath);
+        break;
+    case AsrProfile::Engine::Unknown:
+        break;
+    }
+    add(p.tokensPath);
+    return total;
+}
+
+QString humanSize(qint64 bytes)
+{
+    if (bytes <= 0) {
+        return QStringLiteral("0 МБ");
+    }
+    if (bytes < 1024 * 1024) {
+        return QStringLiteral("%1 КБ").arg(bytes / 1024.0, 0, 'f', 0);
+    }
+    return QStringLiteral("%1 МБ").arg(bytes / (1024.0 * 1024.0), 0, 'f', 0);
+}
+
 }  // namespace
 
 SettingsDialog::SettingsDialog(QWidget* parent)
@@ -59,7 +105,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     , m_isCapturingKey(false)
 {
     setWindowTitle(QStringLiteral("Настройки голосового помощника"));
-    resize(460, 340);
+    resize(520, 420);
 
     // Тот же файл, что читает ConfigManager. Запись — через QSettings,
     // чтение — через ConfigManager (он знает про грабли разбора ini).
@@ -67,19 +113,34 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_settings = new QSettings(cfg.settingsPath(), QSettings::IniFormat, this);
 
     auto* tabWidget = new QTabWidget(this);
+    auto* style = this->style();
 
     // --- 1. Распознавание ---------------------------------------------------
     auto* asrTab = new QWidget();
-    auto* asrLayout = new QFormLayout(asrTab);
+    auto* asrLayout = new QVBoxLayout(asrTab);
+    auto* asrForm = new QFormLayout();
 
     m_asrProfileCombo = new QComboBox();
     // Профили — из [asr] profiles, без хардкода: список должен совпадать
     // с тем, что реально настроено в ini (и с --check).
     m_asrProfileCombo->addItems(cfg.asrProfileNames());
-    asrLayout->addRow(QStringLiteral("Модель ASR:"), m_asrProfileCombo);
-    asrLayout->addRow(new QLabel(
+    asrForm->addRow(QStringLiteral("Модель ASR:"), m_asrProfileCombo);
+    asrLayout->addLayout(asrForm);
+
+    // Статус выбранного профиля: движок, размер, готовность. Ошибку модели
+    // видно ДО применения, а не по падению диктовки.
+    m_asrStatusLabel = new QLabel();
+    m_asrStatusLabel->setWordWrap(true);
+    m_asrStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    asrLayout->addWidget(m_asrStatusLabel);
+
+    connect(m_asrProfileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &SettingsDialog::onAsrProfileChanged);
+
+    asrLayout->addWidget(new QLabel(
         QStringLiteral("Переключение применяется сразу: модель перезагружается "
                        "за 1–2 с (в это время диктовка недоступна).")));
+    asrLayout->addStretch();
 
     // --- 2. Управление ------------------------------------------------------
     auto* hotkeyTab = new QWidget();
@@ -108,6 +169,9 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         QStringLiteral("Поддерживаются: F1–F16, F20, пробел, Tab, Enter, стрелки,\n"
                        "Scroll Lock, Pause и комбинации с ctrl/alt/shift/super.\n"
                        "Буквы и цифры не годятся: хоткей не должен мешать печатать.\n"
+                       "Совет: клавиша доходит и до активного приложения — в терминале\n"
+                       "F8 напечатает «^[[19~». Берите то, что ничего не печатает:\n"
+                       "Scroll Lock, Pause, правый Ctrl, F13+ или комбинацию.\n"
                        "Нужны права на /dev/input: sudo usermod -aG input $USER.")));
     hotkeyLayout->addStretch();
 
@@ -126,19 +190,69 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     outputLayout->addWidget(targetGroup);
     outputLayout->addWidget(new QLabel(
         QStringLiteral("Переключать цель на лету можно голосом («заметка» / «в редактор»)\n"
-                       "или из меню лотка; здесь задаётся только стартовое значение\n"
-                       "([notes] start_target).")));
+                       "или из меню лотка; здесь задаётся только стартовое значение.")));
+
+    auto* methodGroup = new QGroupBox(QStringLiteral("Вставка в окно"));
+    auto* methodForm = new QFormLayout(methodGroup);
+
+    m_methodCombo = new QComboBox();
+    m_methodCombo->addItem(QStringLiteral("auto — буфер обмена + Ctrl+V, иначе xdotool type"),
+                           QStringLiteral("auto"));
+    m_methodCombo->addItem(QStringLiteral("clipboard — всегда буфер обмена + Ctrl+V"),
+                           QStringLiteral("clipboard"));
+    m_methodCombo->addItem(QStringLiteral("xdotool — всегда посимвольная печать (медленно)"),
+                           QStringLiteral("xdotool"));
+    methodForm->addRow(QStringLiteral("Способ:"), m_methodCombo);
+
+    m_pinWindowCheck = new QCheckBox(
+        QStringLiteral("Привязывать вставку к окну, активному в начале записи"));
+    connect(m_pinWindowCheck, &QCheckBox::toggled, this, &SettingsDialog::onPinWindowToggled);
+    methodForm->addRow(QString(), m_pinWindowCheck);
+
+    m_pinGroup = new QGroupBox();
+    m_pinGroup->setFlat(true);
+    auto* pinForm = new QFormLayout(m_pinGroup);
+    pinForm->setContentsMargins(24, 0, 0, 0);
+
+    m_pinModeCombo = new QComboBox();
+    m_pinModeCombo->addItem(
+        QStringLiteral("activate — активировать окно, печать настоящими событиями (работает везде)"),
+        QStringLiteral("activate"));
+    m_pinModeCombo->addItem(
+        QStringLiteral("sendevent — не трогать фокус (приложение должно принимать синтетику)"),
+        QStringLiteral("sendevent"));
+    pinForm->addRow(QStringLiteral("Режим:"), m_pinModeCombo);
+
+    m_pinActivateSpin = new QSpinBox();
+    m_pinActivateSpin->setRange(0, 2000);
+    m_pinActivateSpin->setSingleStep(10);
+    m_pinActivateSpin->setSuffix(QStringLiteral(" мс"));
+    pinForm->addRow(QStringLiteral("Пауза после активации:"), m_pinActivateSpin);
+
+    m_pinRestoreCheck = new QCheckBox(QStringLiteral("Возвращать фокус прежнему окну после вставки"));
+    pinForm->addRow(QString(), m_pinRestoreCheck);
+    methodForm->addRow(m_pinGroup);
+
+    outputLayout->addWidget(methodGroup);
     outputLayout->addStretch();
 
-    tabWidget->addTab(asrTab,     QStringLiteral("Распознавание"));
-    tabWidget->addTab(hotkeyTab,  QStringLiteral("Управление"));
-    tabWidget->addTab(outputTab,  QStringLiteral("Вывод"));
+    tabWidget->addTab(asrTab,
+                      style->standardIcon(QStyle::SP_FileDialogContentsView),
+                      QStringLiteral("Распознавание"));
+    tabWidget->addTab(hotkeyTab,
+                      style->standardIcon(QStyle::SP_FileDialogDetailedView),
+                      QStringLiteral("Управление"));
+    tabWidget->addTab(outputTab,
+                      style->standardIcon(QStyle::SP_FileDialogListView),
+                      QStringLiteral("Вывод"));
 
     // --- Кнопки -----------------------------------------------------------------
     auto* btnLayout = new QHBoxLayout();
     btnLayout->addStretch();
-    m_saveBtn   = new QPushButton(QStringLiteral("Сохранить"));
-    m_cancelBtn = new QPushButton(QStringLiteral("Отмена"));
+    m_saveBtn   = new QPushButton(style->standardIcon(QStyle::SP_DialogApplyButton),
+                                  QStringLiteral("Сохранить"));
+    m_cancelBtn = new QPushButton(style->standardIcon(QStyle::SP_DialogCancelButton),
+                                  QStringLiteral("Отмена"));
     connect(m_saveBtn,   &QPushButton::clicked, this, &SettingsDialog::saveSettings);
     connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
     btnLayout->addWidget(m_saveBtn);
@@ -157,20 +271,63 @@ void SettingsDialog::loadSettings()
 {
     const ConfigManager cfg;
 
+    // --- ASR ---
     const QString active = cfg.activeAsrProfileName();
     const int idx = m_asrProfileCombo->findText(active);
     if (idx >= 0) {
         m_asrProfileCombo->setCurrentIndex(idx);
     }
+    onAsrProfileChanged(m_asrProfileCombo->currentIndex());
 
+    // --- Хоткей ---
     const QString mode = cfg.hotkeyMode();
     m_pttRadio->setChecked(mode != QLatin1String("toggle"));
     m_toggleRadio->setChecked(mode == QLatin1String("toggle"));
     m_hotkeyEdit->setText(cfg.hotkeyKey());
 
+    // --- Вывод ---
     const QString target = cfg.notesStartTarget();
     m_outputNotesRadio->setChecked(target == QLatin1String("notes"));
     m_outputWindowRadio->setChecked(target != QLatin1String("notes"));
+
+    const int mi = m_methodCombo->findData(cfg.injectorMethod());
+    m_methodCombo->setCurrentIndex(mi >= 0 ? mi : 0);
+
+    m_pinWindowCheck->setChecked(cfg.pinWindow());
+    const int pi = m_pinModeCombo->findData(cfg.pinMode());
+    m_pinModeCombo->setCurrentIndex(pi >= 0 ? pi : 0);
+    m_pinActivateSpin->setValue(cfg.pinActivateMs());
+    m_pinRestoreCheck->setChecked(cfg.pinRestoreFocus());
+    onPinWindowToggled(m_pinWindowCheck->isChecked());
+}
+
+void SettingsDialog::onAsrProfileChanged(int)
+{
+    const QString name = m_asrProfileCombo->currentText();
+    if (name.isEmpty()) {
+        m_asrStatusLabel->setText(QStringLiteral("Профили не найдены — проверьте "
+                                                  "[asr] profiles в settings.ini"));
+        return;
+    }
+    const ConfigManager cfg;
+    const AsrProfile p = cfg.asrProfile(name);
+
+    QString err;
+    const bool valid = p.isValid(&err);
+    const QString size = humanSize(profileModelSize(p));
+    if (valid) {
+        m_asrStatusLabel->setText(QStringLiteral("✔ %1 · %2 · %3 · готов к работе")
+                                      .arg(name, AsrProfile::engineToString(p.engine), size));
+    } else {
+        m_asrStatusLabel->setText(QStringLiteral("✖ %1 · %2 · НЕ готов: %3")
+                                      .arg(name, AsrProfile::engineToString(p.engine),
+                                           err.split(QLatin1Char('\n')).first()));
+    }
+}
+
+void SettingsDialog::onPinWindowToggled(bool on)
+{
+    m_pinGroup->setEnabled(on);
 }
 
 void SettingsDialog::saveSettings()
@@ -186,6 +343,14 @@ void SettingsDialog::saveSettings()
     m_settings->setValue(QStringLiteral("notes/start_target"),
                          m_outputNotesRadio->isChecked() ? QStringLiteral("notes")
                                                          : QStringLiteral("focus"));
+    m_settings->setValue(QStringLiteral("output/method"),
+                         m_methodCombo->currentData().toString());
+    m_settings->setValue(QStringLiteral("output/pin_window"), m_pinWindowCheck->isChecked());
+    m_settings->setValue(QStringLiteral("output/pin_mode"),
+                         m_pinModeCombo->currentData().toString());
+    m_settings->setValue(QStringLiteral("output/pin_activate_ms"), m_pinActivateSpin->value());
+    m_settings->setValue(QStringLiteral("output/pin_restore_focus"),
+                         m_pinRestoreCheck->isChecked());
     m_settings->sync();
 
     emit settingsApplied();

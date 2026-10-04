@@ -53,6 +53,12 @@ public:
     // Нужно после сохранения SettingsDialog: ключ/режим меняются без перезапуска.
     void reloadHotkey();
 
+    // --- вывод текста: перечитать [output] из ini и перенастроить инжектор ---
+    // method, задержки, pin_window/pin_mode/pin_activate_ms/pin_restore_focus,
+    // own_window_class — всё подхватывается без перезапуска (нужно после
+    // сохранения SettingsDialog). Уже установленная привязка к окну сохраняется.
+    void reloadOutputSettings();
+
     // --- проверка микрофона: запись тракта в WAV ---
     // Пишет те же чанки, что уходят в ASR (по умолчанию после AGC — см.
     // [audio] mic_check_source), поэтому файл можно прогнать офлайн:

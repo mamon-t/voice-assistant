@@ -427,6 +427,45 @@ void ApplicationController::reloadHotkey()
         << QStringLiteral("Хоткей перезапущен: %1").arg(hotkeyDescription());
 }
 
+void ApplicationController::reloadOutputSettings()
+{
+    if (!m_config) {
+        return;
+    }
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    if (!xdotool) {
+        return;
+    }
+
+    // Тот же набор сеттеров, что и в конструкторе: диалог настроек пишет ini,
+    // затем ТрайIcon дёргает этот метод — изменения вступают в силу сразу,
+    // без перезапуска. Привязка к окну (m_pinnedWindow внутри инжектора)
+    // не трогается: текущая диктовка продолжает идти в запомненное окно.
+    const QString method = m_config->injectorMethod();
+    if (method == QLatin1String("xdotool")) {
+        xdotool->setMethod(XdotoolInjector::Method::XdotoolType);
+    } else if (method == QLatin1String("clipboard")) {
+        xdotool->setMethod(XdotoolInjector::Method::Clipboard);
+    } else {
+        xdotool->setMethod(XdotoolInjector::Method::Auto);
+    }
+    xdotool->setTypingDelayMs(m_config->typingDelayMs());
+    xdotool->setPreserveClipboard(m_config->preserveClipboard());
+    xdotool->setClipboardRestoreMs(m_config->clipboardRestoreMs());
+    xdotool->setPinMode(stringToPinMode(m_config->pinMode()));
+    xdotool->setPinActivateDelayMs(m_config->pinActivateMs());
+    xdotool->setPinRestoreFocus(m_config->pinRestoreFocus());
+    xdotool->setOwnWindowClasses(m_config->ownWindowClasses());
+
+    m_pinWindow = m_config->pinWindow();
+
+    qInfo().noquote()
+        << QStringLiteral("Настройки вывода перечитаны: %1, pin_window=%2, pin_mode=%3")
+               .arg(xdotool->backendName(),
+                    m_pinWindow ? QStringLiteral("true") : QStringLiteral("false"),
+                    pinModeToString(xdotool->pinMode()));
+}
+
 // ---------------------------------------------------------------------------
 // Аудио
 // ---------------------------------------------------------------------------

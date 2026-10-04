@@ -8,7 +8,6 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QVBoxLayout>
-
 HotwordsEditor::HotwordsEditor(QWidget* parent)
     : QDialog(parent)
 {
@@ -29,7 +28,20 @@ HotwordsEditor::HotwordsEditor(QWidget* parent)
             .arg(m_filePath)));
 
     m_listWidget = new QListWidget();
+    // Двойной клик — правка слова на месте (опечатки в подсказках стоят
+    // точности распознавания, а пересоздавать слово ради одной буквы утомительно).
+    m_listWidget->setEditTriggers(QAbstractItemView::DoubleClicked
+                                  | QAbstractItemView::EditKeyPressed);
     mainLayout->addWidget(m_listWidget);
+
+    m_countLabel = new QLabel();
+    mainLayout->addWidget(m_countLabel);
+    connect(m_listWidget, &QListWidget::itemChanged,
+            this, [this]() { updateCount(); });
+    connect(m_listWidget->model(), &QAbstractItemModel::rowsInserted,
+            this, [this]() { updateCount(); });
+    connect(m_listWidget->model(), &QAbstractItemModel::rowsRemoved,
+            this, [this]() { updateCount(); });
 
     auto* inputLayout = new QHBoxLayout();
     m_inputEdit = new QLineEdit();
@@ -42,6 +54,13 @@ HotwordsEditor::HotwordsEditor(QWidget* parent)
     connect(m_addBtn,    &QPushButton::clicked,      this, &HotwordsEditor::addWord);
     connect(m_removeBtn, &QPushButton::clicked,      this, &HotwordsEditor::removeWord);
     connect(m_inputEdit, &QLineEdit::returnPressed,  this, &HotwordsEditor::addWord);
+
+    // «Удалить» живёт только когда есть выделение — иначе кнопка обещает
+    // действие, которого нет.
+    connect(m_listWidget, &QListWidget::itemSelectionChanged, this, [this]() {
+        m_removeBtn->setEnabled(!m_listWidget->selectedItems().isEmpty());
+    });
+    m_removeBtn->setEnabled(false);
 
     inputLayout->addWidget(m_inputEdit);
     inputLayout->addWidget(m_addBtn);
@@ -70,6 +89,14 @@ void HotwordsEditor::loadHotwords()
     m_listWidget->clear();
     const ConfigManager cfg;
     m_listWidget->addItems(cfg.loadHotwords(m_filePath));
+    updateCount();
+}
+
+void HotwordsEditor::updateCount()
+{
+    m_countLabel->setText(
+        QStringLiteral("Слов: %1. Правка — двойным кликом; в силу вступает после «Сохранить».")
+            .arg(m_listWidget->count()));
 }
 
 void HotwordsEditor::saveHotwords()

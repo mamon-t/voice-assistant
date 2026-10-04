@@ -4,6 +4,7 @@
 
 class QListWidget;
 class QLineEdit;
+class QLabel;
 class QPushButton;
 
 // Редактор пользовательских подсказок (hotwords) — слов и фраз из
@@ -34,8 +35,11 @@ private slots:
     void removeWord();
 
 private:
+    void updateCount();      // «Слов: N» + подсказка про правку
+
     QListWidget* m_listWidget;
     QLineEdit*   m_inputEdit;
+    QLabel*      m_countLabel;
     QPushButton* m_addBtn;
     QPushButton* m_removeBtn;
     QPushButton* m_saveBtn;

@@ -22,6 +22,7 @@ TrayIcon::TrayIcon(ApplicationController* controller, QWidget* parent)
     buildMenu();
     connectSignals();
     updateIcon(m_controller ? m_controller->mode() : Mode::Off);
+    updateTooltip();
     syncNotesAction();
 
     // Ошибки, возникшие в конструкторе ApplicationController, сигналом мы уже
@@ -208,23 +209,48 @@ void TrayIcon::onShowSettings()
     }
     SettingsDialog dialog;
     // settingsApplied испускается после записи ini — применяем на лету:
-    // модель, цель вывода и хоткей перечитываются без перезапуска.
+    // модель, цель вывода, настройки инжектора и хоткей перечитываются
+    // без перезапуска. И ОБЯЗАТЕЛЬНО говорим пользователю, что применилось:
+    // молчаливое применение настроек — то самое «выглядит рабочим, но не
+    // работает», с которым проект борется с итерации 10.
     connect(&dialog, &SettingsDialog::settingsApplied, this, [this]() {
         const ConfigManager cfg;   // свежий экземпляр: читает уже сохранённый ini
 
+        QString modelReport;
+        bool modelFailed = false;
         const QString profile = cfg.activeAsrProfileName();
         if (profile != m_controller->activeAsrProfile()) {
-            // Пересоздание пайплайна занимает 1–2 с; ошибки прилетят через
-            // errorOccurred (их показывает showMessage ниже по подписке).
-            m_controller->switchAsrProfile(profile);
+            // Пересоздание пайплайна занимает 1–2 с: показываем курсор
+            // ожидания, иначе UI выглядит подвисшим.
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            const bool ok = m_controller->switchAsrProfile(profile);
+            QApplication::restoreOverrideCursor();
+            modelFailed = !ok;
+            modelReport = ok
+                ? tr("Модель ASR «%1» перезагружена.").arg(profile)
+                : tr("Модель ASR «%1» НЕ переключена: %2")
+                      .arg(profile, m_controller->lastError());
         }
 
         m_controller->setOutputTarget(
             cfg.notesStartTarget() == QLatin1String("notes") ? OutputTarget::Notes
                                                              : OutputTarget::Focus);
-        syncNotesAction();
-
+        m_controller->reloadOutputSettings();
         m_controller->reloadHotkey();
+        syncNotesAction();
+        updateTooltip();
+
+        const QString body = modelReport.isEmpty()
+            ? tr("Изменения вступили в силу без перезапуска.")
+            : modelReport;
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Настройки применены"), body,
+                        modelFailed ? QSystemTrayIcon::Warning
+                                    : QSystemTrayIcon::Information,
+                        modelFailed ? 15000 : 4000);
+        } else {
+            qInfo().noquote() << QStringLiteral("Настройки применены: %1").arg(body);
+        }
     });
     dialog.exec();
 }
@@ -245,6 +271,7 @@ void TrayIcon::onModeChanged(Mode mode)
 {
     updateIcon(mode);
     updateMenu(mode);
+    updateTooltip();
 }
 
 // --- Приватные методы обновления ---
@@ -282,6 +309,28 @@ void TrayIcon::updateMenu(Mode mode)
     syncNotesAction();
 }
 
+void TrayIcon::updateTooltip()
+{
+    if (!m_controller) {
+        setToolTip(tr("Голосовой помощник"));
+        return;
+    }
+    QString state;
+    switch (m_controller->mode()) {
+    case Mode::Off:        state = tr("ожидание (микрофон выключен)"); break;
+    case Mode::Dictation:  state = tr("● ЗАПИСЬ — диктовка");          break;
+    case Mode::Edit:       state = tr("● ЗАПИСЬ — редактирование");    break;
+    case Mode::Spellcheck: state = tr("● ЗАПИСЬ — проверка правописания"); break;
+    case Mode::Error:      state = tr("ОШИБКА — см. последнее уведомление"); break;
+    }
+    const bool notes = (m_controller->outputTarget() == OutputTarget::Notes);
+    const QString target = notes
+        ? tr("файл заметок %1").arg(m_controller->notesFilePath())
+        : tr("активное окно (привязывается в начале записи)");
+    setToolTip(tr("Голосовой помощник\n%1\nКуда писать: %2\nМодель: %3")
+                   .arg(state, target, m_controller->activeAsrProfile()));
+}
+
 void TrayIcon::syncNotesAction()
 {
     if (!m_controller) {
@@ -316,6 +365,7 @@ void TrayIcon::onToggleNotesTarget()
 void TrayIcon::onOutputTargetChanged(OutputTarget target)
 {
     syncNotesAction();
+    updateTooltip();
 
     // Уведомление обязательно: другого индикатора цели вывода нет, а ошибка
     // «диктовал в редактор, а текст ушёл в файл» стоит дорого.
