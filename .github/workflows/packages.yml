@@ -47,7 +47,7 @@ jobs:
           make -j"$(nproc)"
           QT_QPA_PLATFORM=offscreen ctest --output-on-failure
 
-      - name: e2e: привязка вывода к окну (Xvfb + openbox)
+      - name: "e2e: привязка вывода к окну (Xvfb + openbox)"
         run: bash tools/e2e/run-e2e.sh
 
       - name: Пакет .deb + смоук установки
