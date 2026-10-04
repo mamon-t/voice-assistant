@@ -826,6 +826,14 @@ int main(int argc, char *argv[])
     app.setApplicationName("voice-assistant");
     app.setApplicationVersion("0.0.1");
 
+    // Трей-приложение: значок в лотке окном НЕ считается, поэтому без этой
+    // строки закрытие ЛЮБОГО диалога (Настройки, Редактор подсказок) Qt трактует
+    // как «последнее окно закрыто» и молча завершает приложение — с кодом 0,
+    // без единой ошибки в логе. Выход только через «Выход» в меню лотка.
+    // Поймано в поле: смена модели в настройках «закрывала» помощника
+    // (gdb: «exited normally» сразу за «Хоткей перезапущен»).
+    app.setQuitOnLastWindowClosed(false);
+
     ApplicationController controller;
     TrayIcon trayIcon(&controller);
     trayIcon.show();
