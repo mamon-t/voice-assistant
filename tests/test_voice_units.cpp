@@ -148,6 +148,73 @@ private slots:
         }
     }
 
+    void commandFileParseLineValid()
+    {
+        // parseLine — та самая функция, которой вкладка «Команды» валидирует
+        // строки перед сохранением и которой loadFromFile() грузит файл:
+        // что примет диалог, то гарантированно загрузится.
+        QString phrase; Command cmd; QString err;
+        QVERIFY(CommandDictionary::parseLine(QStringLiteral("удали слово = delete-word"),
+                                             &phrase, &cmd, &err));
+        QCOMPARE(phrase, QStringLiteral("удали слово"));
+        QCOMPARE(cmd.type, Command::Type::DeleteWord);
+        QVERIFY(err.isEmpty());
+
+        QVERIFY(CommandDictionary::parseLine(QStringLiteral("  режим правки = SET-MODE:edit "),
+                                             &phrase, &cmd, &err));
+        QCOMPARE(cmd.type, Command::Type::SetMode);
+        QCOMPARE(cmd.mode, Mode::Edit);
+
+        QVERIFY(CommandDictionary::parseLine(QStringLiteral("кавычка = punctuation:\""),
+                                             &phrase, &cmd, &err));
+        QCOMPARE(cmd.type, Command::Type::Punctuation);
+        QCOMPARE(cmd.argument, QStringLiteral("\""));
+    }
+
+    void commandFileParseLineSkipAndErrors()
+    {
+        QString phrase; Command cmd; QString err;
+        // Пустые строки и комментарии — НЕ ошибка (error пустой): файл их содержит легально
+        QVERIFY(!CommandDictionary::parseLine(QStringLiteral("# комментарий"), &phrase, &cmd, &err));
+        QVERIFY(err.isEmpty());
+        QVERIFY(!CommandDictionary::parseLine(QStringLiteral("   "), &phrase, &cmd, &err));
+        QVERIFY(err.isEmpty());
+
+        // Битые строки — ошибка с внятной причиной (диалог их не сохранит молча)
+        QVERIFY(!CommandDictionary::parseLine(QStringLiteral("фраза без равно"), &phrase, &cmd, &err));
+        QVERIFY(!err.isEmpty());
+
+        err.clear();
+        QVERIFY(!CommandDictionary::parseLine(QStringLiteral("фраза = fly-to-moon"), &phrase, &cmd, &err));
+        QVERIFY(err.contains(QStringLiteral("fly-to-moon")));
+
+        err.clear();
+        QVERIFY(!CommandDictionary::parseLine(QStringLiteral(" = delete-word"), &phrase, &cmd, &err));
+        QVERIFY(!err.isEmpty());   // пустая фраза слева от '='
+    }
+
+    void commandSpecRoundTrip()
+    {
+        // commandToSpec (кнопка «скопировать в свои») должна давать строку,
+        // которую parseLine принимает обратно — иначе копия встроенной
+        // команды не пережила бы сохранение файла.
+        CommandDictionary dict;
+        dict.loadDefaults();
+        const QStringList phrases = dict.phrases();
+        QVERIFY(phrases.size() >= 20);
+        for (const QString& phrase : phrases) {
+            const auto cmd = dict.find(phrase);
+            QVERIFY(cmd.has_value());
+            const QString spec = commandToSpec(*cmd);
+            QVERIFY2(!spec.isEmpty(), qPrintable(phrase));
+            QString phr2; Command cmd2; QString err;
+            QVERIFY2(CommandDictionary::parseLine(phrase + QStringLiteral(" = ") + spec,
+                                                  &phr2, &cmd2, &err),
+                     qPrintable(phrase + QStringLiteral(": ") + err));
+            QCOMPARE(cmd2.type, cmd->type);
+        }
+    }
+
     // ---------------- TextPostProcessor ----------------
 
     void voicePunctuationInline()

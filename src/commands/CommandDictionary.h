@@ -39,6 +39,15 @@ public:
     // Возвращает число добавленных команд.
     int loadFromFile(const QString& path);
 
+    // Разбор ОДНОЙ строки в формате «фраза = тип[:аргумент]». Возвращает:
+    //   true                 — строка разобрана, *phrase и *cmd заполнены;
+    //   false, *error пустой — пустая строка или комментарий (не ошибка);
+    //   false, *error задан  — строка битая, причина в *error.
+    // Именно её используют и loadFromFile(), и вкладка «Команды» в настройках:
+    // то, что провалидирует UI, то и загрузится — без расхождений.
+    static bool parseLine(const QString& line, QString* phrase, Command* cmd,
+                          QString* error = nullptr);
+
     void addCommand(const QString& phrase, Command command);
     bool removeCommand(const QString& phrase);   // true, если такая команда была
     void clear();

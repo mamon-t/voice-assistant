@@ -4,6 +4,7 @@
 #include <QMap>
 #include "core/Mode.h"
 #include "core/OutputTarget.h"
+#include "ui/SettingsDialog.h"
 
 class QAction;
 class ApplicationController;
@@ -19,6 +20,7 @@ private slots:
     void onToggleRecording();
     void onShowSettings();
     void onShowHotwordsEditor();
+    void onShowCommandsEditor();
     void onModeChanged(Mode mode);
     void onError(const QString& message);
     void onToggleMicCheck();
@@ -38,6 +40,10 @@ private:
     // вызывается при старте и из updateMenu(), чтобы не показывать всплывающее
     // окно каждый раз, когда меню перерисовывается.
     void syncNotesAction();
+    // Один диалог настроек на все случаи: пункты меню лотка открывают его
+    // на нужной вкладке, а применение настроек (settingsApplied) описано
+    // в одном месте.
+    void execSettingsDialog(SettingsDialog::Tab tab);
 
     ApplicationController* m_controller;
     QAction* m_toggleAction = nullptr;

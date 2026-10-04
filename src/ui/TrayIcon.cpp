@@ -1,7 +1,6 @@
 #include "ui/TrayIcon.h"
 #include "core/ApplicationController.h"
 #include "config/ConfigManager.h"
-#include "ui/HotwordsEditor.h"
 #include "ui/SettingsDialog.h"
 
 #include <QDebug>
@@ -88,14 +87,20 @@ void TrayIcon::buildMenu()
 
     menu->addSeparator();
 
-    // --- Настройки и редактор hotwords ---
+    // --- Настройки: один диалог, пункты меню открывают нужную вкладку ---
     auto* settingsAction = menu->addAction(tr("Настройки..."));
     connect(settingsAction, &QAction::triggered,
             this, &TrayIcon::onShowSettings);
 
-    auto* hotwordsAction = menu->addAction(tr("Редактор горячих слов..."));
+    auto* hotwordsAction = menu->addAction(tr("Голосовые подсказки..."));
+    hotwordsAction->setToolTip(tr("Слова и фразы, которые модель должна узнавать лучше"));
     connect(hotwordsAction, &QAction::triggered,
             this, &TrayIcon::onShowHotwordsEditor);
+
+    auto* commandsAction = menu->addAction(tr("Голосовые команды..."));
+    commandsAction->setToolTip(tr("Что понимает помощник: встроенные команды и свои фразы"));
+    connect(commandsAction, &QAction::triggered,
+            this, &TrayIcon::onShowCommandsEditor);
 
     menu->addSeparator();
 
@@ -204,15 +209,30 @@ void TrayIcon::onToggleRecording()
 
 void TrayIcon::onShowSettings()
 {
+    execSettingsDialog(SettingsDialog::TabAsr);
+}
+
+void TrayIcon::onShowHotwordsEditor()
+{
+    execSettingsDialog(SettingsDialog::TabHotwords);
+}
+
+void TrayIcon::onShowCommandsEditor()
+{
+    execSettingsDialog(SettingsDialog::TabCommands);
+}
+
+void TrayIcon::execSettingsDialog(SettingsDialog::Tab tab)
+{
     if (!m_controller) {
         return;
     }
-    SettingsDialog dialog;
-    // settingsApplied испускается после записи ini — применяем на лету:
-    // модель, цель вывода, настройки инжектора и хоткей перечитываются
-    // без перезапуска. И ОБЯЗАТЕЛЬНО говорим пользователю, что применилось:
-    // молчаливое применение настроек — то самое «выглядит рабочим, но не
-    // работает», с которым проект борется с итерации 10.
+    SettingsDialog dialog(nullptr, tab);
+    // settingsApplied испускается после записи ini/файлов — применяем на лету:
+    // модель, цель вывода, настройки инжектора, хоткей, подсказки и команды
+    // перечитываются без перезапуска. И ОБЯЗАТЕЛЬНО говорим пользователю, что
+    // применилось: молчаливое применение настроек — то самое «выглядит рабочим,
+    // но не работает», с которым проект борется с итерации 10.
     connect(&dialog, &SettingsDialog::settingsApplied, this, [this]() {
         const ConfigManager cfg;   // свежий экземпляр: читает уже сохранённый ini
 
@@ -239,16 +259,17 @@ void TrayIcon::onShowSettings()
                                                              : OutputTarget::Focus);
         m_controller->reloadOutputSettings();
         m_controller->reloadHotkey();
+        m_controller->reloadHotwords();
+        m_controller->reloadCommands();
         syncNotesAction();
 
         // Тултип и уведомление — ОТЛОЖЕННО, на следующем витке event loop:
         // здесь мы всё ещё внутри saveSettings() модального диалога (exec()
         // не вернулся). Обращения к лотковому мосту (setToolTip/showMessage
         // у QSystemTrayIcon на StatusNotifier) из стека сигнала сохранения,
-        // пока модальное окно живо и вот-вот начнёт разрушаться, — вероятный
-        // источник падения, закрытого пользователем на Cinnamon сразу после
-        // «Хоткей перезапущен». В отложенном виде они выполняются уже после
-        // уничтожения диалога.
+        // пока модальное окно живо и вот-вот начнёт разрушаться, — плохая
+        // примета; в отложенном виде они выполняются уже после уничтожения
+        // диалога.
         const QString body = modelReport.isEmpty()
             ? tr("Изменения вступили в силу без перезапуска.")
             : modelReport;
@@ -263,18 +284,6 @@ void TrayIcon::onShowSettings()
                 qInfo().noquote() << QStringLiteral("Настройки применены: %1").arg(body);
             }
         });
-    });
-    dialog.exec();
-}
-
-void TrayIcon::onShowHotwordsEditor()
-{
-    if (!m_controller) {
-        return;
-    }
-    HotwordsEditor dialog;
-    connect(&dialog, &HotwordsEditor::hotwordsUpdated, this, [this]() {
-        m_controller->reloadHotwords();
     });
     dialog.exec();
 }

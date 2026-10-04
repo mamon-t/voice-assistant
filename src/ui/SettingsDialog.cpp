@@ -1,25 +1,35 @@
 #include "SettingsDialog.h"
 
+#include "commands/CommandDictionary.h"
+#include "commands/CommandParser.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "core/Command.h"
 #include "input/EvdevHotkeyListener.h"
 
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDebug>
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QSettings>
 #include <QSpinBox>
 #include <QStyle>
 #include <QTabWidget>
+#include <QTableWidget>
+#include <QTextStream>
 #include <QVBoxLayout>
 
 namespace {
@@ -100,51 +110,99 @@ QString humanSize(qint64 bytes)
 
 }  // namespace
 
-SettingsDialog::SettingsDialog(QWidget* parent)
+SettingsDialog::SettingsDialog(QWidget* parent, Tab initial)
     : QDialog(parent)
-    , m_isCapturingKey(false)
 {
     setWindowTitle(QStringLiteral("Настройки голосового помощника"));
-    resize(520, 420);
+    resize(600, 520);
 
     // Тот же файл, что читает ConfigManager. Запись — через QSettings,
     // чтение — через ConfigManager (он знает про грабли разбора ini).
     const ConfigManager cfg;
     m_settings = new QSettings(cfg.settingsPath(), QSettings::IniFormat, this);
+    m_hotwordsPath = cfg.userHotwordsPath();
+    m_commandsPath = cfg.customCommandsPath();
 
     auto* tabWidget = new QTabWidget(this);
     auto* style = this->style();
 
-    // --- 1. Распознавание ---------------------------------------------------
-    auto* asrTab = new QWidget();
-    auto* asrLayout = new QVBoxLayout(asrTab);
-    auto* asrForm = new QFormLayout();
+    tabWidget->addTab(buildAsrTab(),
+                      style->standardIcon(QStyle::SP_FileDialogContentsView),
+                      QStringLiteral("Распознавание"));
+    tabWidget->addTab(buildControlTab(),
+                      style->standardIcon(QStyle::SP_FileDialogDetailedView),
+                      QStringLiteral("Управление"));
+    tabWidget->addTab(buildOutputTab(),
+                      style->standardIcon(QStyle::SP_FileDialogListView),
+                      QStringLiteral("Вывод"));
+    tabWidget->addTab(buildHotwordsTab(),
+                      style->standardIcon(QStyle::SP_FileDialogInfoView),
+                      QStringLiteral("Подсказки"));
+    tabWidget->addTab(buildCommandsTab(),
+                      style->standardIcon(QStyle::SP_ComputerIcon),
+                      QStringLiteral("Команды"));
+    tabWidget->setCurrentIndex(static_cast<int>(initial));
+
+    // --- Кнопки -----------------------------------------------------------------
+    auto* btnLayout = new QHBoxLayout();
+    btnLayout->addStretch();
+    m_saveBtn   = new QPushButton(style->standardIcon(QStyle::SP_DialogApplyButton),
+                                  QStringLiteral("Сохранить"));
+    m_cancelBtn = new QPushButton(style->standardIcon(QStyle::SP_DialogCancelButton),
+                                  QStringLiteral("Отмена"));
+    connect(m_saveBtn,   &QPushButton::clicked, this, &SettingsDialog::saveSettings);
+    connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
+    btnLayout->addWidget(m_saveBtn);
+    btnLayout->addWidget(m_cancelBtn);
+
+    auto* mainLayout = new QVBoxLayout(this);
+    mainLayout->addWidget(tabWidget);
+    mainLayout->addLayout(btnLayout);
+
+    loadSettings();
+}
+
+SettingsDialog::~SettingsDialog() = default;
+
+// ---------------------------------------------------------------------------
+// Вкладки
+// ---------------------------------------------------------------------------
+
+QWidget* SettingsDialog::buildAsrTab()
+{
+    const ConfigManager cfg;
+    auto* tab = new QWidget();
+    auto* lay = new QVBoxLayout(tab);
+    auto* form = new QFormLayout();
 
     m_asrProfileCombo = new QComboBox();
     // Профили — из [asr] profiles, без хардкода: список должен совпадать
     // с тем, что реально настроено в ini (и с --check).
     m_asrProfileCombo->addItems(cfg.asrProfileNames());
-    asrForm->addRow(QStringLiteral("Модель ASR:"), m_asrProfileCombo);
-    asrLayout->addLayout(asrForm);
+    form->addRow(QStringLiteral("Модель ASR:"), m_asrProfileCombo);
+    lay->addLayout(form);
 
     // Статус выбранного профиля: движок, размер, готовность. Ошибку модели
     // видно ДО применения, а не по падению диктовки.
     m_asrStatusLabel = new QLabel();
     m_asrStatusLabel->setWordWrap(true);
     m_asrStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    asrLayout->addWidget(m_asrStatusLabel);
+    lay->addWidget(m_asrStatusLabel);
 
     connect(m_asrProfileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &SettingsDialog::onAsrProfileChanged);
 
-    asrLayout->addWidget(new QLabel(
+    lay->addWidget(new QLabel(
         QStringLiteral("Переключение применяется сразу: модель перезагружается "
                        "за 1–2 с (в это время диктовка недоступна).")));
-    asrLayout->addStretch();
+    lay->addStretch();
+    return tab;
+}
 
-    // --- 2. Управление ------------------------------------------------------
-    auto* hotkeyTab = new QWidget();
-    auto* hotkeyLayout = new QVBoxLayout(hotkeyTab);
+QWidget* SettingsDialog::buildControlTab()
+{
+    auto* tab = new QWidget();
+    auto* lay = new QVBoxLayout(tab);
 
     auto* modeGroup = new QGroupBox(QStringLiteral("Режим активации"));
     auto* modeLayout = new QVBoxLayout(modeGroup);
@@ -152,7 +210,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_toggleRadio = new QRadioButton(QStringLiteral("Toggle (нажал — запись, отжал — остановка)"));
     modeLayout->addWidget(m_pttRadio);
     modeLayout->addWidget(m_toggleRadio);
-    hotkeyLayout->addWidget(modeGroup);
+    lay->addWidget(modeGroup);
 
     auto* keyLayout = new QHBoxLayout();
     m_hotkeyEdit = new QLineEdit();
@@ -163,9 +221,9 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     keyLayout->addWidget(new QLabel(QStringLiteral("Глобальная клавиша:")));
     keyLayout->addWidget(m_hotkeyEdit);
     keyLayout->addWidget(m_captureBtn);
-    hotkeyLayout->addLayout(keyLayout);
+    lay->addLayout(keyLayout);
 
-    hotkeyLayout->addWidget(new QLabel(
+    lay->addWidget(new QLabel(
         QStringLiteral("Поддерживаются: F1–F16, F20, пробел, Tab, Enter, стрелки,\n"
                        "Scroll Lock, Pause и комбинации с ctrl/alt/shift/super.\n"
                        "Буквы и цифры не годятся: хоткей не должен мешать печатать.\n"
@@ -173,11 +231,14 @@ SettingsDialog::SettingsDialog(QWidget* parent)
                        "F8 напечатает «^[[19~». Берите то, что ничего не печатает:\n"
                        "Scroll Lock, Pause, правый Ctrl, F13+ или комбинацию.\n"
                        "Нужны права на /dev/input: sudo usermod -aG input $USER.")));
-    hotkeyLayout->addStretch();
+    lay->addStretch();
+    return tab;
+}
 
-    // --- 3. Вывод -------------------------------------------------------------
-    auto* outputTab = new QWidget();
-    auto* outputLayout = new QVBoxLayout(outputTab);
+QWidget* SettingsDialog::buildOutputTab()
+{
+    auto* tab = new QWidget();
+    auto* lay = new QVBoxLayout(tab);
 
     auto* targetGroup = new QGroupBox(QStringLiteral("Цель вывода при старте"));
     auto* targetLayout = new QVBoxLayout(targetGroup);
@@ -187,8 +248,8 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         QStringLiteral("Файл заметок (~/.local/share/voice-assistant/notes/)"));
     targetLayout->addWidget(m_outputWindowRadio);
     targetLayout->addWidget(m_outputNotesRadio);
-    outputLayout->addWidget(targetGroup);
-    outputLayout->addWidget(new QLabel(
+    lay->addWidget(targetGroup);
+    lay->addWidget(new QLabel(
         QStringLiteral("Переключать цель на лету можно голосом («заметка» / «в редактор»)\n"
                        "или из меню лотка; здесь задаётся только стартовое значение.")));
 
@@ -233,39 +294,167 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     pinForm->addRow(QString(), m_pinRestoreCheck);
     methodForm->addRow(m_pinGroup);
 
-    outputLayout->addWidget(methodGroup);
-    outputLayout->addStretch();
-
-    tabWidget->addTab(asrTab,
-                      style->standardIcon(QStyle::SP_FileDialogContentsView),
-                      QStringLiteral("Распознавание"));
-    tabWidget->addTab(hotkeyTab,
-                      style->standardIcon(QStyle::SP_FileDialogDetailedView),
-                      QStringLiteral("Управление"));
-    tabWidget->addTab(outputTab,
-                      style->standardIcon(QStyle::SP_FileDialogListView),
-                      QStringLiteral("Вывод"));
-
-    // --- Кнопки -----------------------------------------------------------------
-    auto* btnLayout = new QHBoxLayout();
-    btnLayout->addStretch();
-    m_saveBtn   = new QPushButton(style->standardIcon(QStyle::SP_DialogApplyButton),
-                                  QStringLiteral("Сохранить"));
-    m_cancelBtn = new QPushButton(style->standardIcon(QStyle::SP_DialogCancelButton),
-                                  QStringLiteral("Отмена"));
-    connect(m_saveBtn,   &QPushButton::clicked, this, &SettingsDialog::saveSettings);
-    connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
-    btnLayout->addWidget(m_saveBtn);
-    btnLayout->addWidget(m_cancelBtn);
-
-    auto* mainLayout = new QVBoxLayout(this);
-    mainLayout->addWidget(tabWidget);
-    mainLayout->addLayout(btnLayout);
-
-    loadSettings();
+    lay->addWidget(methodGroup);
+    lay->addStretch();
+    return tab;
 }
 
-SettingsDialog::~SettingsDialog() = default;
+QWidget* SettingsDialog::buildHotwordsTab()
+{
+    auto* tab = new QWidget();
+    auto* lay = new QVBoxLayout(tab);
+
+    lay->addWidget(new QLabel(
+        QStringLiteral("Файл: %1\n"
+                       "Редкие слова, имена и термины: модель начинает узнавать их лучше\n"
+                       "(для transducer-профилей — настоящий контекстный бустинг).\n"
+                       "Слишком длинный список размывает внимание: держите самое нужное.")
+            .arg(m_hotwordsPath)));
+
+    m_hotwordsList = new QListWidget();
+    // Двойной клик — правка на месте: опечатка в подсказке стоит точности
+    // распознавания, а пересоздавать слово ради одной буквы утомительно.
+    m_hotwordsList->setEditTriggers(QAbstractItemView::DoubleClicked
+                                    | QAbstractItemView::EditKeyPressed);
+    lay->addWidget(m_hotwordsList);
+
+    m_hotwordsCountLabel = new QLabel();
+    lay->addWidget(m_hotwordsCountLabel);
+    connect(m_hotwordsList, &QListWidget::itemChanged,
+            this, [this]() { updateHotwordCount(); });
+    connect(m_hotwordsList->model(), &QAbstractItemModel::rowsInserted,
+            this, [this]() { updateHotwordCount(); });
+    connect(m_hotwordsList->model(), &QAbstractItemModel::rowsRemoved,
+            this, [this]() { updateHotwordCount(); });
+
+    auto* inputLayout = new QHBoxLayout();
+    m_hotwordInput = new QLineEdit();
+    m_hotwordInput->setPlaceholderText(QStringLiteral("Новое слово или фраза..."));
+    auto* addBtn = new QPushButton(QStringLiteral("Добавить"));
+    m_hotwordRemoveBtn = new QPushButton(QStringLiteral("Удалить"));
+    connect(addBtn,   &QPushButton::clicked,     this, &SettingsDialog::addHotword);
+    connect(m_hotwordRemoveBtn, &QPushButton::clicked, this, &SettingsDialog::removeHotword);
+    connect(m_hotwordInput, &QLineEdit::returnPressed, this, &SettingsDialog::addHotword);
+    connect(m_hotwordsList, &QListWidget::itemSelectionChanged, this, [this]() {
+        m_hotwordRemoveBtn->setEnabled(!m_hotwordsList->selectedItems().isEmpty());
+    });
+    m_hotwordRemoveBtn->setEnabled(false);
+
+    inputLayout->addWidget(m_hotwordInput);
+    inputLayout->addWidget(addBtn);
+    inputLayout->addWidget(m_hotwordRemoveBtn);
+    lay->addLayout(inputLayout);
+    return tab;
+}
+
+QWidget* SettingsDialog::buildCommandsTab()
+{
+    auto* tab = new QWidget();
+    auto* lay = new QVBoxLayout(tab);
+
+    lay->addWidget(new QLabel(QStringLiteral(
+        "Командой считается фраза, совпавшая со словарём ЦЕЛИКОМ.\n"
+        "Встроенные команды заданы в коде — они только для чтения; чтобы\n"
+        "переопределить фразу, скопируйте её в «свои» и измените левую часть.")));
+
+    // --- встроенные (read-only) ---
+    auto* builtinGroup = new QGroupBox(QStringLiteral("Встроенные команды"));
+    auto* builtinLay = new QVBoxLayout(builtinGroup);
+
+    m_builtinFilter = new QLineEdit();
+    m_builtinFilter->setPlaceholderText(QStringLiteral("Фильтр: «удали», «режим», «точка»..."));
+    connect(m_builtinFilter, &QLineEdit::textChanged,
+            this, &SettingsDialog::filterBuiltinCommands);
+    builtinLay->addWidget(m_builtinFilter);
+
+    m_builtinTable = new QTableWidget(0, 2);
+    m_builtinTable->setHorizontalHeaderLabels({QStringLiteral("Фраза"),
+                                               QStringLiteral("Действие")});
+    m_builtinTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_builtinTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_builtinTable->verticalHeader()->setVisible(false);
+    m_builtinTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_builtinTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_builtinTable->setSelectionMode(QAbstractItemView::SingleSelection);
+
+    // Источник истины — тот же словарь, которым пользуется приложение:
+    // свежий CommandDictionary + loadDefaults(), без своего файла.
+    {
+        CommandDictionary dict;
+        dict.loadDefaults();
+        const QStringList phrases = dict.phrases();
+        m_builtinTable->setRowCount(phrases.size());
+        int row = 0;
+        for (const QString& phrase : phrases) {
+            const auto cmd = dict.find(phrase);   // phrases() уже нормализованы
+            auto* phraseItem = new QTableWidgetItem(phrase);
+            phraseItem->setData(Qt::UserRole, cmd ? commandToSpec(*cmd) : QString());
+            m_builtinTable->setItem(row, 0, phraseItem);
+            m_builtinTable->setItem(row, 1, new QTableWidgetItem(
+                cmd ? commandDescription(*cmd) : QStringLiteral("?")));
+            ++row;
+        }
+    }
+    builtinLay->addWidget(m_builtinTable);
+
+    m_copyBuiltinBtn = new QPushButton(
+        QStringLiteral("Скопировать выбранную в «свои» (чтобы изменить фразу)"));
+    connect(m_copyBuiltinBtn, &QPushButton::clicked,
+            this, &SettingsDialog::copyBuiltinToCustom);
+    builtinLay->addWidget(m_copyBuiltinBtn);
+    lay->addWidget(builtinGroup);
+
+    // --- свои (файл [commands] file) ---
+    auto* customGroup = new QGroupBox(
+        QStringLiteral("Свои команды — файл %1").arg(m_commandsPath));
+    auto* customLay = new QVBoxLayout(customGroup);
+
+    m_customList = new QListWidget();
+    m_customList->setEditTriggers(QAbstractItemView::DoubleClicked
+                                  | QAbstractItemView::EditKeyPressed);
+    customLay->addWidget(m_customList);
+    customLay->addWidget(new QLabel(
+        QStringLiteral("Формат: «фраза = тип[:аргумент]», типы: set-mode:{dictation|edit|"
+                       "spellcheck|off}, set-target:{focus|notes}, delete-word, delete-line, "
+                       "new-line, space, punctuation:<символ>.\n"
+                       "Своя фраза перекрывает встроенную с тем же действием; при сохранении "
+                       "файл перезаписывается (комментарии не сохраняются), битые строки "
+                       "сохранить не дадим.")));
+
+    auto* customBtns = new QHBoxLayout();
+    auto* addBtn = new QPushButton(QStringLiteral("Добавить"));
+    m_customRemoveBtn = new QPushButton(QStringLiteral("Удалить"));
+    connect(addBtn, &QPushButton::clicked, this, &SettingsDialog::addCustomCommand);
+    connect(m_customRemoveBtn, &QPushButton::clicked, this, &SettingsDialog::removeCustomCommand);
+    connect(m_customList, &QListWidget::itemSelectionChanged, this, [this]() {
+        m_customRemoveBtn->setEnabled(!m_customList->selectedItems().isEmpty());
+    });
+    m_customRemoveBtn->setEnabled(false);
+    customBtns->addStretch();
+    customBtns->addWidget(addBtn);
+    customBtns->addWidget(m_customRemoveBtn);
+    customLay->addLayout(customBtns);
+    lay->addWidget(customGroup);
+
+    // --- поведение команд ---
+    m_editInDictationCheck = new QCheckBox(
+        QStringLiteral("Выполнять команды правки в режиме диктовки ([commands] editing_in_dictation)"));
+    m_editInDictationCheck->setToolTip(
+        QStringLiteral("Выключено: в диктовке работают только команды режима и цели,\n"
+                       "а сказанное «удали слово» попадает в текст как есть."));
+    m_notesVoiceCheck = new QCheckBox(
+        QStringLiteral("Голосовое переключение цели: «заметка» / «в редактор» ([notes] voice_commands)"));
+    m_notesVoiceCheck->setToolTip(
+        QStringLiteral("Слово «заметка» встречается в обычной речи — если мешает,\n"
+                       "выключите: цель останется доступной из лотка и по D-Bus."));
+    lay->addWidget(m_editInDictationCheck);
+    lay->addWidget(m_notesVoiceCheck);
+    return tab;
+}
+
+// ---------------------------------------------------------------------------
+// Загрузка / сохранение
+// ---------------------------------------------------------------------------
 
 void SettingsDialog::loadSettings()
 {
@@ -299,7 +488,133 @@ void SettingsDialog::loadSettings()
     m_pinActivateSpin->setValue(cfg.pinActivateMs());
     m_pinRestoreCheck->setChecked(cfg.pinRestoreFocus());
     onPinWindowToggled(m_pinWindowCheck->isChecked());
+
+    // --- Подсказки ---
+    m_hotwordsList->clear();
+    m_hotwordsList->addItems(cfg.loadHotwords(m_hotwordsPath));
+    updateHotwordCount();
+
+    // --- Команды: свой файл и поведение ---
+    m_customList->clear();
+    QFile f(m_commandsPath);
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&f);
+        in.setCodec("UTF-8");   // грабля №6: без setCodec кириллица едет в Latin-1
+        while (!in.atEnd()) {
+            const QString line = in.readLine().trimmed();
+            if (!line.isEmpty() && !line.startsWith(QLatin1Char('#'))) {
+                m_customList->addItem(line);
+            }
+        }
+    }
+    m_editInDictationCheck->setChecked(cfg.editingCommandsInDictation());
+    m_notesVoiceCheck->setChecked(cfg.notesVoiceCommands());
 }
+
+void SettingsDialog::saveSettings()
+{
+    // Сначала валидация команд: если строки битые, НЕ сохраняем ничего —
+    // иначе получилось бы «половина настроек применилась, половина нет».
+    if (!saveCustomCommands()) {
+        return;
+    }
+    if (!saveHotwords()) {
+        QMessageBox::warning(this, QStringLiteral("Подсказки"),
+                             QStringLiteral("Не удалось записать файл %1 — проверьте права.")
+                                 .arg(m_hotwordsPath));
+        return;
+    }
+
+    // Ключи — ровно те, которые читает ConfigManager. Раньше здесь писались
+    // hotkey/type («ptt») и output/target («window») — таких ключей никто не
+    // читает: диалог выглядел рабочим, но ничего не менял.
+    m_settings->setValue(QStringLiteral("asr/active"), m_asrProfileCombo->currentText());
+    m_settings->setValue(QStringLiteral("hotkey/mode"),
+                         m_pttRadio->isChecked() ? QStringLiteral("push_to_talk")
+                                                 : QStringLiteral("toggle"));
+    m_settings->setValue(QStringLiteral("hotkey/key"), m_hotkeyEdit->text().trimmed());
+    m_settings->setValue(QStringLiteral("notes/start_target"),
+                         m_outputNotesRadio->isChecked() ? QStringLiteral("notes")
+                                                         : QStringLiteral("focus"));
+    m_settings->setValue(QStringLiteral("output/method"),
+                         m_methodCombo->currentData().toString());
+    m_settings->setValue(QStringLiteral("output/pin_window"), m_pinWindowCheck->isChecked());
+    m_settings->setValue(QStringLiteral("output/pin_mode"),
+                         m_pinModeCombo->currentData().toString());
+    m_settings->setValue(QStringLiteral("output/pin_activate_ms"), m_pinActivateSpin->value());
+    m_settings->setValue(QStringLiteral("output/pin_restore_focus"),
+                         m_pinRestoreCheck->isChecked());
+    m_settings->setValue(QStringLiteral("commands/editing_in_dictation"),
+                         m_editInDictationCheck->isChecked());
+    m_settings->setValue(QStringLiteral("notes/voice_commands"),
+                         m_notesVoiceCheck->isChecked());
+    m_settings->sync();
+
+    emit settingsApplied();
+    accept();
+}
+
+bool SettingsDialog::saveHotwords()
+{
+    QStringList words;
+    words.reserve(m_hotwordsList->count());
+    for (int i = 0; i < m_hotwordsList->count(); ++i) {
+        const QString t = m_hotwordsList->item(i)->text().trimmed();
+        if (!t.isEmpty()) {
+            words << t;
+        }
+    }
+    const ConfigManager cfg;
+    cfg.saveHotwords(m_hotwordsPath, words);   // UTF-8, по слову в строке
+    return QFile::exists(m_hotwordsPath);
+}
+
+bool SettingsDialog::saveCustomCommands()
+{
+    // Валидация — той же CommandDictionary::parseLine, которой файл будет
+    // загружаться: что примет диалог, то гарантированно загрузится. Заодно
+    // строки нормализуются через commandToSpec (round-trip через парсер).
+    QStringList lines;
+    QStringList bad;
+    for (int i = 0; i < m_customList->count(); ++i) {
+        const QString raw = m_customList->item(i)->text();
+        QString phrase;
+        Command cmd;
+        QString err;
+        if (CommandDictionary::parseLine(raw, &phrase, &cmd, &err)) {
+            lines << QStringLiteral("%1 = %2").arg(phrase, commandToSpec(cmd));
+        } else if (!err.isEmpty()) {
+            bad << QStringLiteral("«%1» — %2").arg(raw.trimmed(), err);
+        }
+    }
+    if (!bad.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Битые строки в командах"),
+                             QStringLiteral("Исправьте или удалите строки — ничего не сохранено:\n\n%1")
+                                 .arg(bad.join(QLatin1Char('\n'))));
+        return false;
+    }
+
+    QDir().mkpath(QFileInfo(m_commandsPath).absolutePath());
+    QFile f(m_commandsPath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        QMessageBox::warning(this, QStringLiteral("Команды"),
+                             QStringLiteral("Не удалось записать файл %1 — проверьте права.")
+                                 .arg(m_commandsPath));
+        return false;
+    }
+    QTextStream out(&f);
+    out.setCodec("UTF-8");   // грабля №6
+    out << QStringLiteral("# Свои голосовые команды: «фраза = тип[:аргумент]».\n"
+                          "# Файл ведётся из диалога настроек, вкладка «Команды».\n");
+    for (const QString& l : std::as_const(lines)) {
+        out << l << '\n';
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Слоты вкладок
+// ---------------------------------------------------------------------------
 
 void SettingsDialog::onAsrProfileChanged(int)
 {
@@ -330,32 +645,74 @@ void SettingsDialog::onPinWindowToggled(bool on)
     m_pinGroup->setEnabled(on);
 }
 
-void SettingsDialog::saveSettings()
+void SettingsDialog::updateHotwordCount()
 {
-    // Ключи — ровно те, которые читает ConfigManager. Раньше здесь писались
-    // hotkey/type («ptt») и output/target («window») — таких ключей никто не
-    // читает: диалог выглядел рабочим, но ничего не менял.
-    m_settings->setValue(QStringLiteral("asr/active"), m_asrProfileCombo->currentText());
-    m_settings->setValue(QStringLiteral("hotkey/mode"),
-                         m_pttRadio->isChecked() ? QStringLiteral("push_to_talk")
-                                                 : QStringLiteral("toggle"));
-    m_settings->setValue(QStringLiteral("hotkey/key"), m_hotkeyEdit->text().trimmed());
-    m_settings->setValue(QStringLiteral("notes/start_target"),
-                         m_outputNotesRadio->isChecked() ? QStringLiteral("notes")
-                                                         : QStringLiteral("focus"));
-    m_settings->setValue(QStringLiteral("output/method"),
-                         m_methodCombo->currentData().toString());
-    m_settings->setValue(QStringLiteral("output/pin_window"), m_pinWindowCheck->isChecked());
-    m_settings->setValue(QStringLiteral("output/pin_mode"),
-                         m_pinModeCombo->currentData().toString());
-    m_settings->setValue(QStringLiteral("output/pin_activate_ms"), m_pinActivateSpin->value());
-    m_settings->setValue(QStringLiteral("output/pin_restore_focus"),
-                         m_pinRestoreCheck->isChecked());
-    m_settings->sync();
-
-    emit settingsApplied();
-    accept();
+    m_hotwordsCountLabel->setText(
+        QStringLiteral("Слов: %1. Правка — двойным кликом; в силу вступает после «Сохранить».")
+            .arg(m_hotwordsList->count()));
 }
+
+void SettingsDialog::addHotword()
+{
+    const QString word = m_hotwordInput->text().trimmed();
+    if (!word.isEmpty()) {
+        if (m_hotwordsList->findItems(word, Qt::MatchExactly).isEmpty()) {
+            m_hotwordsList->addItem(word);
+        }
+        m_hotwordInput->clear();
+    }
+}
+
+void SettingsDialog::removeHotword()
+{
+    qDeleteAll(m_hotwordsList->selectedItems());
+}
+
+void SettingsDialog::filterBuiltinCommands(const QString& text)
+{
+    const QString needle = text.trimmed().toLower();
+    for (int row = 0; row < m_builtinTable->rowCount(); ++row) {
+        const QString phrase = m_builtinTable->item(row, 0)->text().toLower();
+        const QString action = m_builtinTable->item(row, 1)->text().toLower();
+        m_builtinTable->setRowHidden(row, !needle.isEmpty()
+                                         && !phrase.contains(needle)
+                                         && !action.contains(needle));
+    }
+}
+
+void SettingsDialog::copyBuiltinToCustom()
+{
+    const int row = m_builtinTable->currentRow();
+    if (row < 0) {
+        return;
+    }
+    const QString phrase = m_builtinTable->item(row, 0)->text();
+    const QString spec   = m_builtinTable->item(row, 0)->data(Qt::UserRole).toString();
+    const QString line   = QStringLiteral("%1 = %2").arg(phrase, spec);
+    if (!m_customList->findItems(line, Qt::MatchExactly).isEmpty()) {
+        return;   // уже скопирована
+    }
+    m_customList->addItem(line);
+    m_customList->setCurrentRow(m_customList->count() - 1);
+    m_customList->editItem(m_customList->currentItem());   // сразу править фразу
+}
+
+void SettingsDialog::addCustomCommand()
+{
+    auto* item = new QListWidgetItem(QStringLiteral("новая фраза = delete-word"));
+    m_customList->addItem(item);
+    m_customList->setCurrentItem(item);
+    m_customList->editItem(item);
+}
+
+void SettingsDialog::removeCustomCommand()
+{
+    qDeleteAll(m_customList->selectedItems());
+}
+
+// ---------------------------------------------------------------------------
+// Захват клавиши хоткея
+// ---------------------------------------------------------------------------
 
 void SettingsDialog::onKeyCapture()
 {

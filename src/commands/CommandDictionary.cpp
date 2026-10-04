@@ -123,6 +123,49 @@ void CommandDictionary::loadDefaults()
     addCommand(QStringLiteral("дефис"),                  Command::punctuation(QStringLiteral("-")));
 }
 
+bool CommandDictionary::parseLine(const QString& line, QString* phrase, Command* cmd,
+                                  QString* error)
+{
+    if (error) {
+        error->clear();
+    }
+    const QString trimmed = line.trimmed();
+    if (trimmed.isEmpty() || trimmed.startsWith(QLatin1Char('#'))) {
+        return false;   // не ошибка — просто нечего добавлять
+    }
+    const int eq = trimmed.indexOf(QLatin1Char('='));
+    if (eq <= 0) {
+        if (error) {
+            *error = QStringLiteral("жду 'фраза = тип[:аргумент]'");
+        }
+        return false;
+    }
+    const QString phr  = trimmed.left(eq).trimmed();
+    const QString spec = trimmed.mid(eq + 1).trimmed().toLower();
+    if (phr.isEmpty()) {
+        if (error) {
+            *error = QStringLiteral("пустая фраза слева от '='");
+        }
+        return false;
+    }
+    Command parsed;
+    if (!parseCommandSpec(spec, &parsed)) {
+        if (error) {
+            *error = QStringLiteral("неизвестный тип '%1' (доступны: set-mode:{dictation|edit|"
+                                    "spellcheck|off}, set-target:{focus|notes}, delete-word, "
+                                    "delete-line, new-line, space, punctuation:<символ>)").arg(spec);
+        }
+        return false;
+    }
+    if (phrase) {
+        *phrase = phr;
+    }
+    if (cmd) {
+        *cmd = parsed;
+    }
+    return true;
+}
+
 int CommandDictionary::loadFromFile(const QString& path)
 {
     QFile f(path);
@@ -137,27 +180,17 @@ int CommandDictionary::loadFromFile(const QString& path)
     int lineNo = 0;
     while (!in.atEnd()) {
         ++lineNo;
-        const QString line = in.readLine().trimmed();
-        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
-            continue;
-        }
-        const int eq = line.indexOf(QLatin1Char('='));
-        if (eq <= 0) {
-            qWarning().noquote() << QString("CommandDictionary: %1:%2 — жду 'фраза = тип[:аргумент]'")
-                                        .arg(path).arg(lineNo);
-            continue;
-        }
-        const QString phrase = line.left(eq).trimmed();
-        const QString spec   = line.mid(eq + 1).trimmed().toLower();
-
+        const QString line = in.readLine();
+        QString phrase;
         Command cmd;
-        if (!parseCommandSpec(spec, &cmd)) {
-            qWarning().noquote() << QString("CommandDictionary: %1:%2 — неизвестный тип '%3'")
-                                        .arg(path).arg(lineNo).arg(spec);
-            continue;
+        QString err;
+        if (parseLine(line, &phrase, &cmd, &err)) {
+            addCommand(phrase, cmd);
+            ++added;
+        } else if (!err.isEmpty()) {
+            qWarning().noquote() << QString("CommandDictionary: %1:%2 — %3")
+                                        .arg(path).arg(lineNo).arg(err);
         }
-        addCommand(phrase, cmd);
-        ++added;
     }
 
     qDebug().noquote() << QString("CommandDictionary: +%1 команд из %2").arg(added).arg(path);

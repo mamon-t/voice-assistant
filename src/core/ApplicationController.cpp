@@ -23,25 +23,8 @@
 #include <cmath>
 #include <cstdint>
 
-namespace {
-
-QString commandDescription(const Command& cmd)
-{
-    switch (cmd.type) {
-    case Command::Type::SetMode:     return QStringLiteral("режим: %1").arg(modeToString(cmd.mode));
-    case Command::Type::SetTarget:   return QStringLiteral("куда писать: %1")
-                                               .arg(outputTargetTitle(cmd.target));
-    case Command::Type::DeleteWord:  return QStringLiteral("удалить слово");
-    case Command::Type::DeleteLine:  return QStringLiteral("удалить строку");
-    case Command::Type::NewLine:     return QStringLiteral("новая строка");
-    case Command::Type::Space:       return QStringLiteral("пробел");
-    case Command::Type::Punctuation: return QStringLiteral("знак: %1").arg(cmd.argument);
-    case Command::Type::Unknown:     break;
-    }
-    return QStringLiteral("неизвестная команда");
-}
-
-}  // namespace
+// commandDescription() переехал в core/Command.h: описание команды нужен
+// не только контроллеру (лог выполнения), но и вкладке «Команды» в настройках.
 
 ApplicationController::ApplicationController(QObject* parent)
     : QObject(parent)
@@ -404,6 +387,40 @@ void ApplicationController::reloadHotwords()
     } else {
         applyHotwords();
     }
+}
+
+void ApplicationController::reloadCommands()
+{
+    if (!m_config) {
+        return;
+    }
+    // Та же сборка, что в конструкторе (секция 2): стандартный словарь из
+    // кода + свой файл поверх него. Держим отдельно, а не вызываем общий
+    // метод из конструктора: там свой порядок инициализации (hotwords-менеджер
+    // создаётся позже), и перенос дал бы больше риска, чем дублирование
+    // десяти строк.
+    m_commands = std::make_unique<CommandParser>();
+    const QString custom = m_config->customCommandsPath();
+    if (QFile::exists(custom)) {
+        const int added = m_commands->dictionary()->loadFromFile(custom);
+        qInfo().noquote()
+            << QStringLiteral("Команды: из своего файла %1 добавлено %2")
+                   .arg(custom).arg(added);
+    }
+    if (!m_config->notesVoiceCommands()) {
+        const QStringList phrases = CommandDictionary::targetCommandPhrases();
+        for (const QString& phrase : phrases) {
+            m_commands->dictionary()->removeCommand(phrase);
+        }
+    }
+    m_editCmdsInDictation = m_config->editingCommandsInDictation();
+    qInfo().noquote()
+        << QStringLiteral("Словарь команд перечитан: %1 фраз, editing_in_dictation=%2")
+               .arg(m_commands->dictionary()->size())
+               .arg(m_editCmdsInDictation ? QStringLiteral("true") : QStringLiteral("false"));
+
+    // Фразы команд уходят в hotwords ASR — обновляем следом.
+    applyHotwords();
 }
 
 void ApplicationController::reloadHotkey()
