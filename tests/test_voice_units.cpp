@@ -13,7 +13,9 @@
 #include <QDir>
 
 #include <linux/input.h>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 #include <QFile>
 #include <QTextStream>
 
@@ -23,6 +25,7 @@
 #include "config/ConfigManager.h"
 #include "models/ModelCatalog.h"
 #include "models/ModelDownloader.h"
+#include "audio/AudioFileDecoder.h"
 #include "audio/TypingGuard.h"
 #include "audio/WavWriter.h"
 #include "core/OutputTarget.h"
@@ -1358,6 +1361,309 @@ private slots:
         QVERIFY(inj.sendKey(QStringLiteral("Return")));
         QVERIFY(inj.typeText(QString()));       // пустой текст — не ошибка
         QVERIFY(inj.sendKey(QString()));        // пустая клавиша — no-op, тоже не ошибка
+    }
+
+    // ---------------- AudioFileDecoder ----------------
+
+    // Синтетический WAV-контейнер: fmt + data, как пишет любая звонилка.
+    static QByteArray makeWav(int formatTag, int channels, int rate, int bits,
+                              const QByteArray& data)
+    {
+        QByteArray h;
+        auto put32 = [&h](quint32 v) { h.append(reinterpret_cast<const char*>(&v), 4); };
+        auto put16 = [&h](quint16 v) { h.append(reinterpret_cast<const char*>(&v), 2); };
+        h.append("RIFF", 4);
+        put32(36 + quint32(data.size()));
+        h.append("WAVE", 4);
+        h.append("fmt ", 4);
+        put32(16);
+        put16(quint16(formatTag));
+        put16(quint16(channels));
+        put32(quint32(rate));
+        put32(quint32(rate * channels * bits / 8));
+        put16(quint16(channels * bits / 8));
+        put16(quint16(bits));
+        h.append("data", 4);
+        put32(quint32(data.size()));
+        h.append(data);
+        return h;
+    }
+
+    // Записать байты во временный файл с нужным расширением и вернуть путь.
+    static QString writeTemp(QTemporaryDir& dir, const QString& name, const QByteArray& bytes)
+    {
+        const QString path = dir.filePath(name);
+        QFile f(path);
+        f.open(QIODevice::WriteOnly);
+        f.write(bytes);
+        f.close();
+        return path;
+    }
+
+    void decoderG711Tables()
+    {
+        // Контрольные значения классического g711: alaw-тишина 0xD5 -> +8,
+        // ulaw-тишина 0xFF и 0x7F -> 0, знак alaw инвертирован (0x55 -> -8).
+        QCOMPARE(AudioFileDecoder::alawToLinear(0xD5), int16_t(8));
+        QCOMPARE(AudioFileDecoder::alawToLinear(0x55), int16_t(-8));
+        QCOMPARE(AudioFileDecoder::ulawToLinear(0xFF), int16_t(0));
+        QCOMPARE(AudioFileDecoder::ulawToLinear(0x7F), int16_t(0));
+        // Полный диапазон не выходит за int16
+        for (int v = 0; v < 256; ++v) {
+            QVERIFY(qAbs(int(AudioFileDecoder::alawToLinear(uint8_t(v)))) <= 32767);
+            QVERIFY(qAbs(int(AudioFileDecoder::ulawToLinear(uint8_t(v)))) <= 32767);
+        }
+    }
+
+    void decoderWavPcm16StereoResample()
+    {
+        // Стерео 44.1 кГц, 1 секунда постоянного сигнала: L=1000, R=3000.
+        // После домикширования — 2000, после ресемпла — 16000 сэмплов.
+        const int frames = 44100;
+        QByteArray data;
+        data.reserve(frames * 4);
+        for (int i = 0; i < frames; ++i) {
+            const int16_t l = 1000, r = 3000;
+            data.append(reinterpret_cast<const char*>(&l), 2);
+            data.append(reinterpret_cast<const char*>(&r), 2);
+        }
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeTemp(dir, QStringLiteral("s.wav"), makeWav(1, 2, 44100, 16, data));
+
+        AudioFileDecoder::Audio out;
+        QString err;
+        QVERIFY2(AudioFileDecoder::decode(path, AudioFileDecoder::RawParams(), out, &err),
+                 qPrintable(err));
+        QCOMPARE(out.sourceRate, 44100);
+        QCOMPARE(out.sourceChannels, 2);
+        QCOMPARE(int(out.samples.size()), 16000);
+        for (size_t i : {0u, 8000u, 15999u}) {
+            QVERIFY2(qAbs(int(out.samples[i]) - 2000) <= 2,
+                     qPrintable(QStringLiteral("samples[%1]=%2, жду ~2000")
+                                    .arg(i).arg(out.samples[i])));
+        }
+        QVERIFY(qAbs(out.seconds() - 1.0) < 0.01);
+    }
+
+    void decoderWavPcm8()
+    {
+        // 8-битный PCM без знака, центр 128: значение 192 -> (192-128)*256 = 16384
+        QByteArray data(8000, char(192));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeTemp(dir, QStringLiteral("u8.wav"), makeWav(1, 1, 8000, 8, data));
+
+        AudioFileDecoder::Audio out;
+        QString err;
+        QVERIFY2(AudioFileDecoder::decode(path, AudioFileDecoder::RawParams(), out, &err),
+                 qPrintable(err));
+        QCOMPARE(int(out.samples.size()), 16000);   // 1 с @ 8 кГц -> 16 кГц
+        QVERIFY(qAbs(int(out.samples[100]) - 16384) <= 2);
+    }
+
+    void decoderWavAlaw()
+    {
+        // Телефонный WAV G.711 A-law (format tag 6): тишина 0xD5 -> ~+8
+        QByteArray data(8000, char(0xD5));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeTemp(dir, QStringLiteral("alaw.wav"), makeWav(6, 1, 8000, 8, data));
+
+        AudioFileDecoder::Audio out;
+        QString err;
+        QVERIFY2(AudioFileDecoder::decode(path, AudioFileDecoder::RawParams(), out, &err),
+                 qPrintable(err));
+        QCOMPARE(out.sourceFormat.contains(QStringLiteral("format=6")), true);
+        QVERIFY(qAbs(int(out.samples[50])) <= 16);
+    }
+
+    void decoderWavFloat32()
+    {
+        // IEEE float (format tag 3): 0.5f -> ~16384
+        QByteArray data;
+        const float v = 0.5f;
+        for (int i = 0; i < 16000; ++i) {
+            data.append(reinterpret_cast<const char*>(&v), 4);
+        }
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeTemp(dir, QStringLiteral("f32.wav"), makeWav(3, 1, 16000, 32, data));
+
+        AudioFileDecoder::Audio out;
+        QString err;
+        QVERIFY2(AudioFileDecoder::decode(path, AudioFileDecoder::RawParams(), out, &err),
+                 qPrintable(err));
+        QCOMPARE(int(out.samples.size()), 16000);   // 16 кГц — без ресемпла
+        QVERIFY(qAbs(int(out.samples[0]) - 16384) <= 2);
+    }
+
+    void decoderRawS16()
+    {
+        // RAW 8 кГц моно s16le, постоянный сигнал 1234, 2 секунды
+        QByteArray data;
+        const int16_t v = 1234;
+        for (int i = 0; i < 16000; ++i) {
+            data.append(reinterpret_cast<const char*>(&v), 2);
+        }
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeTemp(dir, QStringLiteral("call.raw"), data);
+
+        AudioFileDecoder::RawParams p;   // дефолт: 8000 Гц, моно, s16le
+        AudioFileDecoder::Audio out;
+        QString err;
+        QVERIFY2(AudioFileDecoder::decode(path, p, out, &err), qPrintable(err));
+        QCOMPARE(int(out.samples.size()), 32000);   // 2 с @ 16 кГц
+        QVERIFY(qAbs(int(out.samples[1000]) - 1234) <= 2);
+
+        // Неверная частота меняет длительность (проверяем, что параметры применяются)
+        AudioFileDecoder::RawParams p16 = p;
+        p16.sampleRate = 16000;
+        AudioFileDecoder::Audio out16;
+        QVERIFY(AudioFileDecoder::decode(path, p16, out16, &err));
+        QCOMPARE(int(out16.samples.size()), 16000);   // 1 с @ 16 кГц
+    }
+
+    void decoderRawUlaw()
+    {
+        // RAW μ-law: тишина 0xFF -> 0
+        QByteArray data(8000, char(0xFF));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeTemp(dir, QStringLiteral("call.pcm"), data);
+
+        AudioFileDecoder::RawParams p;
+        p.format = AudioFileDecoder::RawFormat::ULAW;
+        AudioFileDecoder::Audio out;
+        QString err;
+        QVERIFY2(AudioFileDecoder::decode(path, p, out, &err), qPrintable(err));
+        QCOMPARE(out.samples[0], int16_t(0));
+    }
+
+    void decoderErrors()
+    {
+        AudioFileDecoder::Audio out;
+        QString err;
+        AudioFileDecoder::RawParams p;
+
+        // Несуществующий файл
+        QVERIFY(!AudioFileDecoder::decode(QStringLiteral("/tmp/нет-такого-файла-va.wav"),
+                                          p, out, &err));
+        QVERIFY(!err.isEmpty());
+
+        // Обрезанный RIFF: заголовок есть, данных нет
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString bad = writeTemp(dir, QStringLiteral("bad.wav"),
+                                      QByteArray("RIFF\0\0\0\0WAVE", 12));
+        QVERIFY(!AudioFileDecoder::decode(bad, p, out, &err));
+        QVERIFY(!err.isEmpty());
+
+        // Пустой RAW
+        const QString empty = writeTemp(dir, QStringLiteral("empty.raw"), QByteArray());
+        QVERIFY(!AudioFileDecoder::decode(empty, p, out, &err));
+
+        // RAW с безумными параметрами
+        const QString ok = writeTemp(dir, QStringLiteral("one.raw"), QByteArray(1600, 1));
+        AudioFileDecoder::RawParams crazy = p;
+        crazy.sampleRate = 10;   // вне 1000..384000
+        QVERIFY(!AudioFileDecoder::decode(ok, crazy, out, &err));
+    }
+
+    void decoderRawRouting()
+    {
+        // .raw/.pcm/без расширения — RAW; известные сжатые — системный декодер
+        QVERIFY(AudioFileDecoder::isRawExtension(QStringLiteral("a.raw")));
+        QVERIFY(AudioFileDecoder::isRawExtension(QStringLiteral("a.PCM")));
+        QVERIFY(AudioFileDecoder::isRawExtension(QStringLiteral("a.audio")));
+        QVERIFY(AudioFileDecoder::isRawExtension(QStringLiteral("call_record")));
+        QVERIFY(!AudioFileDecoder::isRawExtension(QStringLiteral("a.mp3")));
+        QVERIFY(!AudioFileDecoder::isRawExtension(QStringLiteral("a.wav")));
+
+        // Форматы RAW: строка <-> enum (для ini и CLI)
+        using RF = AudioFileDecoder::RawFormat;
+        QCOMPARE(AudioFileDecoder::RawParams::formatFromString(QStringLiteral("alaw")), RF::ALAW);
+        QCOMPARE(AudioFileDecoder::RawParams::formatFromString(QStringLiteral("ULAW")), RF::ULAW);
+        QCOMPARE(AudioFileDecoder::RawParams::formatFromString(QStringLiteral("s8u")), RF::S8U);
+        QCOMPARE(AudioFileDecoder::RawParams::formatFromString(QStringLiteral("f32le")), RF::F32LE);
+        QCOMPARE(AudioFileDecoder::RawParams::formatFromString(QStringLiteral("что угодно")), RF::S16LE);
+        QCOMPARE(AudioFileDecoder::RawParams::formatToString(RF::ALAW), QStringLiteral("alaw"));
+        QVERIFY(AudioFileDecoder::RawParams::formatNames().contains(QStringLiteral("ulaw")));
+    }
+
+    void resampleKeepsLengthAndPitch()
+    {
+        // 8 кГц -> 16 кГц: вдвое больше сэмплов, постоянный сигнал не меняется
+        std::vector<int16_t> mono(8000, 500);
+        AudioFileDecoder::resampleTo16k(mono, 8000);
+        QCOMPARE(int(mono.size()), 16000);
+        QCOMPARE(mono[7999], int16_t(500));
+
+        // 16 кГц -> no-op
+        const size_t before = mono.size();
+        AudioFileDecoder::resampleTo16k(mono, 16000);
+        QCOMPARE(mono.size(), before);
+    }
+
+    // ---------------- Команда «разбери файл» ----------------
+
+    void transcribeFileCommand()
+    {
+        CommandParser p;
+        const auto c = p.parse(QStringLiteral("Разбери файл."));
+        QVERIFY(c.has_value());
+        QCOMPARE(c->type, Command::Type::TranscribeFile);
+        QCOMPARE(commandDescription(*c), QStringLiteral("разобрать аудиофайл"));
+        QCOMPARE(commandToSpec(*c), QStringLiteral("transcribe-file"));
+
+        // Все синонимы из словаря
+        for (const QString& phrase : {QStringLiteral("разбери аудиофайл"),
+                                      QStringLiteral("распознай файл"),
+                                      QStringLiteral("расшифруй запись")}) {
+            QVERIFY2(p.parse(phrase).has_value(), qPrintable(phrase));
+            QCOMPARE(p.parse(phrase)->type, Command::Type::TranscribeFile);
+        }
+
+        // Round-trip через файл команд (вкладка «Команды» и loadFromFile)
+        QString phr, err;
+        Command parsed;
+        QVERIFY(CommandDictionary::parseLine(
+            QStringLiteral("переведи звонок = transcribe-file"), &phr, &parsed, &err));
+        QCOMPARE(phr, QStringLiteral("переведи звонок"));
+        QCOMPARE(parsed.type, Command::Type::TranscribeFile);
+
+        // Обычная речь командой не становится
+        QVERIFY(!p.parse(QStringLiteral("разбери этот файл по полочкам")).has_value());
+    }
+
+    // ---------------- [transcribe] в конфиге ----------------
+
+    void configTranscribeSection()
+    {
+        // Значения по умолчанию — телефонные
+        const ConfigManager def(QStringLiteral("/tmp/нет-такого-файла-va-transcribe.ini"));
+        QCOMPARE(def.transcribeRawRate(), 8000);
+        QCOMPARE(def.transcribeRawChannels(), 1);
+        QCOMPARE(def.transcribeRawFormat(), QStringLiteral("s16le"));
+        QVERIFY(def.transcribeLastDir().isEmpty());
+
+        // Запись/чтение (сеттеры пишет GUI-диалог RAW-параметров)
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString ini = dir.filePath(QStringLiteral("settings.ini"));
+        {
+            ConfigManager w(ini);
+            w.setTranscribeRawRate(16000);
+            w.setTranscribeRawChannels(2);
+            w.setTranscribeRawFormat(QStringLiteral("alaw"));
+            w.setTranscribeLastDir(QStringLiteral("/home/user/Записи"));
+        }
+        const ConfigManager r(ini);
+        QCOMPARE(r.transcribeRawRate(), 16000);
+        QCOMPARE(r.transcribeRawChannels(), 2);
+        QCOMPARE(r.transcribeRawFormat(), QStringLiteral("alaw"));
+        QCOMPARE(r.transcribeLastDir(), QStringLiteral("/home/user/Записи"));
     }
 };
 

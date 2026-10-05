@@ -16,21 +16,26 @@
 #include <QThread>
 
 #include "audio/QtAudioCapture.h"
+#include "audio/AudioFileDecoder.h"
 #include "audio/WavWriter.h"
 #include "commands/CommandDictionary.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
+#include "core/VoicePipeline.h"
 #include "input/EvdevHotkeyListener.h"
 #include "models/ModelCatalog.h"
 #include "models/ModelDownloader.h"
 #include "output/FileInjector.h"
 #include "output/XdotoolInjector.h"
 
+#include <QElapsedTimer>
 #include <QTimer>
 #include "spellcheck/HunspellChecker.h"
 
 #include <linux/input-event-codes.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 
@@ -770,6 +775,287 @@ int runDownloadModel(QCoreApplication& app, const QStringList& args)
     return exitCode;
 }
 
+// ---------------------------------------------------------------------------
+// --transcribe <файл> — разбор аудиозаписи из файла (WAV/MP3/RAW/OGG/FLAC…).
+//
+// Тот же боевой путь, что и у GUI-команды «разбери файл»: AudioFileDecoder
+// (декодирование в моно 16 кГц) -> VoicePipeline (SileroVAD -> ASR ->
+// постобработка). Отличия от tools/vad-asr-test: работает из установленного
+// пакета, понимает MP3 и RAW, умеет вставлять результат в окно и в заметки.
+//
+// ВЫБОР МОДЕЛИ (зачем этот флаг вообще в CLI):
+//   --config <ini>    другой settings.ini (по умолчанию ~/.config/voice-assistant/settings.ini)
+//   --profile <имя>   профиль ASR из [asr] profiles того же конфига
+//                     (zipformer-ru, gigaam-v3, gigaam-v3-ctc, whisper-base…);
+//                     по умолчанию — активный профиль (тот же, что у диктовки)
+//   --threads N       число потоков декодирования поверх профиля
+// Полный список профилей показывает `voice-assistant --check`.
+// Произвольные пути к моделям без конфига — по-прежнему у tools/vad-asr-test.
+//
+// Параметры RAW (PCM без контейнера — телефонные записи):
+//   --rate N (8000)  --channels N (1)  --format s16le|s8u|f32le|alaw|ulaw
+//
+// Вывод: текст ВСЕГДА печатается в stdout (удобно для скриптов:
+// `--transcribe call.mp3 > call.txt`), диагностика и прогресс — в stderr.
+// Дополнительные цели:
+//   --out <файл>      записать текст в файл (UTF-8)
+//   --notes           дописать в файл заметок ([notes])
+//   --insert          вставить в окно, активное в момент запуска (pin-механизм)
+//   --hotwords <файл> подсказки (строка = слово/фраза)
+//   --no-punct        без голосовой пунктуации, заглавных и финальной точки
+int runTranscribe(QCoreApplication& app, const QStringList& args)
+{
+    auto argValue = [&args](const QString& name) -> QString {
+        const int i = args.indexOf(name);
+        return (i >= 0 && i + 1 < args.size()) ? args.at(i + 1) : QString();
+    };
+
+    const int ti = args.indexOf(QStringLiteral("--transcribe"));
+    const QString file = (ti >= 0 && ti + 1 < args.size()
+                          && !args.at(ti + 1).startsWith(QLatin1String("--")))
+        ? args.at(ti + 1) : QString();
+    if (file.isEmpty()) {
+        std::fprintf(stderr,
+            "--transcribe: нужен аудиофайл.\n"
+            "Пример:  voice-assistant --transcribe звонок.mp3 --profile gigaam-v3\n"
+            "Флаги:   --config <ini> --profile <имя> --threads N --no-punct\n"
+            "         --rate N --channels N --format s16le|s8u|f32le|alaw|ulaw  (RAW)\n"
+            "         --out <файл.txt> --notes --insert --hotwords <файл>\n"
+            "Текст — в stdout, диагностика — в stderr. Профили ASR: --check.\n");
+        return 2;
+    }
+    if (!QFileInfo::exists(file)) {
+        std::fprintf(stderr, "--transcribe: нет файла %s\n", qPrintable(file));
+        return 1;
+    }
+
+    std::unique_ptr<ConfigManager> cfg(makeConfigFromArgs(args));
+    VoicePipeline::Settings settings = VoicePipeline::loadSettings(*cfg);
+
+    // --- выбор модели ---
+    const QString profile = argValue(QStringLiteral("--profile"));
+    if (!profile.isEmpty()) {
+        if (!cfg->hasAsrProfile(profile)) {
+            std::fprintf(stderr,
+                "--transcribe: нет профиля '%s'. Доступны: %s\n",
+                qPrintable(profile),
+                qPrintable(cfg->asrProfileNames().join(QStringLiteral(", "))));
+            return 2;
+        }
+        settings.asr = cfg->asrProfile(profile);
+    }
+    const QString threadsStr = argValue(QStringLiteral("--threads"));
+    if (!threadsStr.isEmpty()) {
+        bool ok = false;
+        const int n = threadsStr.toInt(&ok);
+        if (!ok || n < 1 || n > 64) {
+            std::fprintf(stderr, "--transcribe: --threads нужно число 1..64\n");
+            return 2;
+        }
+        settings.asr.numThreads = n;
+    }
+    if (args.contains(QStringLiteral("--no-punct"))) {
+        settings.text.voicePunctuation    = false;
+        settings.text.capitalizeSentences = false;
+        settings.text.addFinalDot         = false;
+    }
+
+    // --- параметры RAW ---
+    AudioFileDecoder::RawParams raw;
+    raw.sampleRate = cfg->transcribeRawRate();
+    raw.channels   = cfg->transcribeRawChannels();
+    raw.format     = AudioFileDecoder::RawParams::formatFromString(cfg->transcribeRawFormat());
+    const QString rateStr = argValue(QStringLiteral("--rate"));
+    if (!rateStr.isEmpty()) {
+        bool ok = false;
+        const int v = rateStr.toInt(&ok);
+        if (!ok || v < 1000 || v > 384000) {
+            std::fprintf(stderr, "--transcribe: --rate нужно число 1000..384000\n");
+            return 2;
+        }
+        raw.sampleRate = v;
+    }
+    const QString chStr = argValue(QStringLiteral("--channels"));
+    if (!chStr.isEmpty()) {
+        bool ok = false;
+        const int v = chStr.toInt(&ok);
+        if (!ok || v < 1 || v > 8) {
+            std::fprintf(stderr, "--transcribe: --channels нужно число 1..8\n");
+            return 2;
+        }
+        raw.channels = v;
+    }
+    const QString fmtStr = argValue(QStringLiteral("--format"));
+    if (!fmtStr.isEmpty()) {
+        if (!AudioFileDecoder::RawParams::formatNames().contains(fmtStr.toLower())) {
+            std::fprintf(stderr, "--transcribe: --format может быть %s\n",
+                         qPrintable(AudioFileDecoder::RawParams::formatNames()
+                                        .join(QStringLiteral("|"))));
+            return 2;
+        }
+        raw.format = AudioFileDecoder::RawParams::formatFromString(fmtStr);
+    }
+
+    // --- окно для --insert запоминаем ДО долгой работы ---
+    const bool insert = args.contains(QStringLiteral("--insert"));
+    std::unique_ptr<XdotoolInjector> injector;
+    QString insertWid;
+    if (insert) {
+        injector = makeInjectorFromConfig(*cfg);
+        if (!injector->isAvailable()) {
+            std::fprintf(stderr,
+                "--transcribe --insert: xdotool не найден — вставлять нечем\n");
+            return 1;
+        }
+        insertWid = XdotoolInjector::activeWindowId();
+        if (!insertWid.isEmpty()) {
+            injector->setPinnedWindow(insertWid);
+        }
+        printWindowLine("Вставка в окно", insertWid);
+    }
+
+    // --- 1. декодирование файла (падаем рано, до загрузки модели) ---
+    AudioFileDecoder::Audio audio;
+    QString err;
+    if (!AudioFileDecoder::decode(file, raw, audio, &err)) {
+        std::fprintf(stderr, "--transcribe: %s\n", qPrintable(err));
+        return 1;
+    }
+    if (audio.samples.empty()) {
+        std::fprintf(stderr, "--transcribe: в файле нет аудио (0 сэмплов)\n");
+        return 1;
+    }
+    std::fprintf(stderr, "Файл  : %s\n       %d Гц, %d кан., %s -> %.1f с @ 16 кГц моно\n",
+                 qPrintable(file), audio.sourceRate, audio.sourceChannels,
+                 qPrintable(audio.sourceFormat), audio.seconds());
+
+    // --- 2. конвейер ---
+    VoicePipeline pipeline(settings);
+    QStringList segments;
+    QObject::connect(&pipeline, &VoicePipeline::errorOccurred, [](const QString& m) {
+        std::fprintf(stderr, "[ERROR] %s\n", qPrintable(m));
+    });
+    QObject::connect(&pipeline, &VoicePipeline::textReady,
+                     [&segments](const QString& text) {
+        const QString s = text.trimmed();
+        if (!s.isEmpty()) {
+            segments << s;
+            std::fprintf(stderr, "  #%d: %s\n", segments.size(), qPrintable(s));
+        }
+    });
+
+    if (!pipeline.initialize(&err)) {
+        std::fprintf(stderr, "--transcribe: модель не запустилась: %s\n", qPrintable(err));
+        return 1;
+    }
+    std::fprintf(stderr, "Модель: %s (%s), потоков: %d\n",
+                 qPrintable(settings.asr.name),
+                 qPrintable(AsrProfile::engineToString(settings.asr.engine)),
+                 settings.asr.numThreads);
+
+    const QString hotwordsFile = argValue(QStringLiteral("--hotwords"));
+    if (!hotwordsFile.isEmpty()) {
+        const QStringList hw = cfg->loadHotwords(hotwordsFile);
+        pipeline.setHotwords(hw, cfg->hotwordsScore());
+        std::fprintf(stderr, "Подсказки: %d шт. из %s\n",
+                     static_cast<int>(hw.size()), qPrintable(hotwordsFile));
+    }
+
+    // --- 3. подача аудио окнами по 512 сэмплов (32 мс) ---
+    QElapsedTimer total;
+    total.start();
+    const int windowBytes = 512 * static_cast<int>(sizeof(int16_t));
+    const int totalBytes  = static_cast<int>(audio.samples.size() * sizeof(int16_t));
+    const char* pcm = reinterpret_cast<const char*>(audio.samples.data());
+    int lastPct = -1;
+    for (int off = 0; off < totalBytes; off += windowBytes) {
+        const int pct = static_cast<int>(100.0 * off / std::max(1, totalBytes));
+        if (pct / 5 != lastPct / 5) {
+            lastPct = pct;
+            std::fprintf(stderr, "\rРаспознавание: %3d%%", pct);
+            std::fflush(stderr);
+        }
+        const int n = std::min(windowBytes, totalBytes - off);
+        pipeline.processAudio(QByteArray(pcm + off, n), 16000);
+    }
+    pipeline.flush();
+    std::fprintf(stderr, "\rРаспознавание: 100%%\n");
+
+    const QString text = segments.join(QLatin1Char('\n'));
+
+    // --- 4. вывод ---
+    // stdout — всегда (результат команды), остальное — дополнительные цели.
+    if (!text.isEmpty()) {
+        std::printf("%s\n", qPrintable(text));
+        std::fflush(stdout);
+    }
+
+    const QString outFile = argValue(QStringLiteral("--out"));
+    if (!outFile.isEmpty()) {
+        QFile out(outFile);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            std::fprintf(stderr, "--out: не удалось записать %s: %s\n",
+                         qPrintable(outFile), qPrintable(out.errorString()));
+            return 1;
+        }
+        out.write(text.toUtf8());
+        out.write("\n", 1);
+        out.close();
+        std::fprintf(stderr, "Записано: %s\n", qPrintable(outFile));
+    }
+
+    if (args.contains(QStringLiteral("--notes"))) {
+        if (!cfg->notesEnabled()) {
+            std::fprintf(stderr, "--notes: заметки выключены ([notes] enabled=false)\n");
+            return 1;
+        }
+        FileInjector::Options nopt;
+        nopt.dir            = cfg->notesDir();
+        nopt.file           = cfg->notesFile();
+        nopt.timestampFormat = cfg->notesTimestampFormat();
+        nopt.markdown       = cfg->notesMarkdown();
+        nopt.dayHeader      = cfg->notesDayHeader();
+        FileInjector notes(nopt);
+        if (!notes.initialize() || !notes.typeText(text)) {
+            std::fprintf(stderr, "--notes: %s\n", qPrintable(notes.lastError()));
+            return 1;
+        }
+        std::fprintf(stderr, "Заметки : %s\n", qPrintable(notes.filePath()));
+    }
+
+    int exitCode = segments.isEmpty() ? 1 : 0;
+    if (insert && !text.isEmpty()) {
+        const bool ok = injector->typeText(text);
+        std::fprintf(stderr, "%s\n", ok
+            ? qPrintable(QStringLiteral("Вставлено в окно %1 (%2 симв.)")
+                             .arg(insertWid.isEmpty() ? QStringLiteral("(активное)") : insertWid)
+                             .arg(text.size()))
+            : qPrintable(QStringLiteral("НЕ вставлено: %1").arg(injector->lastError())));
+        if (!ok) {
+            exitCode = 1;
+        }
+        // Даём целевому приложению забрать текст из буфера, а инжектору —
+        // восстановить буфер (внутренние таймеры живут от processEvents).
+        const int waitMs = qMax(400, cfg->clipboardRestoreMs());
+        QElapsedTimer waited;
+        waited.start();
+        while (waited.elapsed() < waitMs) {
+            app.processEvents(QEventLoop::AllEvents, 100);
+        }
+    }
+
+    std::fprintf(stderr, "Итог    : сегментов %d, аудио %.1f с, затрачено %.0f мс (RTF %.2f)\n",
+                 segments.size(), audio.seconds(), static_cast<double>(total.elapsed()),
+                 audio.seconds() > 0.0
+                     ? (total.elapsed() / 1000.0) / audio.seconds() : 0.0);
+    if (segments.isEmpty()) {
+        std::fprintf(stderr,
+            "Речь не найдена. Для тихих/шумных записей попробуйте --profile gigaam-v3,\n"
+            "для RAW проверьте --rate/--format (неверная частота даёт кашу или тишину).\n");
+    }
+    return exitCode;
+}
+
 }  // namespace
 
 int main(int argc, char *argv[])
@@ -798,6 +1084,19 @@ int main(int argc, char *argv[])
     if (rawArgs.contains(QStringLiteral("--download-model"))) {
         QCoreApplication app(argc, argv);
         return runDownloadModel(app, QCoreApplication::arguments());
+    }
+
+    // --transcribe <файл> [--profile <имя>] [--config <ini>] — разбор записи
+    // речи из аудиофайла (WAV/MP3/RAW/OGG/FLAC…). Тот же боевой конвейер, что
+    // и у GUI-команды «разбери файл»; модель выбирается профилем из конфига.
+    // QApplication нужен только для --insert (буфер обмена живёт в GUI-классе),
+    // в остальном команда работает без X-сервера, как --check/--record.
+    if (rawArgs.contains(QStringLiteral("--transcribe"))) {
+        std::unique_ptr<QCoreApplication> app(
+            rawArgs.contains(QStringLiteral("--insert"))
+                ? static_cast<QCoreApplication*>(new QApplication(argc, argv))
+                : new QCoreApplication(argc, argv));
+        return runTranscribe(*app, QCoreApplication::arguments());
     }
 
     // --type "текст" [--pin-active] [--window WID] [--delay мс] [--config путь]

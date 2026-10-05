@@ -14,6 +14,7 @@ struct Command {
         NewLine,
         Space,
         Punctuation,  // точка, запятая и т.д.
+        TranscribeFile,  // «разбери файл»: выбор аудиофайла и вставка расшифровки
         Unknown
     };
 
@@ -66,6 +67,15 @@ struct Command {
         cmd.argument = symbol;
         return cmd;
     }
+
+    // «разбери файл» / «расшифруй запись»: UI показывает системный диалог
+    // выбора аудиофайла, результат уходит в окно, активное ДО открытия
+    // диалога (или в заметки, если цель вывода — notes).
+    static Command transcribeFile() {
+        Command cmd;
+        cmd.type = Type::TranscribeFile;
+        return cmd;
+    }
 };
 
 // Человекочитаемое описание команды — для логов, трея и вкладки «Команды»
@@ -82,6 +92,7 @@ inline QString commandDescription(const Command& cmd)
     case Command::Type::NewLine:     return QStringLiteral("новая строка");
     case Command::Type::Space:       return QStringLiteral("пробел");
     case Command::Type::Punctuation: return QStringLiteral("знак: %1").arg(cmd.argument);
+    case Command::Type::TranscribeFile: return QStringLiteral("разобрать аудиофайл");
     case Command::Type::Unknown:     break;
     }
     return QStringLiteral("неизвестная команда");
@@ -111,6 +122,7 @@ inline QString commandToSpec(const Command& cmd)
     case Command::Type::NewLine:     return QStringLiteral("new-line");
     case Command::Type::Space:       return QStringLiteral("space");
     case Command::Type::Punctuation: return QStringLiteral("punctuation:%1").arg(cmd.argument);
+    case Command::Type::TranscribeFile: return QStringLiteral("transcribe-file");
     case Command::Type::Unknown:     break;
     }
     return QString();

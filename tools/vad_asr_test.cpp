@@ -1,17 +1,23 @@
-// vad-asr-test — прогон WAV через БОЕВОЙ путь: ConfigManager -> VoicePipeline
+// vad-asr-test — прогон аудиофайла через БОЕВОЙ путь: ConfigManager -> VoicePipeline
 // (SileroVad -> IRecognizer -> TextPostProcessor), без UI и микрофона.
 //
-//   vad-asr-test <file.wav> --config <settings.ini> [--profile <имя>] [--hotwords <file>]
-//                             [--threads N] [--no-punct] [--notes] [--notes-file <путь>]
+//   vad-asr-test <file> --config <settings.ini> [--profile <имя>] [--hotwords <file>]
+//                       [--threads N] [--no-punct] [--notes] [--notes-file <путь>]
+//                       [--rate N] [--channels N] [--format s16le|s8u|f32le|alaw|ulaw]
 //
-//   vad-asr-test <file.wav> <silero_vad.onnx> transducer <enc> <dec> <joiner> <tokens>
-//                          [hotwords-file] [bpe-vocab]
-//   vad-asr-test <file.wav> <silero_vad.onnx> nemo-ctc <model> <tokens>
-//   vad-asr-test <file.wav> <silero_vad.onnx> whisper <enc> <dec> <tokens> [language]
+//   vad-asr-test <file> <silero_vad.onnx> transducer <enc> <dec> <joiner> <tokens>
+//                       [hotwords-file] [bpe-vocab]
+//   vad-asr-test <file> <silero_vad.onnx> nemo-ctc <model> <tokens>
+//   vad-asr-test <file> <silero_vad.onnx> whisper <enc> <dec> <tokens> [language]
 //
-// WAV: PCM 16 бит, любое число каналов и любая частота (инструмент сам домикширует
-// в моно и передискретизирует в 16 кГц).
+// Форматы — те же, что понимает приложение (общий AudioFileDecoder):
+//   * WAV: PCM 8/16/24/32 бит, float32/64, A-law/μ-law, любые каналы и частота;
+//   * MP3/OGG/FLAC/M4A/AMR… — через системный декодер (QtMultimedia/GStreamer);
+//   * RAW (.raw/.pcm/без расширения) — параметры задают флаги --rate/--channels/
+//     --format (по умолчанию телефонные 8000 Гц, моно, s16le).
+// Всё домикшируется в моно и передискретизируется в 16 кГц.
 
+#include "audio/AudioFileDecoder.h"
 #include "config/ConfigManager.h"
 #include "core/VoicePipeline.h"
 #include "output/FileInjector.h"
@@ -24,116 +30,15 @@
 #include <QStringList>
 #include <QTextStream>
 
-#include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <memory>
 #include <vector>
 
 namespace {
 
 constexpr int kTargetRate = 16000;
-
-struct WavData {
-    std::vector<int16_t> mono;   // уже моно и уже 16 кГц
-    int    sampleRate = 0;       // исходная частота (для справки)
-    int    channels   = 0;
-    int    bits       = 0;
-    double seconds    = 0.0;
-};
-
-inline uint32_t rd32(const char* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
-inline uint16_t rd16(const char* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
-
-bool readWav(const QString& path, WavData& out, QString* error)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        if (error) *error = QStringLiteral("не могу открыть %1").arg(path);
-        return false;
-    }
-    const QByteArray all = f.readAll();
-    const char* p = all.constData();
-    const int size = static_cast<int>(all.size());
-
-    if (size < 44 || std::memcmp(p, "RIFF", 4) != 0 || std::memcmp(p + 8, "WAVE", 4) != 0) {
-        if (error) *error = QStringLiteral("%1: не RIFF/WAVE").arg(path);
-        return false;
-    }
-
-    int channels = 0, sampleRate = 0, bits = 0, format = 0;
-    int dataOff = -1;
-    uint32_t dataLen = 0;
-
-    int pos = 12;
-    while (pos + 8 <= size) {
-        const char* id = p + pos;
-        const uint32_t chunkSize = rd32(p + pos + 4);
-        if (std::memcmp(id, "fmt ", 4) == 0 && pos + 8 + 16 <= size) {
-            format     = rd16(p + pos + 8);
-            channels   = rd16(p + pos + 8 + 2);
-            sampleRate = static_cast<int>(rd32(p + pos + 8 + 4));
-            bits       = rd16(p + pos + 8 + 14);
-        } else if (std::memcmp(id, "data", 4) == 0) {
-            dataOff = pos + 8;
-            // размер в заголовке может врать — режем по фактическому размеру файла
-            dataLen = std::min<uint32_t>(chunkSize, static_cast<uint32_t>(size - pos - 8));
-            break;
-        }
-        pos += 8 + static_cast<int>(chunkSize) + (chunkSize & 1u);
-    }
-
-    if (dataOff < 0) {
-        if (error) *error = QStringLiteral("%1: нет чанка data").arg(path);
-        return false;
-    }
-    if (format != 1 || bits != 16) {
-        if (error) *error = QStringLiteral("%1: нужен PCM 16 бит (format=%2, bits=%3)")
-                                .arg(path).arg(format).arg(bits);
-        return false;
-    }
-    if (channels < 1 || sampleRate < 1) {
-        if (error) *error = QStringLiteral("%1: битые fmt-данные").arg(path);
-        return false;
-    }
-
-    const int frameBytes = channels * 2;
-    const int frames = static_cast<int>(dataLen) / frameBytes;
-
-    std::vector<int16_t> mono(static_cast<size_t>(frames));
-    for (int i = 0; i < frames; ++i) {
-        int32_t acc = 0;
-        for (int c = 0; c < channels; ++c) {
-            acc += static_cast<int16_t>(rd16(p + dataOff + (i * channels + c) * 2));
-        }
-        mono[static_cast<size_t>(i)] = static_cast<int16_t>(acc / channels);
-    }
-
-    out.channels   = channels;
-    out.sampleRate = sampleRate;
-    out.bits       = bits;
-
-    if (sampleRate == kTargetRate) {
-        out.mono = std::move(mono);
-    } else {
-        const double ratio = static_cast<double>(kTargetRate) / static_cast<double>(sampleRate);
-        const size_t dstFrames = static_cast<size_t>(std::llrint(mono.size() * ratio));
-        out.mono.resize(dstFrames);
-        for (size_t i = 0; i < dstFrames; ++i) {
-            const double srcPos = static_cast<double>(i) / ratio;
-            const size_t i0 = static_cast<size_t>(srcPos);
-            const size_t i1 = std::min(i0 + 1, mono.size() - 1);
-            const double frac = srcPos - static_cast<double>(i0);
-            const double v = static_cast<double>(mono[i0]) * (1.0 - frac)
-                           + static_cast<double>(mono[i1]) * frac;
-            out.mono[i] = static_cast<int16_t>(std::llrint(v));
-        }
-    }
-
-    out.seconds = static_cast<double>(out.mono.size()) / static_cast<double>(kTargetRate);
-    return true;
-}
 
 QStringList readLines(const QString& path)
 {
@@ -157,12 +62,13 @@ void usage(const QString& prog)
 {
     std::fprintf(stderr,
         "Usage:\n"
-        "  %s <file.wav> --config <settings.ini> [--profile <name>] [--hotwords <file>]\n"
-        "                [--threads N] [--no-punct] [--notes] [--notes-file <path>]\n"
-        "  %s <file.wav> <silero_vad.onnx> transducer <enc> <dec> <joiner> <tokens>"
+        "  %s <file> --config <settings.ini> [--profile <name>] [--hotwords <file>]\n"
+        "            [--threads N] [--no-punct] [--notes] [--notes-file <path>]\n"
+        "            [--rate N] [--channels N] [--format s16le|s8u|f32le|alaw|ulaw]\n"
+        "  %s <file> <silero_vad.onnx> transducer <enc> <dec> <joiner> <tokens>"
         " [hotwords-file] [bpe-vocab]\n"
-        "  %s <file.wav> <silero_vad.onnx> nemo-ctc <model> <tokens>\n"
-        "  %s <file.wav> <silero_vad.onnx> whisper <enc> <dec> <tokens> [language]\n",
+        "  %s <file> <silero_vad.onnx> nemo-ctc <model> <tokens>\n"
+        "  %s <file> <silero_vad.onnx> whisper <enc> <dec> <tokens> [language]\n",
         qPrintable(prog), qPrintable(prog), qPrintable(prog), qPrintable(prog));
 }
 
@@ -180,14 +86,29 @@ int main(int argc, char** argv)
 
     const QString wavPath = a.at(1);
 
-    WavData wav;
+    // Параметры RAW (PCM без контейнера) разбираем предварительным проходом:
+    // в режиме --config флаги могут стоять где угодно, а positional-режим
+    // их просто не содержит (проход на него не влияет).
+    AudioFileDecoder::RawParams raw;
+    for (int i = 2; i < a.size(); ++i) {
+        if (a.at(i) == QLatin1String("--rate") && i + 1 < a.size()) {
+            raw.sampleRate = a.at(++i).toInt();
+        } else if (a.at(i) == QLatin1String("--channels") && i + 1 < a.size()) {
+            raw.channels = a.at(++i).toInt();
+        } else if (a.at(i) == QLatin1String("--format") && i + 1 < a.size()) {
+            raw.format = AudioFileDecoder::RawParams::formatFromString(a.at(++i));
+        }
+    }
+
+    AudioFileDecoder::Audio wav;
     QString wavError;
-    if (!readWav(wavPath, wav, &wavError)) {
-        std::fprintf(stderr, "WAV error: %s\n", qPrintable(wavError));
+    if (!AudioFileDecoder::decode(wavPath, raw, wav, &wavError)) {
+        std::fprintf(stderr, "Audio error: %s\n", qPrintable(wavError));
         return 1;
     }
-    std::printf("WAV : %s\n      %d Hz, %d ch, %d bit -> %.2f s @ 16 kHz mono\n",
-                qPrintable(wavPath), wav.sampleRate, wav.channels, wav.bits, wav.seconds);
+    std::printf("FILE: %s\n      %d Hz, %d ch, %s -> %.2f s @ 16 kHz mono\n",
+                qPrintable(wavPath), wav.sourceRate, wav.sourceChannels,
+                qPrintable(wav.sourceFormat), wav.seconds());
 
     VoicePipeline::Settings settings;
     QString hotwordsFile;
@@ -218,6 +139,9 @@ int main(int argc, char** argv)
                 settings.text.voicePunctuation    = false;
                 settings.text.capitalizeSentences = false;
                 settings.text.addFinalDot         = false;
+            } else if (k == QLatin1String("--rate") || k == QLatin1String("--channels")
+                       || k == QLatin1String("--format")) {
+                ++i;   // учтены предварительным проходом выше
             } else {
                 std::fprintf(stderr, "неизвестная опция: %s\n", qPrintable(k));
                 usage(a.value(0));
@@ -315,9 +239,9 @@ int main(int argc, char** argv)
     double asrTotalMs = 0.0;
     QElapsedTimer segTimer;
 
-    QObject::connect(&pipeline, &VoicePipeline::rawTextRecognized, [&](const QString& raw) {
+    QObject::connect(&pipeline, &VoicePipeline::rawTextRecognized, [&](const QString& rawText) {
         asrTotalMs += static_cast<double>(segTimer.elapsed());
-        std::printf("  #%d  raw : %s\n", ++segmentIndex, qPrintable(raw));
+        std::printf("  #%d  raw : %s\n", ++segmentIndex, qPrintable(rawText));
         std::fflush(stdout);
     });
     QObject::connect(&pipeline, &VoicePipeline::textReady, [&](const QString& text) {
@@ -357,18 +281,18 @@ int main(int argc, char** argv)
     segTimer.restart();
 
     const int windowBytes = 512 * static_cast<int>(sizeof(int16_t));
-    const int totalBytes  = static_cast<int>(wav.mono.size() * sizeof(int16_t));
-    const char* raw = reinterpret_cast<const char*>(wav.mono.data());
+    const int totalBytes  = static_cast<int>(wav.samples.size() * sizeof(int16_t));
+    const char* rawPcm = reinterpret_cast<const char*>(wav.samples.data());
 
     for (int off = 0; off < totalBytes; off += windowBytes) {
         const int n = std::min(windowBytes, totalBytes - off);
-        pipeline.processAudio(QByteArray(raw + off, n), kTargetRate);
+        pipeline.processAudio(QByteArray(rawPcm + off, n), kTargetRate);
     }
     pipeline.flush();
 
     std::printf("\nSegments: %d | audio %.2f s | wall %.0f ms | ASR %.0f ms | RTF %.2f\n",
-                segmentIndex, wav.seconds, static_cast<double>(total.elapsed()), asrTotalMs,
-                wav.seconds > 0.0 ? (asrTotalMs / 1000.0) / wav.seconds : 0.0);
+                segmentIndex, wav.seconds(), static_cast<double>(total.elapsed()), asrTotalMs,
+                wav.seconds() > 0.0 ? (asrTotalMs / 1000.0) / wav.seconds() : 0.0);
 
     if (notesOut) {
         std::printf("Notes : %lld записей -> %s\n",

@@ -1,8 +1,10 @@
 #include "ui/TrayIcon.h"
 #include "core/ApplicationController.h"
+#include "audio/AudioFileDecoder.h"
 #include "config/AsrProfile.h"
 #include "config/ConfigManager.h"
 #include "ui/ModelDownloadDialog.h"
+#include "ui/RawParamsDialog.h"
 #include "ui/SettingsDialog.h"
 
 #include <QDebug>
@@ -10,7 +12,12 @@
 #include <QAction>
 #include <QApplication>
 #include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
+#include <QProgressDialog>
+#include <QStandardPaths>
 #include <QUrl>
 #include <QIcon>
 #include <QMenu>
@@ -66,6 +73,18 @@ void TrayIcon::buildMenu()
             m_controller->setMode(mode);
         });
     }
+
+    // --- Разбор аудиофайла: выбрать запись -> расшифровать -> вставить ---
+    // Тот же сценарий запускается голосом: «разбери файл» / «расшифруй запись».
+    m_transcribeAction = menu->addAction(tr("Разобрать аудиофайл…"));
+    m_transcribeAction->setToolTip(
+        tr("Выбрать запись (WAV, MP3, RAW, …) и вставить расшифровку в окно, "
+           "которое было активно до открытия диалога (или в файл заметок)"));
+    connect(m_transcribeAction, &QAction::triggered, this, [this]() {
+        if (m_controller) {
+            m_controller->requestFileTranscription();
+        }
+    });
 
     // --- Проверка микрофона: запись тракта в WAV ---
     m_micCheckAction = menu->addAction(tr("Проверить микрофон (запись в WAV)"));
@@ -128,6 +147,27 @@ void TrayIcon::connectSignals()
             this, &TrayIcon::onError);
     connect(m_controller, &ApplicationController::outputTargetChanged,
             this, &TrayIcon::onOutputTargetChanged);
+
+    // --- разбор аудиофайла ---
+    connect(m_controller, &ApplicationController::transcribeFileRequested,
+            this, &TrayIcon::onTranscribeFileRequested);
+    // Пока файл разбирается, повторный запуск не имеет смысла — пункт гаснет.
+    connect(m_controller, &ApplicationController::fileTranscriptionStarted,
+            this, [this](const QString&) {
+        if (m_transcribeAction) m_transcribeAction->setEnabled(false);
+    });
+    connect(m_controller, &ApplicationController::fileTranscriptionFinished,
+            this, [this](const QString&, const QString&, int) {
+        if (m_transcribeAction) m_transcribeAction->setEnabled(true);
+    });
+    connect(m_controller, &ApplicationController::fileTranscriptionFailed,
+            this, [this](const QString&, const QString&) {
+        if (m_transcribeAction) m_transcribeAction->setEnabled(true);
+    });
+    connect(m_controller, &ApplicationController::fileTranscriptionCancelled,
+            this, [this](const QString&) {
+        if (m_transcribeAction) m_transcribeAction->setEnabled(true);
+    });
 
     // Запись микрофона завершена — сообщаем, куда лёг файл
     connect(m_controller, &ApplicationController::micCheckFinished,
@@ -202,6 +242,131 @@ void TrayIcon::onError(const QString& message)
         // нет лотка (чистый WM, ssh) — хотя бы в лог
         qWarning().noquote() << message;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Разбор аудиофайла: диалог выбора -> (RAW: параметры) -> старт -> прогресс
+// ---------------------------------------------------------------------------
+
+void TrayIcon::onTranscribeFileRequested(const QString& targetWindowId)
+{
+    if (!m_controller) {
+        return;
+    }
+
+    ConfigManager cfg;
+    AudioFileDecoder::RawParams saved;
+    saved.sampleRate = cfg.transcribeRawRate();
+    saved.channels   = cfg.transcribeRawChannels();
+    saved.format     = AudioFileDecoder::RawParams::formatFromString(cfg.transcribeRawFormat());
+
+    QString startDir = cfg.transcribeLastDir();
+    if (startDir.isEmpty() || !QDir(startDir).exists()) {
+        startDir = QStandardPaths::writableLocation(QStandardPaths::HomeLocation);
+    }
+
+    // Системный диалог выбора файла. Родителя нет (трей-приложение без окна);
+    // окно-цель для вставки уже запомнено контроллером ДО этого диалога,
+    // поэтому переезд фокуса сюда результату не мешает.
+    const QString path = QFileDialog::getOpenFileName(
+        nullptr, tr("Аудиофайл для разбора"), startDir,
+        AudioFileDecoder::fileDialogFilter());
+    if (path.isEmpty()) {
+        return;   // отмена выбора — ничего не делаем
+    }
+    cfg.setTranscribeLastDir(QFileInfo(path).absolutePath());
+
+    AudioFileDecoder::RawParams params = saved;
+    if (AudioFileDecoder::isRawExtension(path)) {
+        // RAW без контейнера: параметры неоткуда прочитать — спрашиваем.
+        // Выбор запоминается в [transcribe] и предлагается в следующий раз.
+        RawParamsDialog dlg(saved, path);
+        if (dlg.exec() != QDialog::Accepted) {
+            return;
+        }
+        params = dlg.params();
+        cfg.setTranscribeRawRate(params.sampleRate);
+        cfg.setTranscribeRawChannels(params.channels);
+        cfg.setTranscribeRawFormat(
+            AudioFileDecoder::RawParams::formatToString(params.format));
+    }
+
+    if (!m_controller->startFileTranscription(path, targetWindowId, params)) {
+        onError(m_controller->lastError());
+        return;
+    }
+
+    // Модальный прогресс с отменой. Живёт до первого терминального сигнала;
+    // соединения привязаны к pd как контексту — после deleteLater разрываются
+    // сами, утечек подписок нет.
+    auto* pd = new QProgressDialog(tr("Читаю аудиофайл…"), tr("Отмена"), 0, 100);
+    pd->setWindowTitle(tr("Разбор аудиофайла"));
+    pd->setLabelText(tr("Начинаю: %1").arg(QFileInfo(path).fileName()));
+    pd->setWindowModality(Qt::ApplicationModal);
+    pd->setMinimumDuration(0);
+    pd->setAutoClose(false);
+    pd->setAutoReset(false);
+    pd->setValue(0);
+    pd->show();
+
+    connect(m_controller, &ApplicationController::fileTranscriptionProgress, pd,
+            [pd](int percent, const QString& stage) {
+        pd->setValue(percent);
+        pd->setLabelText(stage);
+    });
+    connect(pd, &QProgressDialog::canceled, this, [this]() {
+        if (m_controller) {
+            m_controller->cancelFileTranscription();
+        }
+    });
+
+    connect(m_controller, &ApplicationController::fileTranscriptionFinished, pd,
+            [this, pd, path](const QString& p, const QString& text, int segments) {
+        if (p != path) {
+            return;
+        }
+        pd->close();
+        pd->deleteLater();
+        const bool notes = m_controller
+            && m_controller->outputTarget() == OutputTarget::Notes;
+        const QString where = notes
+            ? tr("Текст дописан в файл заметок.")
+            : tr("Текст вставлен в целевое окно.");
+        const QString preview = text.length() > 200
+            ? text.left(200) + QStringLiteral("…")
+            : text;
+        const QString msg = tr("Сегментов: %1, символов: %2.\n%3\n\n%4")
+                                .arg(segments).arg(text.size()).arg(where, preview);
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Аудиофайл разобран"), msg,
+                        QSystemTrayIcon::Information, 15000);
+        } else {
+            qInfo().noquote() << msg;
+        }
+    });
+
+    connect(m_controller, &ApplicationController::fileTranscriptionFailed, pd,
+            [this, pd, path](const QString& p, const QString& error) {
+        if (p != path) {
+            return;
+        }
+        pd->close();
+        pd->deleteLater();
+        onError(tr("Разбор файла не удался:\n%1").arg(error));
+    });
+
+    connect(m_controller, &ApplicationController::fileTranscriptionCancelled, pd,
+            [this, pd, path](const QString& p) {
+        if (p != path) {
+            return;
+        }
+        pd->close();
+        pd->deleteLater();
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Разбор файла"), tr("Отменено."),
+                        QSystemTrayIcon::Information, 5000);
+        }
+    });
 }
 
 // --- Слоты ---

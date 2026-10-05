@@ -603,3 +603,54 @@ int ConfigManager::typingGuardMs() const
     const int v = m_settings.value(QStringLiteral("audio/typing_guard_ms"), 0).toInt();
     return (v < 0) ? 0 : v;
 }
+
+// ---------------------------------------------------------------------------
+// Разбор аудиофайла («разбери файл» / --transcribe)
+// ---------------------------------------------------------------------------
+
+int ConfigManager::transcribeRawRate() const
+{
+    const int v = m_settings.value(QStringLiteral("transcribe/raw_rate"), 8000).toInt();
+    return (v >= 1000 && v <= 384000) ? v : 8000;
+}
+
+int ConfigManager::transcribeRawChannels() const
+{
+    const int v = m_settings.value(QStringLiteral("transcribe/raw_channels"), 1).toInt();
+    return (v >= 1 && v <= 8) ? v : 1;
+}
+
+QString ConfigManager::transcribeRawFormat() const
+{
+    return m_settings.value(QStringLiteral("transcribe/raw_format"), QStringLiteral("s16le"))
+        .toString().trimmed().toLower();
+}
+
+QString ConfigManager::transcribeLastDir() const
+{
+    return m_settings.value(QStringLiteral("transcribe/last_dir")).toString().trimmed();
+}
+
+void ConfigManager::setTranscribeRawRate(int rate)
+{
+    m_settings.setValue(QStringLiteral("transcribe/raw_rate"), rate);
+    m_settings.sync();
+}
+
+void ConfigManager::setTranscribeRawChannels(int channels)
+{
+    m_settings.setValue(QStringLiteral("transcribe/raw_channels"), channels);
+    m_settings.sync();
+}
+
+void ConfigManager::setTranscribeRawFormat(const QString& format)
+{
+    m_settings.setValue(QStringLiteral("transcribe/raw_format"), format);
+    m_settings.sync();
+}
+
+void ConfigManager::setTranscribeLastDir(const QString& dir)
+{
+    m_settings.setValue(QStringLiteral("transcribe/last_dir"), dir);
+    m_settings.sync();
+}

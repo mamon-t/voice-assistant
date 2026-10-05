@@ -9,6 +9,7 @@
 #include "commands/CommandParser.h"
 #include "config/ConfigManager.h"
 #include "config/HotwordsManager.h"
+#include "core/FileTranscriber.h"
 #include "core/VoicePipeline.h"
 #include "output/FileInjector.h"
 #include "output/XdotoolInjector.h"
@@ -20,6 +21,8 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QThread>
 #include <cmath>
 #include <cstdint>
 
@@ -183,6 +186,14 @@ bool ApplicationController::isReady() const
 ApplicationController::~ApplicationController()
 {
     stopRecording();
+    // Разбор файла мог идти в момент выхода: просим отмену и ждём рабочий
+    // поток. Ждём недолго — cancel проверяется в цикле подачи каждые ~0.5 с,
+    // но загрузка модели (1–3 с) неделима; terminate() — крайний случай,
+    // процесс всё равно завершается.
+    if (m_transcriber) {
+        m_transcriber->requestCancel();
+    }
+    cleanupTranscriber();
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +897,16 @@ void ApplicationController::executeCommand(const Command& cmd)
         return;
     }
 
+    // «Разбери файл» — тоже маршрутизация (запускает отдельный сценарий),
+    // а не правка текста: обязана работать в диктовке. Диктовку останавливаем:
+    // пока открыт диалог выбора файла, микрофон не должен продолжать вставлять
+    // в редактор всё, что слышит.
+    if (cmd.type == Command::Type::TranscribeFile) {
+        emit commandExecuted(desc);
+        requestFileTranscription();
+        return;
+    }
+
     // Правка текста в режиме диктовки по умолчанию запрещена: иначе продиктованное
     // «удали слово» съедало бы само себя. Включается [commands] editing_in_dictation=true.
     if (m_mode == Mode::Dictation && !m_editCmdsInDictation) {
@@ -924,6 +945,7 @@ void ApplicationController::executeCommand(const Command& cmd)
         break;
     case Command::Type::SetMode:
     case Command::Type::SetTarget:
+    case Command::Type::TranscribeFile:
     case Command::Type::Unknown:
         break;
     }
@@ -1030,6 +1052,27 @@ ITextInjector* ApplicationController::activeInjector() const
 // Привязка вставки к окну и глушитель печати
 // ---------------------------------------------------------------------------
 
+bool ApplicationController::isOwnWindow(const QString& windowId) const
+{
+    if (windowId.isEmpty()) {
+        return false;
+    }
+    const QString cls = XdotoolInjector::windowClass(windowId);
+    const QStringList own = m_config ? m_config->ownWindowClasses() : QStringList();
+    const qint64 pid = XdotoolInjector::windowPid(windowId);
+    return (!cls.isEmpty() && own.contains(cls))
+        || (pid != 0 && pid == QCoreApplication::applicationPid());
+}
+
+QString ApplicationController::currentForeignWindowId() const
+{
+    const QString wid = XdotoolInjector::activeWindowId();
+    if (wid.isEmpty() || isOwnWindow(wid)) {
+        return QString();
+    }
+    return wid;
+}
+
 void ApplicationController::captureTargetWindow()
 {
     if (!m_pinWindow) {
@@ -1056,12 +1099,8 @@ void ApplicationController::captureTargetWindow()
     // уезжает в меню, которое закрывается через мгновение вместе с текстом:
     // в логе при этом «успех», а в редакторе ничего. Окна помощника узнаём по
     // WM_CLASS ([output] own_window_class) и по PID собственного процесса.
-    const QString cls = XdotoolInjector::windowClass(wid);
-    const QStringList own = m_config ? m_config->ownWindowClasses() : QStringList();
-    const qint64 pid = XdotoolInjector::windowPid(wid);
-    const bool isSelf = (!cls.isEmpty() && own.contains(cls))
-                        || (pid != 0 && pid == QCoreApplication::applicationPid());
-    if (isSelf) {
+    if (isOwnWindow(wid)) {
+        const QString cls = XdotoolInjector::windowClass(wid);
         qWarning().noquote()
             << QStringLiteral("pin_window: активное окно %1 принадлежит самому помощнику "
                               "(WM_CLASS=%2, pid=%3) — привязка НЕ установлена, текст пойдёт "
@@ -1069,7 +1108,7 @@ void ApplicationController::captureTargetWindow()
                               "Начинайте запись хоткеем (%4), а не кликом по меню трея.")
                    .arg(XdotoolInjector::describeWindow(wid),
                         cls.isEmpty() ? QStringLiteral("?") : cls)
-                   .arg(pid)
+                   .arg(XdotoolInjector::windowPid(wid))
                    .arg(m_config ? m_config->hotkeyKey() : QStringLiteral("хоткей"));
         xdotool->clearPinnedWindow();
         m_pinnedWindow.clear();
@@ -1085,4 +1124,246 @@ void ApplicationController::onKeyActivity()
     if (m_typingGuard.isEnabled()) {
         m_typingGuard.noteKeyActivity(m_clock.elapsed());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Разбор аудиофайла («разбери файл» / пункт меню лотка / --transcribe из GUI)
+// ---------------------------------------------------------------------------
+
+bool ApplicationController::isTranscribing() const
+{
+    return m_transcriber != nullptr;
+}
+
+void ApplicationController::requestFileTranscription()
+{
+    if (isTranscribing()) {
+        reportError(QStringLiteral("Файл уже разбирается (%1) — дождитесь окончания "
+                                   "или отмените")
+                        .arg(m_transcribeFile));
+        return;
+    }
+
+    // Диктовку останавливаем ДО диалога выбора файла: иначе в toggle-режиме
+    // микрофон продолжит ловить речь и вставлять её в редактор, пока
+    // пользователь выбирает файл.
+    if (m_mode != Mode::Off) {
+        stopRecording();
+    }
+
+    // Окно-цель запоминаем СЕЙЧАС: после открытия диалога (наше собственное
+    // окно) активным станет он, а после закрытия фокус непредсказуем.
+    const QString wid = currentForeignWindowId();
+    if (wid.isEmpty()) {
+        qWarning().noquote()
+            << QStringLiteral("Разбор файла: чужое активное окно не определено — "
+                              "результат пойдёт в окно, которое будет в фокусе "
+                              "после закрытия диалогов");
+    } else {
+        qInfo().noquote() << QStringLiteral("Разбор файла: цель — %1")
+                                 .arg(XdotoolInjector::describeWindow(wid));
+    }
+    emit transcribeFileRequested(wid);
+}
+
+bool ApplicationController::startFileTranscription(const QString& filePath,
+                                                   const QString& targetWindowId,
+                                                   const AudioFileDecoder::RawParams& rawParams)
+{
+    if (isTranscribing()) {
+        reportError(QStringLiteral("Файл уже разбирается (%1)").arg(m_transcribeFile));
+        return false;
+    }
+    if (!QFileInfo::exists(filePath)) {
+        reportError(QStringLiteral("Нет файла: %1").arg(filePath));
+        return false;
+    }
+    if (!m_config) {
+        reportError(QStringLiteral("Конфигурация недоступна"));
+        return false;
+    }
+
+    // Настройки конвейера — как у диктовки (активный профиль ASR, VAD,
+    // постобработка). Отдельный VoicePipeline создаётся уже в рабочем потоке
+    // (FileTranscriber::run), поэтому диктующий тракт не трогается.
+    VoicePipeline::Settings settings = VoicePipeline::loadSettings(*m_config);
+
+    auto* transcriber = new FileTranscriber(filePath, settings, rawParams);
+    // Пользовательские подсказки (имена, термины) помогают и здесь; фразы
+    // команд НЕ примешиваем — в часовой записи буст «удали слово» только вредит.
+    transcriber->setUserHotwords(m_hotwords ? m_hotwords->allHotwords() : QStringList(),
+                                 m_config->hotwordsScore());
+
+    auto* thread = new QThread();
+    thread->setObjectName(QStringLiteral("file-transcriber"));
+    transcriber->moveToThread(thread);
+
+    // Поток started -> run() (вызов уже в рабочем потоке, авто-соединение
+    // становится прямым: transcriber живёт в этом потоке).
+    connect(thread, &QThread::started, transcriber, &FileTranscriber::run);
+
+    // Ретрансляция прогресса в UI (сигналы приходят очередью — потоки разные).
+    connect(transcriber, &FileTranscriber::progress,
+            this, &ApplicationController::fileTranscriptionProgress);
+    connect(transcriber, &FileTranscriber::succeeded,
+            this, &ApplicationController::onFileTranscriptionSucceeded);
+    connect(transcriber, &FileTranscriber::failed,
+            this, &ApplicationController::onFileTranscriptionFailed);
+    connect(transcriber, &FileTranscriber::cancelled,
+            this, &ApplicationController::onFileTranscriptionCancelled);
+
+    m_transcriber           = transcriber;
+    m_transcribeThread      = thread;
+    m_transcribeFile        = filePath;
+    m_transcribeTargetWindow = targetWindowId;
+
+    thread->start();
+    qInfo().noquote() << QStringLiteral("Разбор файла начат: %1 (профиль ASR: %2)")
+                             .arg(filePath, settings.asr.name);
+    emit fileTranscriptionStarted(filePath);
+    return true;
+}
+
+void ApplicationController::cancelFileTranscription()
+{
+    if (m_transcriber) {
+        m_transcriber->requestCancel();
+        qInfo().noquote() << QStringLiteral("Разбор файла: запрошена отмена (%1)")
+                                 .arg(m_transcribeFile);
+    }
+}
+
+void ApplicationController::cleanupTranscriber()
+{
+    if (m_transcribeThread) {
+        m_transcribeThread->quit();
+        // run() проверяет флаг отмены каждые ~0.5 с; неделима только загрузка
+        // модели (1–3 с). Если поток за 8 с не остановился (патологический
+        // случай — например, зависший системный декодер), прерываем жёстко.
+        if (!m_transcribeThread->wait(8000)) {
+            qWarning().noquote()
+                << QStringLiteral("Разбор файла: рабочий поток не остановился за 8 с — "
+                                  "прерываю жёстко");
+            m_transcribeThread->terminate();
+            m_transcribeThread->wait(2000);
+        }
+        delete m_transcribeThread;
+        m_transcribeThread = nullptr;
+    }
+    if (m_transcriber) {
+        // Поток остановлен, событий больше не будет — удаляем напрямую
+        // (deleteLater не сработал бы: event loop потока уже мёртв).
+        delete m_transcriber;
+        m_transcriber = nullptr;
+    }
+}
+
+void ApplicationController::onFileTranscriptionSucceeded(const QString& text, int segments,
+                                                         double audioSeconds, double wallMs)
+{
+    const QString filePath = m_transcribeFile;
+    const QString targetWindow = m_transcribeTargetWindow;
+    cleanupTranscriber();
+
+    qInfo().noquote() << QStringLiteral("Разбор файла завершён: %1 — сегментов: %2, "
+                                        "аудио %3 с, затрачено %4 мс (RTF %5)")
+                             .arg(filePath)
+                             .arg(segments)
+                             .arg(audioSeconds, 0, 'f', 1)
+                             .arg(wallMs, 0, 'f', 0)
+                             .arg(audioSeconds > 0.0 ? wallMs / 1000.0 / audioSeconds : 0.0,
+                                  0, 'f', 2);
+
+    if (text.trimmed().isEmpty()) {
+        emit fileTranscriptionFailed(
+            filePath,
+            QStringLiteral("Речь не найдена: VAD не услышал ни одного сегмента. "
+                           "Для тихих/шумных записей попробуйте профиль GigaAM v3 "
+                           "или проверьте параметры RAW (частота/кодирование)."));
+        return;
+    }
+
+    // --- доставка результата: та же цель вывода, что и у диктовки ---
+    if (m_target == OutputTarget::Notes) {
+        if (!m_notes || !m_notes->isAvailable()) {
+            emit fileTranscriptionFailed(
+                filePath,
+                QStringLiteral("Заметки недоступны ([notes] enabled=false или нет прав) — "
+                               "результат не записан"));
+            return;
+        }
+        if (!m_notes->typeText(text)) {
+            emit fileTranscriptionFailed(filePath, m_notes->lastError());
+            return;
+        }
+        qInfo().noquote() << QStringLiteral("Разбор файла -> заметки: %1")
+                                 .arg(m_notes->filePath());
+        emit noteWritten(m_notes->filePath(), text);
+        emit fileTranscriptionFinished(filePath, text, segments);
+        return;
+    }
+
+    if (!m_injector || !m_injector->isAvailable()) {
+        emit fileTranscriptionFailed(
+            filePath, QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
+        return;
+    }
+
+    // Вставка в окно, запомненное ДО диалога выбора файла. Механизм тот же,
+    // что у pin_window (pin_mode=activate активирует окно, печатает
+    // настоящими событиями и возвращает фокус), но привязка временная:
+    // после вставки прежнее состояние инжектора восстанавливается.
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    const QString previousPin = xdotool ? xdotool->pinnedWindow() : QString();
+    if (xdotool) {
+        if (!targetWindow.isEmpty() && XdotoolInjector::windowExists(targetWindow)) {
+            xdotool->setPinnedWindow(targetWindow);
+        } else if (!targetWindow.isEmpty()) {
+            qWarning().noquote()
+                << QStringLiteral("Разбор файла: окно %1 закрыто — текст пойдёт "
+                                  "в активное окно").arg(targetWindow);
+        }
+    }
+
+    const bool ok = m_injector->typeText(text);
+    const QString injectorError = xdotool ? xdotool->lastError() : QString();
+
+    if (xdotool) {
+        if (previousPin.isEmpty()) {
+            xdotool->clearPinnedWindow();
+        } else {
+            xdotool->setPinnedWindow(previousPin);
+        }
+    }
+
+    if (!ok) {
+        emit fileTranscriptionFailed(
+            filePath,
+            QStringLiteral("Текст распознан (%1 сегментов), но вставить не удалось: %2")
+                .arg(segments)
+                .arg(injectorError.isEmpty() ? QStringLiteral("неизвестная ошибка")
+                                             : injectorError));
+        return;
+    }
+    emit fileTranscriptionFinished(filePath, text, segments);
+}
+
+void ApplicationController::onFileTranscriptionFailed(const QString& error)
+{
+    const QString filePath = m_transcribeFile;
+    cleanupTranscriber();
+    qWarning().noquote() << QStringLiteral("Разбор файла не удался (%1): %2")
+                                .arg(filePath, error);
+    // Только специализированный сигнал (не reportError): UI показывает
+    // уведомление по fileTranscriptionFailed, иначе пользователь получил бы
+    // два всплывающих окна об одной и той же ошибке.
+    emit fileTranscriptionFailed(filePath, error);
+}
+
+void ApplicationController::onFileTranscriptionCancelled()
+{
+    const QString filePath = m_transcribeFile;
+    cleanupTranscriber();
+    qInfo().noquote() << QStringLiteral("Разбор файла отменён: %1").arg(filePath);
+    emit fileTranscriptionCancelled(filePath);
 }

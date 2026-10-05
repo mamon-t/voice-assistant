@@ -1,4 +1,4 @@
-# CLI-стенд: прогоняет WAV через боевой путь ConfigManager -> VoicePipeline
+# CLI-стенд: прогоняет аудиофайл через боевой путь ConfigManager -> VoicePipeline
 # (SileroVad -> IRecognizer -> TextPostProcessor) без UI и микрофона.
 # Собирается только если каталог tools/ существует (см. корневой CMakeLists.txt).
 
@@ -16,6 +16,9 @@ add_executable(vad-asr-test
     # цель вывода «заметки» (--notes): тот же FileInjector, что и в приложении.
     # Зависит только от QtCore, поэтому список библиотек ниже менять не нужно.
     ${CMAKE_SOURCE_DIR}/src/output/FileInjector.cpp
+    # чтение аудиофайлов (WAV/RAW/MP3…) — общий с приложением декодер;
+    # для сжатых форматов нужен Qt5::Multimedia (QAudioDecoder).
+    ${CMAKE_SOURCE_DIR}/src/audio/AudioFileDecoder.cpp
 
     # header-only / Q_OBJECT заголовки: без них в списке источников AUTOMOC
     # не сгенерирует moc_*.cpp и линковка упадёт на vtable
@@ -29,8 +32,20 @@ target_include_directories(vad-asr-test PRIVATE
     ${SHERPA_ONNX_INCLUDE_DIR}
 )
 
+# Подавление GStreamer-CRITICAL (HAVE_GLIB) — то же, что в voice-assistant-core:
+# AudioFileDecoder.cpp компилируется в этот бинарник напрямую.
+if(GLIB_FOUND)
+    target_compile_definitions(vad-asr-test PRIVATE HAVE_GLIB=1)
+    target_include_directories(vad-asr-test PRIVATE ${GLIB_INCLUDE_DIRS})
+    if(GLIB_LIBRARY_DIRS)
+        target_link_directories(vad-asr-test PRIVATE ${GLIB_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(vad-asr-test PRIVATE ${GLIB_LIBRARIES})
+endif()
+
 target_link_libraries(vad-asr-test PRIVATE
     Qt5::Core
+    Qt5::Multimedia
     ${SHERPA_ONNX_CXX_LIBRARY}
     ${SHERPA_ONNX_C_LIBRARY}
 )

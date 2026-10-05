@@ -45,6 +45,8 @@ bool parseCommandSpec(const QString& spec, Command* out)
     } else if (type == QLatin1String("punctuation")) {
         if (arg.isEmpty()) return false;
         *out = Command::punctuation(arg);
+    } else if (type == QLatin1String("transcribe-file")) {
+        *out = Command::transcribeFile();
     } else {
         return false;
     }
@@ -121,6 +123,20 @@ void CommandDictionary::loadDefaults()
     addCommand(QStringLiteral("точка с запятой"),        Command::punctuation(QStringLiteral(";")));
     addCommand(QStringLiteral("тире"),                   Command::punctuation(QStringLiteral("—")));
     addCommand(QStringLiteral("дефис"),                  Command::punctuation(QStringLiteral("-")));
+
+    // --- разбор аудиофайла ---
+    // Как и смена режима/цели, это маршрутизация, а не правка текста: работает
+    // в любом режиме, включая диктовку с editing_in_dictation=false. По команде
+    // диктовка останавливается, UI открывает системный диалог выбора файла,
+    // а расшифровка вставляется в окно, активное ДО диалога (или в заметки).
+    addCommand(QStringLiteral("разбери файл"),           Command::transcribeFile());
+    addCommand(QStringLiteral("разбери аудиофайл"),      Command::transcribeFile());
+    addCommand(QStringLiteral("разбери запись"),         Command::transcribeFile());
+    addCommand(QStringLiteral("распознай файл"),         Command::transcribeFile());
+    addCommand(QStringLiteral("распознай аудиофайл"),    Command::transcribeFile());
+    addCommand(QStringLiteral("расшифруй файл"),         Command::transcribeFile());
+    addCommand(QStringLiteral("расшифруй аудиофайл"),    Command::transcribeFile());
+    addCommand(QStringLiteral("расшифруй запись"),       Command::transcribeFile());
 }
 
 bool CommandDictionary::parseLine(const QString& line, QString* phrase, Command* cmd,
@@ -153,7 +169,8 @@ bool CommandDictionary::parseLine(const QString& line, QString* phrase, Command*
         if (error) {
             *error = QStringLiteral("неизвестный тип '%1' (доступны: set-mode:{dictation|edit|"
                                     "spellcheck|off}, set-target:{focus|notes}, delete-word, "
-                                    "delete-line, new-line, space, punctuation:<символ>)").arg(spec);
+                                    "delete-line, new-line, space, punctuation:<символ>, "
+                                    "transcribe-file)").arg(spec);
         }
         return false;
     }

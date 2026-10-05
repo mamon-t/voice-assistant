@@ -116,6 +116,19 @@ public:
     QString micCheckSource() const;     // [audio] mic_check_source: agc | raw
     QString micCheckPrefix() const;     // [audio] mic_check_prefix
 
+    // --- разбор аудиофайла («разбери файл» / --transcribe) ---
+    // Параметры RAW (PCM без контейнера): из файла их прочитать нельзя,
+    // поэтому есть значения по умолчанию (телефонные 8000 Гц, моно, s16le),
+    // а GUI-диалог запоминает последний выбор обратно в ini.
+    int     transcribeRawRate() const;      // [transcribe] raw_rate, 8000
+    int     transcribeRawChannels() const;  // [transcribe] raw_channels, 1
+    QString transcribeRawFormat() const;    // [transcribe] raw_format: s16le|s8u|f32le|alaw|ulaw
+    QString transcribeLastDir() const;      // [transcribe] last_dir — каталог диалога выбора
+    void setTranscribeRawRate(int rate);
+    void setTranscribeRawChannels(int channels);
+    void setTranscribeRawFormat(const QString& format);
+    void setTranscribeLastDir(const QString& dir);
+
     // --- глобальный хоткей микрофона ---
     QString hotkeyBackend() const;      // [hotkey] backend: evdev | off
     QString hotkeyKey() const;          // [hotkey] key: KEY_F8, ctrl+space, ...

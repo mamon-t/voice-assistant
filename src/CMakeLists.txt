@@ -46,6 +46,26 @@ else()
         "   После этого пересоберите: cd build && cmake .. && make -j4")
 endif()
 
+# ---------------------------------------------------------------------------
+# glib-2.0 (переменные GLIB_* определены в корневом CMakeLists.txt) — только
+# заголовки, линковка не нужна: g_log_set_handler уже внутри libglib-2.0.so,
+# которую тянет Qt5::Core. Подавляет GStreamer-CRITICAL-шторм при декодировании
+# аудиофайлов (HAVE_GLIB в audio/AudioFileDecoder.cpp).
+# ---------------------------------------------------------------------------
+if(GLIB_FOUND)
+    target_compile_definitions(voice-assistant-core PRIVATE HAVE_GLIB=1)
+    target_include_directories(voice-assistant-core PRIVATE ${GLIB_INCLUDE_DIRS})
+    # Линковка ОБЯЗАТЕЛЬНА и PUBLIC: g_log_set_handler живёт в libglib-2.0.so,
+    # а Qt5::Core её в команду линковки не протаскивает — без явной ссылки
+    # «undefined reference to g_log_remove_handler, DSO missing from command
+    # line» (поймано сборкой). PUBLIC — символы нужны и бинарнику, который
+    # линкует core статически.
+    if(GLIB_LIBRARY_DIRS)
+        target_link_directories(voice-assistant-core PUBLIC ${GLIB_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(voice-assistant-core PUBLIC ${GLIB_LIBRARIES})
+endif()
+
 # ONNX Runtime не линкуем намеренно — он уже внутри libsherpa-onnx-c-api.so
 target_link_libraries(voice-assistant-core PUBLIC
     Qt5::Core

@@ -38,6 +38,27 @@ if(NOT SHERPA_ONNX_INCLUDE_DIR OR NOT SHERPA_ONNX_CXX_LIBRARY OR NOT SHERPA_ONNX
         "libsherpa-onnx-cxx-api.so, libsherpa-onnx-c-api.so")
 endif()
 
+# ---------------------------------------------------------------------------
+# glib-2.0 — НЕОБЯЗАТЕЛЬНАЯ зависимость сборки. Нужна только затем, чтобы
+# глушить шторм «GStreamer-CRITICAL … assertion 'GST_IS_SAMPLE' failed»,
+# который Qt5 GStreamer-бэкенд устраивает при уничтожении QAudioDecoder
+# (см. комментарий в src/audio/AudioFileDecoder.cpp, HAVE_GLIB). Заголовки
+# почти всегда уже есть: qtmultimedia5-dev тянет libgstreamer1.0-dev, а тот —
+# libglib2.0-dev. Нет glib — код соберётся без подавления (мусор в stderr).
+# Переменные GLIB_* видны в src/ и tools/ (определение до add_subdirectory).
+# ---------------------------------------------------------------------------
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GLIB QUIET glib-2.0)
+endif()
+if(GLIB_FOUND)
+    message(STATUS "glib-2.0 ${GLIB_VERSION}: найден — GStreamer-CRITICAL при "
+                   "декодировании файлов будет подавлен")
+else()
+    message(STATUS "glib-2.0 не найден — сборка без подавления GStreamer-CRITICAL "
+                   "(косметика: мусор в stderr при разборе mp3/ogg)")
+endif()
+
 message(STATUS "sherpa-onnx include : ${SHERPA_ONNX_INCLUDE_DIR}")
 message(STATUS "sherpa-onnx cxx lib : ${SHERPA_ONNX_CXX_LIBRARY}")
 message(STATUS "sherpa-onnx c   lib : ${SHERPA_ONNX_C_LIBRARY}")
@@ -188,9 +209,11 @@ Silero VAD + zipformer-ru / GigaAM / Whisper через sherpa-onnx. Глоба�
 хоткей через evdev (X11, Wayland, TTY), вставка в любое окно X11 (буфер обмена
 + Ctrl+V или xdotool, с привязкой к окну начала записи), голосовые команды
 правки и пунктуация, проверка правописания hunspell, вторая цель вывода —
-файл заметок (диктовка не мешает печатать руками). Модели (~110 МБ)
-скачиваются при первом запуске из меню лотка или командой
-voice-assistant --download-model zipformer-ru.")
+файл заметок (диктовка не мешает печатать руками). Разбор аудиофайлов:
+команда «разбери файл» или пункт меню открывает выбор записи (WAV, MP3,
+RAW/телефонные G.711 и др.) и вставляет расшифровку в редактор; из консоли —
+voice-assistant --transcribe. Модели (~110 МБ) скачиваются при первом запуске
+из меню лотка или командой voice-assistant --download-model zipformer-ru.")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
 set(CPACK_STRIP_FILES TRUE)
 
@@ -201,8 +224,14 @@ set(CPACK_DEBIAN_PACKAGE_SECTION "sound")
 # сборка под 22.04 не удовлетворила бы зависимость на 22.04+24.04 сразу).
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libc6, libstdc++6, libqt5core5a, libqt5gui5, libqt5widgets5, libqt5multimedia5, libqt5dbus5, libqt5network5, xdotool, xclip, x11-utils")
+# libqt5multimedia5-plugins + gstreamer-плагины — для разбора СЖАТЫХ форматов
+# (MP3/OGG/FLAC/M4A) через QAudioDecoder. В Recommends, а не Depends: WAV и RAW
+# работают без них, а на дистрибутивах без этих пакетов установка не должна
+# ломаться. В Linux Mint/Ubuntu мультимедиа-кодеки обычно уже стоят.
+# ВАЖНО: без libqt5multimedia5-plugins QAudioDecoder не находит сервис
+# («no service found for org.qt-project.qt.audiodecode») — грабля №34.
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS
-    "hunspell-ru, x11-xkb-utils, pulseaudio")
+    "hunspell-ru, x11-xkb-utils, pulseaudio, libqt5multimedia5-plugins, gstreamer1.0-plugins-good, gstreamer1.0-plugins-ugly, gstreamer1.0-libav")
 set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
     "${CMAKE_SOURCE_DIR}/dist/packaging/postinst")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
@@ -212,7 +241,11 @@ set(CPACK_RPM_PACKAGE_LICENSE "MIT")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Productivity")
 set(CPACK_RPM_PACKAGE_REQUIRES
     "qt5-qtbase, qt5-qtmultimedia, xdotool, xclip, xorg-x11-utils")
-set(CPACK_RPM_PACKAGE_SUGGESTS "hunspell-ru, x11-xkb-utils")
+# Сжатые форматы (MP3/OGG…) в Fedora декодируют gstreamer1-плагины;
+# mediaservice для Qt5 там внутри qt5-qtmultimedia. Suggests — не ломает
+# установку, где пакетов нет.
+set(CPACK_RPM_PACKAGE_SUGGESTS
+    "hunspell-ru, x11-xkb-utils, gstreamer1-plugins-good, gstreamer1-plugins-ugly, gstreamer1-libav")
 set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
     "${CMAKE_SOURCE_DIR}/dist/packaging/postinst")
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)

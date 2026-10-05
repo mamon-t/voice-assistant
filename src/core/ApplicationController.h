@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <memory>
 
+#include "audio/AudioFileDecoder.h"
 #include "audio/TypingGuard.h"
 #include "core/Command.h"
 #include "core/Mode.h"
@@ -23,6 +24,8 @@ class ISpellChecker;
 class IHotkeyListener;
 class WavWriter;
 class FileInjector;
+class FileTranscriber;
+class QThread;
 
 // Сердце приложения: аудиопоток -> AGC -> VoicePipeline (VAD -> ASR -> пунктуация),
 // затем маршрутизация результата: команда или вставка текста.
@@ -74,6 +77,25 @@ public:
     bool    isMicChecking() const;
     QString micCheckFile() const;
 
+    // --- разбор аудиофайла («разбери файл» / пункт меню лотка) ---
+    //
+    // Сценарий: пользователь говорит команду (или жмёт пункт в лотке) ->
+    // запоминаем окно, активное СЕЙЧАС (редактор), диктовку останавливаем ->
+    // сигнал transcribeFileRequested -> UI показывает системный диалог выбора
+    // файла -> startFileTranscription() -> рабочий поток (FileTranscriber)
+    // декодирует файл и гонит его через отдельный VoicePipeline -> результат
+    // вставляется в запомненное окно (цель «заметки» — в файл заметок).
+    //
+    // Окно запоминается ДО диалога выбора: диалог и прогресс — окна самого
+    // помощника, и после их закрытия фокус непредсказуем. Доставка — тем же
+    // механизмом pin (pin_mode=activate сам вернёт фокус).
+    bool isTranscribing() const;
+    void requestFileTranscription();
+    bool startFileTranscription(const QString& filePath,
+                                const QString& targetWindowId,
+                                const AudioFileDecoder::RawParams& rawParams);
+    void cancelFileTranscription();
+
     // --- глобальный хоткей ---
     bool    isHotkeyActive() const;
     QString hotkeyDescription() const;
@@ -121,12 +143,27 @@ signals:
     void outputTargetChanged(OutputTarget target);
     void noteWritten(const QString& path, const QString& text);
 
+    // --- разбор аудиофайла ---
+    // UI должен показать диалог выбора файла; targetWindowId — окно, куда
+    // вставлять результат (пусто, если активное окно не определилось или
+    // это окно самого помощника — тогда вставка пойдёт в текущий фокус).
+    void transcribeFileRequested(const QString& targetWindowId);
+    void fileTranscriptionStarted(const QString& filePath);
+    void fileTranscriptionProgress(int percent, const QString& stage);
+    void fileTranscriptionFinished(const QString& filePath, const QString& text, int segments);
+    void fileTranscriptionFailed(const QString& filePath, const QString& error);
+    void fileTranscriptionCancelled(const QString& filePath);
+
 private slots:
     void onAudioDataReady(const QByteArray& data, int sampleRate);
     void onAudioError(const QString& message);
     void onRawTextRecognized(const QString& raw);    // до постобработки — ищем команду
     void onTextReady(const QString& text);           // после постобработки — вставляем
     void onKeyActivity();                            // пользователь печатает — см. TypingGuard
+    void onFileTranscriptionSucceeded(const QString& text, int segments,
+                                      double audioSeconds, double wallMs);
+    void onFileTranscriptionFailed(const QString& error);
+    void onFileTranscriptionCancelled();
 
 private:
     bool buildPipeline();
@@ -145,6 +182,13 @@ private:
     // в него, даже если фокус ушёл в другой файл. Окна самого помощника (меню
     // трея, настройки) привязкой НЕ становятся: вставка в них теряет текст.
     void captureTargetWindow();
+    // Активное окно принадлежит самому помощнику (WM_CLASS из
+    // [output] own_window_class или PID нашего процесса) — см. captureTargetWindow.
+    bool isOwnWindow(const QString& windowId) const;
+    // Активное окно, если оно НЕ наше; иначе пустая строка.
+    QString currentForeignWindowId() const;
+    // Остановить рабочий поток разбора файла и освободить объекты.
+    void cleanupTranscriber();
 
     Mode m_mode = Mode::Off;
 
@@ -159,6 +203,12 @@ private:
     std::unique_ptr<IHotkeyListener> m_hotkey;
     std::unique_ptr<WavWriter>       m_wavWriter;
     std::unique_ptr<FileInjector>    m_notes;
+
+    // --- разбор аудиофайла: рабочий поток и его состояние ---
+    QThread*        m_transcribeThread = nullptr;
+    FileTranscriber* m_transcriber     = nullptr;   // живёт в m_transcribeThread
+    QString         m_transcribeFile;               // какой файл разбираем
+    QString         m_transcribeTargetWindow;       // куда вставлять результат
 
     bool    m_micCheckOwnsCapture = false;   // захват запущен специально для записи
     QString m_micCheckSource;                // "agc" | "raw"

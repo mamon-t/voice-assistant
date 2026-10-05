@@ -1,0 +1,2954 @@
+
+===== docs/architecture.md =====
+
+# Архитектура
+
+## Слои
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ UI / внешнее управление                                              │
+│   ui/TrayIcon        dbus/DBusInterface        main.cpp              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ setMode(), startRecording(), …
+┌───────────────────────────────▼─────────────────────────────────────┐
+│ Ядро                                                                 │
+│   core/ApplicationController — режимы, маршрутизация результата      │
+└──────┬────────────────────────────┬──────────────────────┬──────────┘
+       │                            │                      │
+┌──────▼─────────┐   ┌──────────────▼───────────┐   ┌──────▼──────────┐
+│ audio/         │   │ core/VoicePipeline       │   │ выход            │
+│  QtAudioCapture│   │  vad/SileroVad           │   │  commands/       │
+│  Agc           │   │  asr/IRecognizer         │   │   CommandParser  │
+│  TypingGuard   │   │  text/TextPostProcessor  │   │  output/         │
+└────────────────┘   └──────────────────────────┘   │   ITextInjector  │
+┌────────────────┐                                  │   Xdotool (окно) │
+│ input/         │                                  │   FileInjector   │
+│  EvdevHotkey   │                                  └─────────────────┘
+└────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ Конфигурация: config/ConfigManager, config/AsrProfile,              │
+│               config/HotwordsManager                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Зависимости направлены сверху вниз. Ядро не знает о трее и D-Bus; UI и адаптер
+D-Bus знают только публичное API контроллера.
+
+## Цепочка прохождения звука
+
+```
+QtAudioCapture::audioDataReady(QByteArray, int)
+  → ApplicationController::onAudioDataReady      буферизация по 1600 байт (50 мс @ 16 кГц)
+  → Agc::process                                 усиление + шумовой порог
+  → VoicePipeline::processAudio                  только если mode != Off
+  → SileroVad::processAudio                      Silero VAD (sherpa-onnx VoiceActivityDetector)
+  → SileroVad::speechSegmentReady(pcm16, 16000)  ЦЕЛЫЙ речевой сегмент
+  → IRecognizer::acceptWaveform + finalResult    одно декодирование на фразу
+  → TextPostProcessor::process                   «точка» → «.», заглавные, точка в конце
+```
+
+Дальше результат расходится двумя сигналами:
+
+```
+VoicePipeline::rawTextRecognized(raw)   → CommandParser::parse(raw)
+                                          совпало со словарём целиком:
+                                            → executeCommand(), m_skipNextText = true
+VoicePipeline::textReady(text)          → emit textRecognized(text)
+                                          m_skipNextText → пропустить вставку
+                                          Mode::Dictation  → ITextInjector::typeText(text)
+                                          Mode::Edit       → только команды
+                                          Mode::Spellcheck → TODO (AspellChecker пустой)
+```
+
+### Почему команда ищется по сырому тексту
+
+`TextPostProcessor` превращает слова «точка», «новая строка», «пробел» в знаки.
+Из готового текста команда «новая строка» уже не соберётся. Поэтому:
+
+* `rawTextRecognized` — для `CommandParser`;
+* `textReady` — для вставки.
+
+Порядок сигналов гарантирован: `VoicePipeline::onSpeechSegment()` отправляет
+`rawTextRecognized` раньше `textReady`, соединения прямые (один поток).
+
+### Почему VAD отдаёт сегменты, а не поток
+
+Нестриминговые модели (zipformer-ru, GigaAM, Whisper) дают заметно лучший результат
+на целой фразе, чем на склейке кусков по 32 мс. `SileroVad` поэтому:
+
+1. шлёт `speechStarted()` / `speechEnded()` по переходам `IsDetected()` — для UI;
+2. выгребает готовые сегменты через `Front()` / `Pop()` и шлёт `speechSegmentReady()`.
+
+Выгребать обязательно: если сегменты не забирать, очередь внутри
+`VoiceActivityDetector` растёт без ограничения.
+
+## Классы
+
+| Класс | Интерфейс | Реализации |
+|---|---|---|
+| Захват звука | `IAudioCapture` | `QtAudioCapture` |
+| VAD | `IVad` | `SileroVad` |
+| ASR | `IRecognizer` | `TransducerRecognizer`, `NemoCtcRecognizer`, `WhisperRecognizer` |
+| Ввод текста | `ITextInjector` | `XdotoolInjector` (окно), `FileInjector` (файл заметок) |
+| Выбор окна для вставки | `WindowTarget` (чистая функция) | `decideWindowTarget()` — способ доставки и куда вернуть фокус |
+| Правописание | `ISpellChecker` | `HunspellChecker` (hunspell, C API) |
+| Глобальный хоткей | `IHotkeyListener` | `EvdevHotkeyListener` (`/dev/input/event*`) |
+| Запись аудио | — | `WavWriter` (PCM16 → WAV) |
+| Глушитель печати | — | `TypingGuard` (header-only, время передаётся снаружи) |
+| Цель вывода | — | `OutputTarget` (`Focus` / `Notes`) |
+
+Конкретную реализацию ASR выбирает `RecognizerFactory::create(AsrProfile)`;
+остальное приложение знает только `IRecognizer`.
+
+### Как добавить свой движок ASR
+
+1. Реализовать `IRecognizer` (`initialize`, `acceptWaveform`, `finalResult`,
+   `reset`, `setHotwords`, `isLoaded`).
+2. Добавить значение в `AsrProfile::Engine` и ветку в `RecognizerFactory::create()`.
+3. Добавить профиль в `settings.ini`.
+
+Контроллер, пайплайн и UI при этом не меняются.
+
+### Как выбирается окно для вставки
+
+`output/WindowTarget.h` — единственный модуль вывода без единой зависимости от
+X11: ни `QProcess`, ни `xdotool`, ни задержек. Только решение.
+
+```
+pinned (WID из начала записи) + active (WID сейчас) + «окно живо» + pin_mode
+        │
+        ▼  decideWindowTarget()
+WindowTarget { delivery, window, restoreTo }
+        │
+        ├── ActiveWindow — привязки нет / окно закрыли / это окно помощника
+        ├── SendEvent    — xdotool … --window WID (синтетика, фокус не трогаем)
+        └── Activate     — windowactivate --sync → пауза → печать настоящими
+                           событиями БЕЗ --window → возврат фокуса в restoreTo
+```
+
+Зачем вынесено отдельно. `xdotool … --window WID` шлёт настоящие события
+(XTest), только если окно уже в фокусе; иначе — `XSendEvent`, который браузеры,
+LibreOffice и Java отбрасывают, а `xdotool` всё равно возвращает `0`. Пока это
+решение жило внутри `typeViaClipboard()`/`typeViaXdotool()` вперемешку с
+`QProcess`, проверить его было нельзя — и оно ломалось молча. Чистая функция
+покрыта тестами (8 сценариев), а инжектор лишь исполняет её вердикт.
+
+`DeliveryScope` (RAII) активует окно в конструкторе и возвращает фокус в
+деструкторе. Скоуп один на всю вставку: при откате «буфер обмена не сработал →
+`xdotool type`» окно активировалось бы дважды и фокус мигал бы на каждом
+сегменте. Поэтому `resolveTarget()` вызывается один раз, а результат передаётся
+в оба способа доставки.
+
+### Как добавить способ ввода текста (Wayland/TTY)
+
+Реализовать `ITextInjector` поверх `ydotool` и выбирать его в
+`ApplicationController` по значению `[output] method`. Интерфейс уже содержит
+`backendName()` для логов и настроек.
+
+То, что реализаций может быть несколько и они могут работать одновременно,
+уже проверено на практике: `FileInjector` пишет в файл заметок, пока
+`XdotoolInjector` вставляет в окно. Выбор между ними делает
+`ApplicationController::activeInjector()` по текущей цели вывода
+(`OutputTarget`), остальной тракт разницы не замечает.
+
+## Владение объектами
+
+Все компоненты — `std::unique_ptr` **без** Qt-родителя:
+
+```cpp
+m_pipeline = std::make_unique<VoicePipeline>(VoicePipeline::loadSettings(*m_config));
+```
+
+QObject-родителя намеренно не передаём. Иначе объект оказывается одновременно
+в списке детей родителя и под `unique_ptr`. Порядок деструкции (сначала члены,
+потом база `QObject`) делает это безопасным, но полагаться на такой тонкий
+момент не стоит — двойное владение легко превращается в double free при
+первом же рефакторинге.
+
+## Проверка правописания
+
+`HunspellChecker` реализует `ISpellChecker` и создаётся в конструкторе
+`ApplicationController`, если `[spellcheck] enabled=true`. Отсутствие hunspell
+или словаря **не мешает** остальному: контроллер логирует причину и продолжает
+работать без режима `Spellcheck`.
+
+В режиме `Spellcheck` текст вставляется как при диктовке, а затем проверяется:
+
+```
+onTextReady(text) → injectText(text)
+                  → runSpellcheck(text) → check(text)  → слова с ошибками
+                                        → suggest(word) → варианты
+                                        → emit spellcheckFinished(text, errors)
+                                          (трей показывает уведомление)
+```
+
+Числа («2026») ошибками не считаются: словарь их не знает, а в диктовке они
+встречаются постоянно. Слова разбираются регулярным выражением `[^\W\d_]+`
+с `UseUnicodePropertiesOption`, поэтому «ё», дефисы и пунктуация обрабатываются
+корректно.
+
+`HunspellChecker` намеренно использует **C API** hunspell (`char*`), а не
+`hunspell.hxx` (`std::string`): C++ API зависит от `_GLIBCXX_USE_CXX11_ABI`
+и ломает линковку при сборке со старым ABI.
+
+## Проверка микрофона и запись в WAV
+
+`WavWriter` пишет заголовок сразу с нулевыми размерами и правит его в `close()`.
+Поэтому файл остаётся читаемым даже после аварийного завершения: размеры
+восстанавливаются из фактической длины — именно так поступает читатель
+в `tools/vad_asr_test.cpp`. Корректность заголовка проверена двумя способами:
+юнит-тестом на побайтовое совпадение с `makeHeader()` и внешним читателем
+(модуль `wave` из стандартной библиотеки Python).
+
+Два источника записи, и это не избыточность:
+
+| Источник | Как включить | Что показывает |
+|---|---|---|
+| сырой микрофон | `./src/voice-assistant --record N file.wav` | что реально отдаёт устройство, без AGC |
+| тракт после AGC | пункт в трее / D-Bus `startMicCheck` | то же, что слышит ASR |
+
+Сравнение двух записей одного текста отвечает на вопрос «AGC помогает или вредит».
+
+Запись работает и в `Mode::Off`: `startMicCheck()` сам запускает захват
+(флаг `m_micCheckOwnsCapture`) и не меняет режим, а `stopRecording()` не глушит
+захват, пока идёт запись.
+
+## Цель вывода: окно или файл заметок
+
+`Mode` описывает, **что** делать с речью (диктовать, править, проверять
+орфографию). `OutputTarget` — **куда** класть результат. Понятия ортогональны:
+заметки можно диктовать и одновременно проверять на орфографию.
+
+```
+VoicePipeline::textReady(text)
+        │
+        ▼
+ApplicationController::injectText(text)
+        │
+        ├── OutputTarget::Focus ──▶ XdotoolInjector ──▶ буфер обмена + Ctrl+V
+        │                                              или xdotool type --file -
+        └── OutputTarget::Notes ──▶ FileInjector ─────▶ ~/.local/share/
+                                                        voice-assistant/notes/
+                                                        YYYY-MM-DD.md
+```
+
+Зачем это понадобилось. Вставка в окно привязана к фокусу **в момент прихода
+результата**, а это через 0.5–2 с после фразы: переключился сделать пометку —
+и продиктованное улетело в пометки. Способ «буфер обмена + Ctrl+V» к тому же
+затирает буфер. Файл не зависит ни от фокуса, ни от клавиатуры, ни от буфера,
+поэтому диктовка и ручная печать перестают конфликтовать.
+
+Переключение цели:
+
+| Откуда | Как |
+|---|---|
+| голосом | «заметка» / «в редактор» — команда `Command::Type::SetTarget` |
+| из трея | пункт «Писать в файл заметок» (галочка) |
+| по D-Bus | `setOutputTarget "notes"`, `toggleOutputTarget`, `notesFile` |
+| из консоли | `./src/voice-assistant --note "текст"` |
+| в конфиге | `[notes] start_target=notes` |
+
+`SetTarget` обрабатывается в `executeCommand()` **до** проверки
+`editing_in_dictation`: это маршрутизация, а не правка текста, иначе сказанное
+«заметка» пропало бы именно в режиме диктовки, где оно нужнее всего.
+
+`FileInjector` намеренно реализует `ITextInjector`, поэтому команды правки
+работают и в файле («удали слово» стирает последнее слово последней заметки,
+«новая строка» добавляет пустую). Неприменимые к файлу клавиши
+(`shift+Home`) возвращают `true` и просто пропускаются: команда не имеет
+смысла в этой цели, но и ошибкой не является.
+
+Запись идёт байтами в UTF-8, а не через `QTextStream << "кириллица"` — узкий
+литерал кодируется как Latin-1 (грабля №6). Перезапись последней строки
+делается через `QSaveFile`, чтобы обрыв записи не портил файл заметок.
+
+## Глушитель печати
+
+`TypingGuard` — единственный компонент, которому нужно знать, что пользователь
+печатает. Источник бесплатный: `EvdevHotkeyListener` и так читает все события
+устройства и шлёт `keyActivity()` на любую клавишу, кроме самого хоткея и
+модификаторов из его комбинации (иначе `ctrl+space` глушил бы сам себя).
+
+```
+evdev: клавиша ──▶ IHotkeyListener::keyActivity()
+                          │
+                          ▼
+        ApplicationController::onKeyActivity()
+                          │  m_typingGuard.noteKeyActivity(m_clock.elapsed())
+                          ▼
+   onAudioDataReady(): if (m_typingGuard.blocked(now)) chunk не уходит в VAD
+```
+
+Класс не знает ни про evdev, ни про Qt-события, ни про аудио: время
+передаётся снаружи, поэтому логика проверяется тестами на синтетических
+числах. Запись в WAV при этом **не** прерывается — снимок тракта обязан
+показывать всё, иначе его нельзя сравнивать с тем, что слышит ASR.
+
+По умолчанию выключен (`[audio] typing_guard_ms=0`): если говорить и печатать
+одновременно, речь режется. По окончании записи контроллер печатает, сколько
+аудио было выброшено, — по этой строке видно, не слишком ли значение велико.
+
+## Глобальный хоткей
+
+`EvdevHotkeyListener` читает `/dev/input/event*` напрямую, поэтому работает
+в X11, Wayland и TTY. Устройства отбираются по наличию нужной клавиши
+в битовой маске `EVIOCGBIT(EV_KEY)`; на каждый fd вешается свой
+`QSocketNotifier`.
+
+Логика разбора вынесена в `handleEvent(const struct input_event&)` и не зависит
+от дескрипторов, поэтому покрыта тестами на синтетических событиях:
+нажатие (`value=1`), отпускание (`value=0`), автоповтор (`value=2` — игнорируется,
+иначе push-to-talk дёргался бы непрерывно), чужие клавиши, не-клавишные события
+и модификаторы (левый и правый Ctrl считаются одним).
+
+`configure()` валидирует спецификацию клавиши **без** обращения к `/dev/input` —
+этим пользуется `--check`, которому права на устройства не нужны.
+
+`EVIOCGRAB` (`[hotkey] grab`) по умолчанию выключен: он забирает устройство
+эксклюзивно, и X-сервер перестаёт получать с него все клавиши. Печатать во
+время диктовки должно быть можно всегда, поэтому это не «настройка по
+умолчанию», а требование к реализации.
+
+Вся политика перехвата собрана в одной статической функции
+`shouldGrab(options, name, path, keyBits, numBytes, &reason)` — она не трогает
+дескрипторы, поэтому проверяется тестами без железа:
+
+| Условие | Результат |
+|---|---|
+| `grab=false` | никогда не перехватываем, только слушаем |
+| `grab=true`, `grab_devices` задан | перехватываем **только** перечисленное (подстрока имени или путь) |
+| `grab=true`, список пуст, устройство похоже на клавиатуру | **не** перехватываем, в лог пишется причина |
+| `grab=true`, список пуст, педаль/пульт | перехватываем |
+
+«Похоже на клавиатуру» определяет `looksLikeFullKeyboard()`: в маске
+`EVIOCGBIT(EV_KEY)` есть хотя бы 20 букв и хотя бы 5 цифр. Буквы
+перечислены явным списком, потому что их коды в `input-event-codes.h` идут
+не подряд (`KEY_A`=30, `KEY_B`=48, `KEY_Z`=44) — перебор диапазона
+`KEY_A..KEY_Z` даёт 11 букв вместо 26, и предохранитель молча не срабатывает.
+
+## Потоки
+
+Один поток (GUI). Аудио приходит из `QAudioInput` через `QIODevice::readyRead`
+в тот же поток; VAD и ASR считаются синхронно внутри слота. Для Celeron это
+осознанный выбор: RTF zipformer-ru ≈ 0.06, то есть декодирование фразы в разы
+быстрее её длительности, и выносить ASR в отдельный поток пока незачем.
+
+Если понадобится стриминговое распознавание с частичными результатами,
+декодирование придётся вынести в worker-поток, а обмен сделать через
+`Qt::QueuedConnection`.
+
+## Сборка
+
+`src/CMakeLists.txt` собирает статическую библиотеку `voice-assistant-core`
+из всех источников, кроме `main.cpp`, и исполняемый файл `voice-assistant`
+из `main.cpp` + ресурсов. Тесты линкуются с `voice-assistant-core`, поэтому
+гоняют тот же код, что и приложение, без GUI и микрофона.
+
+Заголовки добавлены в список источников цели обязательно: `IVad`, `IRecognizer`,
+`IAudioCapture` — header-only классы с `Q_OBJECT`, и без них AUTOMOC не создаёт
+`moc_IVad.cpp`. Подробности — в [sherpa-onnx-notes.md](sherpa-onnx-notes.md).
+
+===== src/core/ApplicationController.h =====
+
+#pragma once
+
+#include <QByteArray>
+#include <QElapsedTimer>
+#include <QObject>
+#include <QString>
+#include <QStringList>
+#include <memory>
+
+#include "audio/TypingGuard.h"
+#include "core/Command.h"
+#include "core/Mode.h"
+#include "core/OutputTarget.h"
+
+class IAudioCapture;
+class Agc;
+class ConfigManager;
+class VoicePipeline;
+class ITextInjector;
+class CommandParser;
+class HotwordsManager;
+class ISpellChecker;
+class IHotkeyListener;
+class WavWriter;
+class FileInjector;
+
+// Сердце приложения: аудиопоток -> AGC -> VoicePipeline (VAD -> ASR -> пунктуация),
+// затем маршрутизация результата: команда или вставка текста.
+//
+// Контроллер намеренно тонкий: всё, что связано с речью, живёт в VoicePipeline,
+// выбор модели — в ConfigManager (профили), словарь команд — в CommandParser.
+class ApplicationController : public QObject {
+    Q_OBJECT
+
+public:
+    explicit ApplicationController(QObject* parent = nullptr);
+    ~ApplicationController();
+
+    Mode mode() const;
+    void startRecording();
+    void stopRecording();
+    void setMode(Mode mode);
+
+    // --- ASR-профили (переключение модели на лету) ---
+    QStringList asrProfiles() const;
+    QString     activeAsrProfile() const;
+    bool        switchAsrProfile(const QString& profileName);
+
+    // --- подсказки пользователя ---
+    void reloadHotwords();
+
+    // --- словарь команд: пересобрать из кода + [commands] file ---
+    // Нужно после правки своих команд во вкладке «Команды»: словарь и
+    // командные hotwords перечитываются без перезапуска.
+    void reloadCommands();
+
+    // --- глобальный хоткей: перечитать [hotkey] из ini и перезапустить слушатель ---
+    // Нужно после сохранения SettingsDialog: ключ/режим меняются без перезапуска.
+    void reloadHotkey();
+
+    // --- вывод текста: перечитать [output] из ini и перенастроить инжектор ---
+    // method, задержки, pin_window/pin_mode/pin_activate_ms/pin_restore_focus,
+    // own_window_class — всё подхватывается без перезапуска (нужно после
+    // сохранения SettingsDialog). Уже установленная привязка к окну сохраняется.
+    void reloadOutputSettings();
+
+    // --- проверка микрофона: запись тракта в WAV ---
+    // Пишет те же чанки, что уходят в ASR (по умолчанию после AGC — см.
+    // [audio] mic_check_source), поэтому файл можно прогнать офлайн:
+    //   ./tools/vad-asr-test запись.wav --config ~/.config/voice-assistant/settings.ini
+    // Работает и в Mode::Off: захват запускается специально и режим не меняется.
+    bool    startMicCheck(QString* outFile = nullptr);
+    void    stopMicCheck();
+    bool    isMicChecking() const;
+    QString micCheckFile() const;
+
+    // --- глобальный хоткей ---
+    bool    isHotkeyActive() const;
+    QString hotkeyDescription() const;
+
+    // --- цель вывода: активное окно или файл заметок ---
+    //
+    // Зачем: диктовка в окно конфликтует с ручной печатью. Результат приходит
+    // через 0.5–2 с после фразы и уходит в то окно, которое в фокусе СЕЙЧАС,
+    // а способ «буфер обмена + Ctrl+V» ещё и затирает буфер. Заметки в файл
+    // не зависят ни от фокуса, ни от клавиатуры, ни от буфера: можно
+    // диктовать пометки к файлу, с которым работаешь, продолжая печатать.
+    OutputTarget outputTarget() const;
+    bool        setOutputTarget(OutputTarget target);
+    bool        toggleOutputTarget();
+    QString     outputTargetName() const;      // "focus" | "notes" — для D-Bus
+    QString     notesFilePath() const;         // куда пишутся заметки (пусто, если выключены)
+    bool        isNotesAvailable() const;
+
+    // К какому окну привязана вставка ([output] pin_window). Пустая строка —
+    // привязки нет (выключена, окно не определилось или это было окно самого
+    // помощника). Нужно для диагностики и для --pin-info.
+    QString pinnedWindow() const { return m_pinnedWindow; }
+
+    // Последняя ошибка, в том числе возникшая в конструкторе (тогда её ещё
+    // некому было принять сигналом). Пустая строка — ошибок не было.
+    QString lastError() const { return m_lastError; }
+
+    // --- проверка правописания ---
+    bool      isSpellcheckAvailable() const;
+    QStringList checkText(const QString& text);        // слова с ошибками
+    QStringList suggestionsFor(const QString& word);   // варианты исправления
+    QString   spellcheckStatus() const;                // одна строка для логов и --check
+
+    // Готов ли тракт к работе (VAD и ASR созданы).
+    bool isReady() const;
+
+signals:
+    void modeChanged(Mode mode);
+    void errorOccurred(const QString& message);
+    void textRecognized(const QString& text);        // что услышали (после постобработки)
+    void commandExecuted(const QString& description); // для логов и UI
+    void spellcheckFinished(const QString& text, const QStringList& errors);
+    void micCheckStarted(const QString& path);
+    void micCheckFinished(const QString& path, double seconds);
+    void outputTargetChanged(OutputTarget target);
+    void noteWritten(const QString& path, const QString& text);
+
+private slots:
+    void onAudioDataReady(const QByteArray& data, int sampleRate);
+    void onAudioError(const QString& message);
+    void onRawTextRecognized(const QString& raw);    // до постобработки — ищем команду
+    void onTextReady(const QString& text);           // после постобработки — вставляем
+    void onKeyActivity();                            // пользователь печатает — см. TypingGuard
+
+private:
+    bool buildPipeline();
+    void applyHotwords();
+    void executeCommand(const Command& cmd);
+    void injectText(const QString& text);
+    // Инжектор текущей цели вывода: файл заметок или окно. nullptr, если
+    // соответствующий вывод недоступен.
+    ITextInjector* activeInjector() const;
+    void runSpellcheck(const QString& text);
+    void setupHotkey();
+    void onHotkeyPressed();
+    void onHotkeyReleased();
+    void setupNotes();
+    // [output] pin_window: запомнить окно, активное в НАЧАЛЕ записи, и вставлять
+    // в него, даже если фокус ушёл в другой файл. Окна самого помощника (меню
+    // трея, настройки) привязкой НЕ становятся: вставка в них теряет текст.
+    void captureTargetWindow();
+
+    Mode m_mode = Mode::Off;
+
+    std::unique_ptr<ConfigManager>   m_config;
+    std::unique_ptr<IAudioCapture>   m_audioCapture;
+    std::unique_ptr<Agc>             m_agc;
+    std::unique_ptr<VoicePipeline>   m_pipeline;
+    std::unique_ptr<ITextInjector>   m_injector;
+    std::unique_ptr<CommandParser>   m_commands;
+    std::unique_ptr<HotwordsManager> m_hotwords;
+    std::unique_ptr<ISpellChecker>   m_spellChecker;
+    std::unique_ptr<IHotkeyListener> m_hotkey;
+    std::unique_ptr<WavWriter>       m_wavWriter;
+    std::unique_ptr<FileInjector>    m_notes;
+
+    bool    m_micCheckOwnsCapture = false;   // захват запущен специально для записи
+    QString m_micCheckSource;                // "agc" | "raw"
+    QString m_hotkeyMode;                    // "push_to_talk" | "toggle"
+
+    OutputTarget  m_target = OutputTarget::Focus;
+    TypingGuard   m_typingGuard;             // глушим микрофон, пока идёт печать
+    QElapsedTimer m_clock;                   // единые часы для TypingGuard
+    bool          m_pinWindow = false;       // [output] pin_window
+    QString       m_pinnedWindow;            // WID окна, в которое вставляем
+
+    QByteArray m_audioBuffer;
+    static constexpr int TARGET_CHUNK_SIZE = 1600; // 50 мс при 16 кГц
+
+    void reportError(const QString& message);
+
+    QString m_lastError;
+    QString m_lastInjected;      // чтобы ставить пробел между сегментами
+    bool m_skipNextText   = false;  // фраза оказалась командой — вставлять нечего
+    bool m_audioDebugLog  = false;
+    bool m_editCmdsInDictation = false;
+};
+
+===== src/core/ApplicationController.cpp =====
+
+#include "ApplicationController.h"
+
+#include "audio/Agc.h"
+#include "audio/QtAudioCapture.h"
+#include "audio/WavWriter.h"
+#include "input/EvdevHotkeyListener.h"
+#include "input/IHotkeyListener.h"
+#include "commands/CommandDictionary.h"
+#include "commands/CommandParser.h"
+#include "config/ConfigManager.h"
+#include "config/HotwordsManager.h"
+#include "core/VoicePipeline.h"
+#include "output/FileInjector.h"
+#include "output/XdotoolInjector.h"
+#include "spellcheck/HunspellChecker.h"
+#include "text/TextPostProcessor.h"
+#include "spellcheck/ISpellChecker.h"
+
+#include <QCoreApplication>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <cmath>
+#include <cstdint>
+
+// commandDescription() переехал в core/Command.h: описание команды нужен
+// не только контроллеру (лог выполнения), но и вкладке «Команды» в настройках.
+
+ApplicationController::ApplicationController(QObject* parent)
+    : QObject(parent)
+{
+    // 1. Конфиг -----------------------------------------------------------------
+    m_config = std::make_unique<ConfigManager>();
+    m_audioDebugLog      = m_config->audioDebugLog();
+    m_editCmdsInDictation = m_config->editingCommandsInDictation();
+
+    // 2. Команды ----------------------------------------------------------------
+    m_commands = std::make_unique<CommandParser>();   // словарь уже наполнен стандартом
+    const QString customCommands = m_config->customCommandsPath();
+    if (QFile::exists(customCommands)) {
+        m_commands->dictionary()->loadFromFile(customCommands);
+    }
+
+    // Слово «заметка» встречается в обычной речи. Если оно мешает, голосовое
+    // переключение цели выключается ([notes] voice_commands=false), а цель
+    // остаётся доступной из трея, по D-Bus и хоткеем.
+    if (!m_config->notesVoiceCommands()) {
+        int removed = 0;
+        const QStringList phrases = CommandDictionary::targetCommandPhrases();
+        for (const QString& phrase : phrases) {
+            if (m_commands->dictionary()->removeCommand(phrase)) {
+                ++removed;
+            }
+        }
+        qInfo().noquote()
+            << QStringLiteral("Голосовые команды заметок выключены ([notes] "
+                              "voice_commands=false), убрано фраз: %1").arg(removed);
+    }
+
+    // 3. Подсказки пользователя -------------------------------------------------
+    m_hotwords = std::make_unique<HotwordsManager>();
+    m_hotwords->setConfigManager(m_config.get());
+    m_hotwords->reload();
+    connect(m_hotwords.get(), &HotwordsManager::hotwordsChanged,
+            this, &ApplicationController::applyHotwords);
+
+    // 4. Инжектор текста --------------------------------------------------------
+    auto injector = std::make_unique<XdotoolInjector>();
+    const QString method = m_config->injectorMethod();
+    if (method == QLatin1String("xdotool")) {
+        injector->setMethod(XdotoolInjector::Method::XdotoolType);
+    } else if (method == QLatin1String("clipboard")) {
+        injector->setMethod(XdotoolInjector::Method::Clipboard);
+    } else {
+        injector->setMethod(XdotoolInjector::Method::Auto);
+    }
+    injector->setTypingDelayMs(m_config->typingDelayMs());
+    injector->setPreserveClipboard(m_config->preserveClipboard());
+    injector->setClipboardRestoreMs(m_config->clipboardRestoreMs());
+
+    // Как доставлять текст в привязанное окно. activate (по умолчанию) —
+    // окно активируется и текст печатается настоящими событиями: работает
+    // везде, но на ~50–150 мс забирает фокус. sendevent — прежнее поведение
+    // (xdotool --window): фокус не трогается, зато часть приложений такой
+    // ввод отбрасывает, и xdotool всё равно возвращает 0.
+    injector->setPinMode(stringToPinMode(m_config->pinMode()));
+    injector->setPinActivateDelayMs(m_config->pinActivateMs());
+    injector->setPinRestoreFocus(m_config->pinRestoreFocus());
+    injector->setOwnWindowClasses(m_config->ownWindowClasses());
+
+    if (!injector->initialize() || !injector->isAvailable()) {
+        reportError(QStringLiteral(
+            "Ввод текста недоступен: нужен xdotool (X11) и, желательно, xclip. "
+            "Для Wayland/TTY требуется ydotool."));
+    }
+    m_injector = std::move(injector);
+
+    // 4b. Заметки, привязка к окну, глушитель печати ----------------------------
+    m_clock.start();
+    setupNotes();
+
+    m_pinWindow = m_config->pinWindow();
+    m_typingGuard.setGuardMs(m_config->typingGuardMs());
+    if (m_typingGuard.isEnabled()) {
+        qInfo().noquote()
+            << QStringLiteral("Глушитель печати: %1 мс (аудио не уходит в ASR, пока "
+                              "идёт набор текста)").arg(m_typingGuard.guardMs());
+        if (!isHotkeyActive() && m_config->hotkeyBackend() != QLatin1String("evdev")) {
+            qWarning().noquote()
+                << QStringLiteral("Глушитель печати не сработает: нужны события клавиатуры, "
+                                  "а [hotkey] backend != evdev");
+        }
+    }
+
+    // 5. Проверка правописания ---------------------------------------------------
+    // Не критично для диктовки: если словаря или библиотеки нет, сообщаем и живём дальше.
+    if (m_config->spellcheckEnabled()) {
+        HunspellChecker::Options sopt;
+        sopt.lang           = m_config->spellcheckLang();
+        sopt.dictionaryDir  = m_config->spellcheckDictionaryDir();
+        sopt.maxSuggestions = m_config->spellcheckMaxSuggestions();
+
+        auto checker = std::make_unique<HunspellChecker>(sopt);
+        if (checker->initialize()) {
+            m_spellChecker = std::move(checker);
+        } else {
+            qWarning().noquote()
+                << QStringLiteral("Проверка правописания недоступна: %1")
+                       .arg(checker->lastError());
+        }
+    }
+
+    // 6. Аудиоподсистема --------------------------------------------------------
+    m_audioCapture = std::make_unique<QtAudioCapture>();
+    if (!m_audioCapture->initialize()) {
+        reportError(QStringLiteral("Не удалось инициализировать захват звука"));
+        m_mode = Mode::Error;
+        emit modeChanged(m_mode);
+        return;
+    }
+
+    m_agc = std::make_unique<Agc>();
+    m_agc->setTargetDb(-15.0f);
+    m_agc->setAttackTime(0.05f);              // 50 мс
+    m_agc->setReleaseTime(0.2f);              // 200 мс
+    m_agc->setMaxGain(10.0f);
+    m_agc->setMinGain(0.01f);
+    m_agc->setNoiseGateThresholdDb(-35.0f);   // порог тишины -35 dB
+
+    connect(m_audioCapture.get(), &IAudioCapture::audioDataReady,
+            this, &ApplicationController::onAudioDataReady);
+    connect(m_audioCapture.get(), &IAudioCapture::errorOccurred,
+            this, &ApplicationController::onAudioError);
+
+    m_micCheckSource = m_config->micCheckSource();
+    m_hotkeyMode     = m_config->hotkeyMode();
+
+    // 7. Речевой пайплайн (VAD -> ASR -> пунктуация) -----------------------------
+    if (!buildPipeline()) {
+        // Без ASR приложение работать не может. Не делаем вид, что всё в порядке:
+        // переводимся в Mode::Error (трей покажет error.svg) и сообщаем наружу.
+        m_mode = Mode::Error;
+        emit modeChanged(m_mode);
+        return;
+    }
+
+    // 8. Глобальный хоткей (не критично: без него остаются трей и D-Bus)
+    setupHotkey();
+}
+
+void ApplicationController::reportError(const QString& message)
+{
+    m_lastError = message;
+    qCritical().noquote() << message;
+    emit errorOccurred(message);
+}
+
+bool ApplicationController::isReady() const
+{
+    return static_cast<bool>(m_pipeline);
+}
+
+ApplicationController::~ApplicationController()
+{
+    stopRecording();
+}
+
+// ---------------------------------------------------------------------------
+// Построение пайплайна
+// ---------------------------------------------------------------------------
+
+bool ApplicationController::buildPipeline()
+{
+    // Родителя QObject не передаём: владельцем является unique_ptr
+    m_pipeline = std::make_unique<VoicePipeline>(VoicePipeline::loadSettings(*m_config));
+
+    connect(m_pipeline.get(), &VoicePipeline::errorOccurred,
+            this, &ApplicationController::errorOccurred);
+    // ВАЖЕН ПОРЯДОК: rawTextRecognized приходит раньше textReady —
+    // по «сырому» тексту мы ищем команду, а по готовому вставляем текст.
+    connect(m_pipeline.get(), &VoicePipeline::rawTextRecognized,
+            this, &ApplicationController::onRawTextRecognized);
+    connect(m_pipeline.get(), &VoicePipeline::textReady,
+            this, &ApplicationController::onTextReady);
+
+    QString err;
+    if (!m_pipeline->initialize(&err)) {
+        m_pipeline.reset();
+        reportError(QStringLiteral("Речевой тракт не запущен: %1. "
+                                   "Диагностика: ./src/voice-assistant --check")
+                        .arg(err));
+        return false;
+    }
+
+    applyHotwords();
+    qInfo().noquote() << QStringLiteral("ASR-профиль: %1 | инжектор: %2")
+                             .arg(m_pipeline->asrProfileName(),
+                                  m_injector ? m_injector->backendName() : QStringLiteral("нет"));
+    return true;
+}
+
+void ApplicationController::applyHotwords()
+{
+    if (!m_pipeline) {
+        return;
+    }
+
+    // Подсказки пользователя + фразы команд: ASR проглатывает редкие слова,
+    // а диктантные команды обязаны распознаваться дословно (тот же эффект,
+    // что и с «точка»/«запятая»). Диктантные знаки VoicePipeline добавит сам.
+    // Пользовательские подсказки идут с общим скором ([asr] hotwords_score),
+    // фразы команд — со своим, более мягким: их много (26+), и сильный буст
+    // начинает протаскивать служебные слова в обычную речь.
+    QStringList hw = m_hotwords ? m_hotwords->allHotwords() : QStringList();
+    if (m_commands && m_commands->dictionary()) {
+        const QString suffix = QStringLiteral(" :%1")
+                                   .arg(m_config ? m_config->commandsHotwordsScore() : 1.5f, 0, 'f', 2);
+        const QStringList phrases = m_commands->dictionary()->phrases();
+        for (const QString& p : phrases) {
+            if (!hw.contains(p)) {
+                hw << p + suffix;
+            }
+        }
+    }
+
+    m_pipeline->setHotwords(hw, m_config ? m_config->hotwordsScore() : 2.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Режимы
+// ---------------------------------------------------------------------------
+
+Mode ApplicationController::mode() const
+{
+    return m_mode;
+}
+
+void ApplicationController::startRecording()
+{
+    if (!m_pipeline) {
+        reportError(QStringLiteral(
+            "Запись не начата: речевой тракт не инициализирован. "
+            "Проверьте модели — ./src/voice-assistant --check"));
+        return;
+    }
+    if (m_mode == Mode::Off) {
+        if (m_agc)      m_agc->reset();
+        if (m_pipeline) m_pipeline->reset();
+        m_audioBuffer.clear();
+        m_skipNextText = false;
+        m_lastInjected.clear();
+        m_typingGuard.reset();
+        captureTargetWindow();
+
+        if (m_audioCapture) m_audioCapture->start();
+        m_mode = Mode::Dictation;
+        qDebug() << "Recording started";
+        emit modeChanged(m_mode);
+    }
+}
+
+void ApplicationController::stopRecording()
+{
+    if (m_mode != Mode::Off) {
+        if (m_pipeline) m_pipeline->flush();     // вытолкнуть хвост последней фразы
+        if (m_audioCapture && !isMicChecking()) {
+            m_audioCapture->stop();   // запись микрофона держит захват сама
+        }
+        m_audioBuffer.clear();
+        m_mode = Mode::Off;
+
+        // Без этой строки непонятно, не съел ли глушитель печати саму речь:
+        // если секунд много, [audio] typing_guard_ms стоит уменьшить.
+        if (m_typingGuard.droppedChunks() > 0) {
+            qInfo().noquote()
+                << QStringLiteral("Глушитель печати: выброшено %1 кусков аудио (%2 с) — "
+                                  "столько речи не дошло до ASR")
+                       .arg(m_typingGuard.droppedChunks())
+                       .arg(m_typingGuard.droppedSamples() / 16000.0, 0, 'f', 2);
+        }
+        qDebug() << "Recording stopped";
+        emit modeChanged(m_mode);
+    }
+}
+
+void ApplicationController::setMode(Mode mode)
+{
+    if (m_mode == mode) {
+        return;
+    }
+    if (mode != Mode::Off && !m_pipeline) {
+        reportError(QStringLiteral(
+            "Режим %1 не включён: речевой тракт не инициализирован. "
+            "Проверьте модели — ./src/voice-assistant --check")
+                        .arg(modeToString(mode)));
+        return;
+    }
+
+    if (m_mode == Mode::Off && mode != Mode::Off) {
+        if (m_agc)      m_agc->reset();
+        if (m_pipeline) m_pipeline->reset();
+        m_audioBuffer.clear();
+        m_skipNextText = false;
+        m_lastInjected.clear();
+        m_typingGuard.reset();
+        captureTargetWindow();
+        if (m_audioCapture) m_audioCapture->start();
+    } else if (mode == Mode::Off) {
+        if (m_pipeline) m_pipeline->flush();
+        if (m_audioCapture && !isMicChecking()) {
+            m_audioCapture->stop();
+        }
+        m_audioBuffer.clear();
+    }
+
+    m_mode = mode;
+    qDebug() << "Mode changed to" << modeToString(mode);
+    emit modeChanged(m_mode);
+}
+
+// ---------------------------------------------------------------------------
+// Профили ASR и подсказки
+// ---------------------------------------------------------------------------
+
+QStringList ApplicationController::asrProfiles() const
+{
+    return m_config ? m_config->asrProfileNames() : QStringList();
+}
+
+QString ApplicationController::activeAsrProfile() const
+{
+    return m_pipeline ? m_pipeline->asrProfileName() : QString();
+}
+
+bool ApplicationController::switchAsrProfile(const QString& profileName)
+{
+    if (!m_config) {
+        return false;
+    }
+    if (!m_config->hasAsrProfile(profileName)) {
+        reportError(QStringLiteral("Нет профиля ASR: %1").arg(profileName));
+        return false;
+    }
+
+    const Mode oldMode = m_mode;
+
+    if (m_pipeline) {
+        disconnect(m_pipeline.get(), nullptr, this, nullptr);
+        m_pipeline.reset();      // модель выгружается, ОЗУ освобождается
+    }
+    m_config->setActiveAsrProfileName(profileName);
+
+    if (!buildPipeline()) {
+        m_mode = Mode::Error;
+        emit modeChanged(m_mode);
+        return false;
+    }
+
+    setMode(oldMode);
+    return true;
+}
+
+void ApplicationController::reloadHotwords()
+{
+    if (m_hotwords) {
+        m_hotwords->reload();     // -> hotwordsChanged -> applyHotwords()
+    } else {
+        applyHotwords();
+    }
+}
+
+void ApplicationController::reloadCommands()
+{
+    if (!m_config) {
+        return;
+    }
+    // Та же сборка, что в конструкторе (секция 2): стандартный словарь из
+    // кода + свой файл поверх него. Держим отдельно, а не вызываем общий
+    // метод из конструктора: там свой порядок инициализации (hotwords-менеджер
+    // создаётся позже), и перенос дал бы больше риска, чем дублирование
+    // десяти строк.
+    m_commands = std::make_unique<CommandParser>();
+    const QString custom = m_config->customCommandsPath();
+    if (QFile::exists(custom)) {
+        const int added = m_commands->dictionary()->loadFromFile(custom);
+        qInfo().noquote()
+            << QStringLiteral("Команды: из своего файла %1 добавлено %2")
+                   .arg(custom).arg(added);
+    }
+    if (!m_config->notesVoiceCommands()) {
+        const QStringList phrases = CommandDictionary::targetCommandPhrases();
+        for (const QString& phrase : phrases) {
+            m_commands->dictionary()->removeCommand(phrase);
+        }
+    }
+    m_editCmdsInDictation = m_config->editingCommandsInDictation();
+    qInfo().noquote()
+        << QStringLiteral("Словарь команд перечитан: %1 фраз, editing_in_dictation=%2")
+               .arg(m_commands->dictionary()->size())
+               .arg(m_editCmdsInDictation ? QStringLiteral("true") : QStringLiteral("false"));
+
+    // Фразы команд уходят в hotwords ASR — обновляем следом.
+    applyHotwords();
+}
+
+void ApplicationController::reloadHotkey()
+{
+    // Останавливаем старый слушатель (деструктор закрывает fd устройств)
+    // и поднимаем новый с текущими [hotkey] key/mode из ini. Ошибки не
+    // смертельны: setupHotkey() сам пишет reportError, трей и D-Bus работают.
+    if (m_hotkey) {
+        m_hotkey->stop();
+        m_hotkey.reset();
+    }
+    if (m_mode != Mode::Off && m_hotkeyMode != m_config->hotkeyMode()) {
+        // Режим сменился посреди записи (push_to_talk <-> toggle): safer
+        // остановить запись, иначе отпускание клавиши в новом режиме не
+        // остановит диктовку.
+        stopRecording();
+    }
+    m_hotkeyMode = m_config->hotkeyMode();
+    setupHotkey();
+    qInfo().noquote()
+        << QStringLiteral("Хоткей перезапущен: %1").arg(hotkeyDescription());
+}
+
+void ApplicationController::reloadOutputSettings()
+{
+    if (!m_config) {
+        return;
+    }
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    if (!xdotool) {
+        return;
+    }
+
+    // Тот же набор сеттеров, что и в конструкторе: диалог настроек пишет ini,
+    // затем ТрайIcon дёргает этот метод — изменения вступают в силу сразу,
+    // без перезапуска. Привязка к окну (m_pinnedWindow внутри инжектора)
+    // не трогается: текущая диктовка продолжает идти в запомненное окно.
+    const QString method = m_config->injectorMethod();
+    if (method == QLatin1String("xdotool")) {
+        xdotool->setMethod(XdotoolInjector::Method::XdotoolType);
+    } else if (method == QLatin1String("clipboard")) {
+        xdotool->setMethod(XdotoolInjector::Method::Clipboard);
+    } else {
+        xdotool->setMethod(XdotoolInjector::Method::Auto);
+    }
+    xdotool->setTypingDelayMs(m_config->typingDelayMs());
+    xdotool->setPreserveClipboard(m_config->preserveClipboard());
+    xdotool->setClipboardRestoreMs(m_config->clipboardRestoreMs());
+    xdotool->setPinMode(stringToPinMode(m_config->pinMode()));
+    xdotool->setPinActivateDelayMs(m_config->pinActivateMs());
+    xdotool->setPinRestoreFocus(m_config->pinRestoreFocus());
+    xdotool->setOwnWindowClasses(m_config->ownWindowClasses());
+
+    m_pinWindow = m_config->pinWindow();
+
+    qInfo().noquote()
+        << QStringLiteral("Настройки вывода перечитаны: %1, pin_window=%2, pin_mode=%3")
+               .arg(xdotool->backendName(),
+                    m_pinWindow ? QStringLiteral("true") : QStringLiteral("false"),
+                    pinModeToString(xdotool->pinMode()));
+}
+
+// ---------------------------------------------------------------------------
+// Аудио
+// ---------------------------------------------------------------------------
+
+void ApplicationController::onAudioDataReady(const QByteArray& data, int sampleRate)
+{
+    m_audioBuffer.append(data);
+
+    while (m_audioBuffer.size() >= TARGET_CHUNK_SIZE) {
+        const QByteArray chunk = m_audioBuffer.left(TARGET_CHUNK_SIZE);
+        m_audioBuffer.remove(0, TARGET_CHUNK_SIZE);
+
+        const QByteArray processed = m_agc ? m_agc->process(chunk, sampleRate) : chunk;
+
+        if (m_audioDebugLog) {
+            const int16_t* samples = reinterpret_cast<const int16_t*>(processed.constData());
+            const int numSamples = processed.size() / static_cast<int>(sizeof(int16_t));
+            double sum = 0.0;
+            for (int i = 0; i < numSamples; ++i) {
+                sum += static_cast<double>(samples[i]) * samples[i];
+            }
+            const double rms = (numSamples > 0) ? std::sqrt(sum / numSamples) : 0.0;
+            const double db = (rms > 0) ? 20.0 * std::log10(rms / 32768.0) : -100.0;
+            qDebug().noquote()
+                << QString("Audio: %1 B, RMS %2 (%3 dB), gain %4, speech %5")
+                       .arg(processed.size())
+                       .arg(rms, 0, 'f', 0)
+                       .arg(db, 0, 'f', 1)
+                       .arg(m_agc ? m_agc->currentGain() : 1.0f, 0, 'f', 2)
+                       .arg(m_agc && m_agc->isSpeechDetected() ? QStringLiteral("YES")
+                                                               : QStringLiteral("NO"));
+        }
+
+        // Запись тракта для диагностики (работает в любом режиме).
+        // Пишется ВСЕГДА, в том числе когда глушитель печати выбрасывает аудио:
+        // снимок микрофона обязан показывать весь тракт, иначе его нельзя
+        // сравнивать с тем, что слышит ASR.
+        if (m_wavWriter && m_wavWriter->isOpen()) {
+            m_wavWriter->write(m_micCheckSource == QLatin1String("raw") ? chunk : processed);
+        }
+
+        // VAD в sherpa-onnx требует ровно 16 кГц моно int16 и сам не ресемплит
+        if (m_mode != Mode::Off && m_pipeline) {
+            if (m_typingGuard.blocked(m_clock.elapsed())) {
+                // Идёт печать: стук клавиш не должен превращаться в текст,
+                // а продиктованное — вклиниваться в напечатанное.
+                m_typingGuard.countDropped(processed.size() / 2);
+            } else {
+                m_pipeline->processAudio(processed, sampleRate);
+            }
+        }
+    }
+}
+
+void ApplicationController::onAudioError(const QString& message)
+{
+    qCritical() << "Audio error:" << message;
+    emit errorOccurred(message);
+}
+
+// ---------------------------------------------------------------------------
+// Проверка микрофона: запись тракта в WAV
+// ---------------------------------------------------------------------------
+
+bool ApplicationController::isMicChecking() const
+{
+    return m_wavWriter && m_wavWriter->isOpen();
+}
+
+QString ApplicationController::micCheckFile() const
+{
+    return isMicChecking() ? m_wavWriter->filePath() : QString();
+}
+
+bool ApplicationController::startMicCheck(QString* outFile)
+{
+    if (isMicChecking()) {
+        if (outFile) {
+            *outFile = m_wavWriter->filePath();
+        }
+        return true;
+    }
+    if (!m_audioCapture) {
+        reportError(QStringLiteral("Запись микрофона невозможна: захват звука не создан"));
+        return false;
+    }
+
+    const QString dir  = m_config ? m_config->micCheckDir()
+                                  : QDir::homePath() + QStringLiteral("/voice-assistant-recordings");
+    const QString name = WavWriter::defaultFileName(
+        m_config ? m_config->micCheckPrefix() : QStringLiteral("mic-check"));
+    const QString path = QDir(dir).filePath(name);
+
+    m_wavWriter = std::make_unique<WavWriter>();
+    // Захват отдаёт 16 кГц моно int16 — ровно то, что нужно WAV'у и ASR
+    if (!m_wavWriter->open(path, 16000, 1, 16)) {
+        reportError(m_wavWriter->lastError());
+        m_wavWriter.reset();
+        return false;
+    }
+
+    if (m_agc) {
+        m_agc->reset();
+    }
+    m_micCheckOwnsCapture = !m_audioCapture->isRunning();
+    if (m_micCheckOwnsCapture) {
+        m_audioCapture->start();   // режим не меняем: это диагностика, не диктовка
+    }
+
+    if (outFile) {
+        *outFile = path;
+    }
+    qInfo().noquote() << QStringLiteral("Запись микрофона начата: %1 (источник=%2)")
+                             .arg(path, m_micCheckSource);
+    emit micCheckStarted(path);
+    return true;
+}
+
+void ApplicationController::stopMicCheck()
+{
+    if (!isMicChecking()) {
+        return;
+    }
+
+    const QString path   = m_wavWriter->filePath();
+    const double  secs   = m_wavWriter->seconds();
+    m_wavWriter->close();
+    m_wavWriter.reset();
+
+    if (m_micCheckOwnsCapture && m_audioCapture && m_mode == Mode::Off) {
+        m_audioCapture->stop();
+    }
+    m_micCheckOwnsCapture = false;
+
+    qInfo().noquote() << QStringLiteral("Запись сохранена: %1 (%2 с)")
+                             .arg(path).arg(secs, 0, 'f', 2);
+    emit micCheckFinished(path, secs);
+}
+
+// ---------------------------------------------------------------------------
+// Глобальный хоткей
+// ---------------------------------------------------------------------------
+
+void ApplicationController::setupHotkey()
+{
+    const QString backend = m_config ? m_config->hotkeyBackend() : QStringLiteral("off");
+    if (backend == QLatin1String("off") || backend.isEmpty()) {
+        qInfo().noquote() << QStringLiteral("Хоткей: выключен ([hotkey] backend=off)");
+        return;
+    }
+    if (backend != QLatin1String("evdev")) {
+        reportError(QStringLiteral("Неизвестный [hotkey] backend='%1' (доступны: evdev, off)")
+                        .arg(backend));
+        return;
+    }
+
+    EvdevHotkeyListener::Options opt;
+    opt.key         = m_config->hotkeyKey();
+    opt.grab        = m_config->hotkeyGrab();
+    opt.grabDevices = m_config->hotkeyGrabDevices();
+
+    auto listener = std::make_unique<EvdevHotkeyListener>(opt);
+    connect(listener.get(), &IHotkeyListener::errorOccurred,
+            this, &ApplicationController::errorOccurred);
+    connect(listener.get(), &IHotkeyListener::pressed,  this, &ApplicationController::onHotkeyPressed);
+    connect(listener.get(), &IHotkeyListener::released, this, &ApplicationController::onHotkeyReleased);
+    // Печать пользователя глушит микрофон (см. audio/TypingGuard.h)
+    connect(listener.get(), &IHotkeyListener::keyActivity,
+            this, &ApplicationController::onKeyActivity);
+
+    QString err;
+    if (!listener->start(&err)) {
+        // Не смертельно: трей и D-Bus продолжают работать
+        reportError(QStringLiteral("Хоткей не запущен: %1").arg(err));
+        return;
+    }
+    m_hotkey = std::move(listener);
+}
+
+bool ApplicationController::isHotkeyActive() const
+{
+    return m_hotkey && m_hotkey->isActive();
+}
+
+QString ApplicationController::hotkeyDescription() const
+{
+    if (!m_hotkey) {
+        return QStringLiteral("выключен");
+    }
+    return QStringLiteral("%1, клавиша %2, режим %3")
+        .arg(m_hotkey->backendName(), m_config->hotkeyKey(), m_hotkeyMode);
+}
+
+void ApplicationController::onHotkeyPressed()
+{
+    if (m_hotkeyMode == QLatin1String("toggle")) {
+        if (m_mode == Mode::Off) {
+            startRecording();
+        } else {
+            stopRecording();
+        }
+        return;
+    }
+    // push-to-talk: держим клавишу — идёт запись
+    if (m_mode == Mode::Off) {
+        startRecording();
+    }
+}
+
+void ApplicationController::onHotkeyReleased()
+{
+    if (m_hotkeyMode != QLatin1String("toggle") && m_mode != Mode::Off) {
+        stopRecording();   // внутри flush() — хвост фразы не теряется
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Результат распознавания
+// ---------------------------------------------------------------------------
+
+void ApplicationController::onRawTextRecognized(const QString& raw)
+{
+    // Команда ищется по «сырому» тексту: TextPostProcessor съедает слова
+    // «точка», «новая строка», «пробел», превращая их в знаки, и команда
+    // из готового текста уже не соберётся.
+    if (!m_commands) {
+        return;
+    }
+    if (const auto cmd = m_commands->parse(raw); cmd.has_value()) {
+        m_skipNextText = true;
+        executeCommand(*cmd);
+    }
+}
+
+void ApplicationController::onTextReady(const QString& text)
+{
+    emit textRecognized(text);
+
+    if (m_skipNextText) {
+        m_skipNextText = false;   // фраза была командой — вставлять нечего
+        return;
+    }
+
+    switch (m_mode) {
+    case Mode::Dictation:
+        injectText(text);
+        break;
+
+    case Mode::Spellcheck:
+        // Диктуем как обычно и тут же проверяем: текст вставляется, а о найденных
+        // ошибках сообщаем сигналом (трей показывает их уведомлением).
+        injectText(text);
+        runSpellcheck(text);
+        break;
+
+    case Mode::Edit:
+        // В режиме правки текст не вставляется: работают только команды
+        break;
+
+    case Mode::Off:
+    case Mode::Error:
+        break;
+    }
+}
+
+void ApplicationController::injectText(const QString& text)
+{
+    // Цель «заметки»: файл. Ни фокус окна, ни клавиатура, ни буфер обмена
+    // не участвуют, поэтому печатать руками можно параллельно с диктовкой.
+    if (m_target == OutputTarget::Notes) {
+        if (!m_notes || !m_notes->isAvailable()) {
+            reportError(QStringLiteral("Заметки недоступны: файл не открыт "
+                                       "([notes] enabled=false или нет прав на каталог)"));
+            return;
+        }
+        if (!m_notes->typeText(text)) {
+            reportError(QStringLiteral("Не удалось записать заметку: %1")
+                            .arg(m_notes->lastError()));
+            return;
+        }
+        qInfo().noquote() << QStringLiteral("Заметка -> %1").arg(m_notes->filePath());
+        emit noteWritten(m_notes->filePath(), text);
+        return;
+    }
+
+    if (!m_injector || !m_injector->isAvailable()) {
+        reportError(QStringLiteral("Некуда вставлять текст: инжектор недоступен"));
+        return;
+    }
+
+    // Привязанное окно могли закрыть, пока шла запись (или это было всплывающее
+    // меню, которое уже исчезло). Тогда вставка ушла бы в никуда: снимаем
+    // привязку и честно пишем в лог, что текст пойдёт в активное окно.
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    if (xdotool && !m_pinnedWindow.isEmpty()
+        && !XdotoolInjector::windowExists(m_pinnedWindow)) {
+        qWarning().noquote()
+            << QStringLiteral("pin_window: окно %1 закрыто, привязка снята — "
+                              "текст пойдёт в активное окно").arg(m_pinnedWindow);
+        m_pinnedWindow.clear();
+        xdotool->clearPinnedWindow();
+    }
+
+    // VAD отдаёт речь отдельными фразами, каждая вставляется своим вызовом.
+    // Без разделителя получалось "…двадцать лет назад.Сегодня вот…" — добавляем
+    // пробел, если предыдущая вставка им не закончилась.
+    QString toType = text;
+    if (m_config->spaceBetweenSegments()
+        && TextPostProcessor::needsLeadingSpace(m_lastInjected, toType)) {
+        toType.prepend(QLatin1Char(' '));
+    }
+
+    if (!m_injector->typeText(toType)) {
+        // «Не удалось вставить текст» без адреса ни о чём не говорит, поэтому
+        // рядом всегда печатаем КУДА именно мы целились.
+        reportError(QStringLiteral("Не удалось вставить текст (%1 символ) в %2%3")
+                        .arg(toType.size())
+                        .arg(m_pinnedWindow.isEmpty()
+                                 ? QStringLiteral("активное окно")
+                                 : QStringLiteral("окно ") + m_pinnedWindow,
+                             xdotool ? QStringLiteral(": ") + xdotool->lastError() : QString()));
+        return;
+    }
+    m_lastInjected = toType;
+}
+
+// ---------------------------------------------------------------------------
+// Проверка правописания
+// ---------------------------------------------------------------------------
+
+bool ApplicationController::isSpellcheckAvailable() const
+{
+    return static_cast<bool>(m_spellChecker);
+}
+
+QStringList ApplicationController::checkText(const QString& text)
+{
+    return m_spellChecker ? m_spellChecker->check(text) : QStringList();
+}
+
+QStringList ApplicationController::suggestionsFor(const QString& word)
+{
+    return m_spellChecker ? m_spellChecker->suggest(word) : QStringList();
+}
+
+QString ApplicationController::spellcheckStatus() const
+{
+    if (!m_spellChecker) {
+        return QStringLiteral("недоступна (нет hunspell или словаря)");
+    }
+    const auto* hun = dynamic_cast<const HunspellChecker*>(m_spellChecker.get());
+    return hun ? QStringLiteral("hunspell, словарь %1").arg(hun->dictionaryPath())
+               : QStringLiteral("доступна");
+}
+
+void ApplicationController::runSpellcheck(const QString& text)
+{
+    if (!m_spellChecker) {
+        return;
+    }
+
+    const QStringList errors = m_spellChecker->check(text);
+    if (errors.isEmpty()) {
+        qInfo().noquote() << QStringLiteral("Орфография: ошибок нет");
+        emit spellcheckFinished(text, errors);
+        return;
+    }
+
+    QStringList report;
+    report.reserve(errors.size());
+    for (const QString& word : errors) {
+        const QStringList sug = m_spellChecker->suggest(word);
+        report << (sug.isEmpty() ? word
+                                 : QStringLiteral("%1 -> %2").arg(word, sug.join(QStringLiteral(", "))));
+    }
+
+    qWarning().noquote()
+        << QStringLiteral("Орфография: найдено %1 — %2")
+               .arg(errors.size())
+               .arg(report.join(QStringLiteral("; ")));
+
+    emit spellcheckFinished(text, errors);
+}
+
+void ApplicationController::executeCommand(const Command& cmd)
+{
+    const QString desc = commandDescription(cmd);
+
+    if (cmd.type == Command::Type::SetMode) {
+        emit commandExecuted(desc);
+        setMode(cmd.mode);
+        return;
+    }
+
+    // Смена цели вывода — это маршрутизация, а не правка текста, поэтому она
+    // обязана работать и в режиме диктовки при editing_in_dictation=false.
+    // Иначе сказанное «заметка» пропало бы именно тогда, когда оно нужно.
+    if (cmd.type == Command::Type::SetTarget) {
+        emit commandExecuted(desc);
+        setOutputTarget(cmd.target);
+        return;
+    }
+
+    // Правка текста в режиме диктовки по умолчанию запрещена: иначе продиктованное
+    // «удали слово» съедало бы само себя. Включается [commands] editing_in_dictation=true.
+    if (m_mode == Mode::Dictation && !m_editCmdsInDictation) {
+        qInfo().noquote()
+            << QStringLiteral("Команда «%1» пропущена: режим диктовки "
+                              "(commands/editing_in_dictation=false)").arg(desc);
+        return;
+    }
+
+    // Команды правки идут в ту же цель, что и текст: для заметок это файл
+    // («удали слово» сотрёт последнее слово последней заметки, «новая строка»
+    // добавит пустую строку).
+    ITextInjector* out = activeInjector();
+    if (!out) {
+        reportError(QStringLiteral("Инжектор недоступен, команда «%1» не выполнена")
+                        .arg(desc));
+        return;
+    }
+
+    switch (cmd.type) {
+    case Command::Type::DeleteWord:
+        out->sendKey(QStringLiteral("ctrl+BackSpace"));
+        break;
+    case Command::Type::DeleteLine:
+        out->sendKey(QStringLiteral("shift+Home"));
+        out->sendKey(QStringLiteral("BackSpace"));
+        break;
+    case Command::Type::NewLine:
+        out->sendKey(QStringLiteral("Return"));
+        break;
+    case Command::Type::Space:
+        out->sendKey(QStringLiteral("space"));
+        break;
+    case Command::Type::Punctuation:
+        out->typeText(cmd.argument);
+        break;
+    case Command::Type::SetMode:
+    case Command::Type::SetTarget:
+    case Command::Type::Unknown:
+        break;
+    }
+
+    emit commandExecuted(desc);
+}
+
+// ---------------------------------------------------------------------------
+// Цель вывода: активное окно или файл заметок
+// ---------------------------------------------------------------------------
+
+void ApplicationController::setupNotes()
+{
+    if (!m_config->notesEnabled()) {
+        qInfo().noquote() << QStringLiteral("Заметки выключены ([notes] enabled=false)");
+        return;
+    }
+
+    FileInjector::Options nopt;
+    nopt.dir            = m_config->notesDir();
+    nopt.file           = m_config->notesFile();
+    nopt.timestampFormat = m_config->notesTimestampFormat();
+    nopt.markdown       = m_config->notesMarkdown();
+    nopt.dayHeader      = m_config->notesDayHeader();
+
+    auto notes = std::make_unique<FileInjector>(nopt);
+    if (!notes->initialize()) {
+        // Не смертельно: диктовка в окно продолжает работать.
+        reportError(QStringLiteral("Заметки недоступны: %1").arg(notes->lastError()));
+        return;
+    }
+    m_notes = std::move(notes);
+
+    if (m_config->notesStartTarget() == QLatin1String("notes")) {
+        m_target = OutputTarget::Notes;
+        qInfo().noquote()
+            << QStringLiteral("Цель вывода по умолчанию — файл заметок: %1")
+                   .arg(m_notes->filePath());
+    }
+}
+
+OutputTarget ApplicationController::outputTarget() const
+{
+    return m_target;
+}
+
+QString ApplicationController::outputTargetName() const
+{
+    return outputTargetToString(m_target);
+}
+
+bool ApplicationController::isNotesAvailable() const
+{
+    return m_notes && m_notes->isAvailable();
+}
+
+QString ApplicationController::notesFilePath() const
+{
+    return m_notes ? m_notes->filePath() : QString();
+}
+
+bool ApplicationController::setOutputTarget(OutputTarget target)
+{
+    if (target == OutputTarget::Notes && !isNotesAvailable()) {
+        reportError(QStringLiteral("Заметки недоступны: включите [notes] enabled "
+                                   "и проверьте права на каталог %1")
+                        .arg(m_config ? m_config->notesDir() : QString()));
+        return false;
+    }
+    if (m_target == target) {
+        return true;
+    }
+
+    m_target = target;
+    // Пробел между сегментами считается от последней вставки В ОКНО; для файла
+    // каждая запись — своя строка, поэтому хвост сбрасываем.
+    m_lastInjected.clear();
+
+    qInfo().noquote()
+        << QStringLiteral("Куда писать: %1%2")
+               .arg(outputTargetTitle(m_target),
+                    m_target == OutputTarget::Notes && m_notes
+                        ? QStringLiteral(" (%1)").arg(m_notes->filePath())
+                        : QString());
+    emit outputTargetChanged(m_target);
+    return true;
+}
+
+bool ApplicationController::toggleOutputTarget()
+{
+    return setOutputTarget(m_target == OutputTarget::Notes ? OutputTarget::Focus
+                                                           : OutputTarget::Notes);
+}
+
+ITextInjector* ApplicationController::activeInjector() const
+{
+    if (m_target == OutputTarget::Notes) {
+        return (m_notes && m_notes->isAvailable()) ? m_notes.get() : nullptr;
+    }
+    return (m_injector && m_injector->isAvailable()) ? m_injector.get() : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Привязка вставки к окну и глушитель печати
+// ---------------------------------------------------------------------------
+
+void ApplicationController::captureTargetWindow()
+{
+    if (!m_pinWindow) {
+        return;
+    }
+    auto* xdotool = dynamic_cast<XdotoolInjector*>(m_injector.get());
+    if (!xdotool) {
+        return;
+    }
+
+    const QString wid = XdotoolInjector::activeWindowId();
+    if (wid.isEmpty()) {
+        qWarning().noquote()
+            << QStringLiteral("pin_window: не удалось определить активное окно, "
+                              "вставка пойдёт туда, где будет фокус");
+        xdotool->clearPinnedWindow();
+        m_pinnedWindow.clear();
+        return;
+    }
+
+    // ЗАЩИТА ОТ САМОЙ ОБИДНОЙ ПОЛОМКИ. Запись часто начинают кликом по меню
+    // трея, а в X11 всплывающее меню — это отдельное окно, и именно оно в этот
+    // момент активно. Привязка к нему означала, что весь продиктованный текст
+    // уезжает в меню, которое закрывается через мгновение вместе с текстом:
+    // в логе при этом «успех», а в редакторе ничего. Окна помощника узнаём по
+    // WM_CLASS ([output] own_window_class) и по PID собственного процесса.
+    const QString cls = XdotoolInjector::windowClass(wid);
+    const QStringList own = m_config ? m_config->ownWindowClasses() : QStringList();
+    const qint64 pid = XdotoolInjector::windowPid(wid);
+    const bool isSelf = (!cls.isEmpty() && own.contains(cls))
+                        || (pid != 0 && pid == QCoreApplication::applicationPid());
+    if (isSelf) {
+        qWarning().noquote()
+            << QStringLiteral("pin_window: активное окно %1 принадлежит самому помощнику "
+                              "(WM_CLASS=%2, pid=%3) — привязка НЕ установлена, текст пойдёт "
+                              "в окно, которое будет в фокусе на момент вставки. "
+                              "Начинайте запись хоткеем (%4), а не кликом по меню трея.")
+                   .arg(XdotoolInjector::describeWindow(wid),
+                        cls.isEmpty() ? QStringLiteral("?") : cls)
+                   .arg(pid)
+                   .arg(m_config ? m_config->hotkeyKey() : QStringLiteral("хоткей"));
+        xdotool->clearPinnedWindow();
+        m_pinnedWindow.clear();
+        return;
+    }
+
+    m_pinnedWindow = wid;
+    xdotool->setPinnedWindow(wid);
+}
+
+void ApplicationController::onKeyActivity()
+{
+    if (m_typingGuard.isEnabled()) {
+        m_typingGuard.noteKeyActivity(m_clock.elapsed());
+    }
+}
+
+===== src/core/VoicePipeline.h =====
+
+#pragma once
+
+#include <QByteArray>
+#include <QObject>
+#include <QString>
+#include <QStringList>
+#include <memory>
+
+#include "config/AsrProfile.h"
+#include "text/TextPostProcessor.h"
+
+class ConfigManager;
+class IRecognizer;
+class SileroVad;
+
+// Связка «микрофонный чанк -> VAD -> ASR -> постобработка -> готовый текст».
+//
+// Сделана отдельным классом намеренно: ApplicationController остаётся тонким
+// (режимы, трей, инжектор), а вся речевая цепочка живёт здесь и тестируется
+// отдельно (её же использует tools/vad_asr_test).
+//
+// Типовой usage в ApplicationController:
+//
+//   m_pipeline = std::make_unique<VoicePipeline>(VoicePipeline::loadSettings(m_config), this);
+//   QString err;
+//   if (!m_pipeline->initialize(&err)) { emit errorOccurred(err); return; }
+//   connect(m_pipeline.get(), &VoicePipeline::textReady, this, &ApplicationController::onText);
+//   ...
+//   // в onAudioDataReady, после AGC:
+//   m_pipeline->processAudio(processedData, sampleRate);
+//   // при отпускании клавиши push-to-talk:
+//   m_pipeline->flush();
+class VoicePipeline : public QObject {
+    Q_OBJECT
+
+public:
+    struct Settings {
+        // VAD
+        QString vadModelPath;
+        float   vadThreshold    = 0.5f;
+        float   vadMinSilence   = 0.5f;
+        float   vadMinSpeech    = 0.25f;
+        float   vadMaxSpeech    = 20.0f;
+        int     vadWindowSize   = 512;
+        int     vadNumThreads   = 1;
+        float   vadBufferSeconds = 60.0f;
+
+        // ASR
+        AsrProfile asr;
+
+        // Постобработка текста
+        TextPostProcessor::Options text;
+
+        // Скоринг подсказок. Формат sherpa-onnx позволяет задавать скор на фразу:
+        // "фраза :1.00" (двоеточие обязательно ПОСЛЕ слов). Диктантные знаки
+        // бустим слабее пользовательских слов: слишком сильный буст начинает
+        // вставлять «точку» там, где её не произносили.
+        float punctuationHotwordsScore = 2.0f;   // замер: ниже 1.75 слова теряются
+    };
+
+    // Собирает Settings из ConfigManager (settings.ini).
+    static Settings loadSettings(const ConfigManager& config);
+
+    explicit VoicePipeline(const Settings& settings, QObject* parent = nullptr);
+    ~VoicePipeline() override;
+
+    // Создаёт VAD и ASR. Возвращает false, если моделей нет на диске или
+    // sherpa-onnx не смог инициализироваться; детали — в *error и в сигнале errorOccurred.
+    bool initialize(QString* error = nullptr);
+
+    bool isReady() const { return m_ready; }
+
+    // PCM16 mono. Частота должна быть 16000 Гц (VAD в sherpa-onnx сам не ресемплит).
+    void processAudio(const QByteArray& pcm16Mono, int sampleRate);
+
+    // Вытолкнуть хвост текущей фразы (конец диктовки / отпускание клавиши PTT).
+    void flush();
+
+    // Сбросить состояние VAD и незадекодированный буфер ASR.
+    void reset();
+
+    // Подсказки пользователя. Реально применяются только для engine=transducer
+    // в modified_beam_search; остальные движки пишут предупреждение в лог.
+    //
+    // К списку автоматически примешиваются диктантные знаки ("точка", "запятая",
+    // "вопросительный знак", ...) если включена голосовая пунктуация и движок —
+    // transducer: без буста ASR эти слова проглатывает, и пунктуация не появится.
+    void setHotwords(const QStringList& words, float score);
+
+    QString asrProfileName() const { return m_settings.asr.name; }
+
+signals:
+    // Готовая фраза после постобработки — её можно отдавать в инжектор или парсер команд.
+    void textReady(const QString& text);
+
+    // То, что выдал ASR до постобработки (для логов и отладки hotwords).
+    void rawTextRecognized(const QString& text);
+
+    void speechStarted();
+    void speechEnded();
+    void errorOccurred(const QString& message);
+
+private:
+    void onSpeechSegment(const QByteArray& pcm16, int sampleRate);
+    void applyHotwords();
+
+    Settings m_settings;
+    std::unique_ptr<SileroVad> m_vad;
+    std::unique_ptr<IRecognizer> m_asr;
+    TextPostProcessor m_post;
+    QStringList m_userHotwords;
+    float m_hotwordsScore = 2.0f;
+    bool m_hotwordsApplied = false;
+    bool m_ready = false;
+};
+
+===== src/core/VoicePipeline.cpp =====
+
+#include "VoicePipeline.h"
+
+#include "asr/IRecognizer.h"
+#include "asr/RecognizerFactory.h"
+#include "config/ConfigManager.h"
+#include "vad/SileroVad.h"
+
+#include <QDebug>
+#include <QSet>
+
+VoicePipeline::VoicePipeline(const Settings& settings, QObject* parent)
+    : QObject(parent)
+    , m_settings(settings)
+    , m_post(settings.text)
+    , m_hotwordsScore(settings.asr.hotwordsScore)
+{
+}
+
+VoicePipeline::~VoicePipeline() = default;
+
+VoicePipeline::Settings VoicePipeline::loadSettings(const ConfigManager& config)
+{
+    Settings s;
+
+    s.vadModelPath     = config.sileroVadPath();
+    s.vadThreshold     = config.vadThreshold();
+    s.vadMinSilence    = config.vadMinSilenceDuration();
+    s.vadMinSpeech     = config.vadMinSpeechDuration();
+    s.vadWindowSize    = config.vadWindowSize();
+    s.vadNumThreads    = config.vadNumThreads();
+    s.vadBufferSeconds = config.vadBufferSeconds();
+
+    s.asr = config.activeAsrProfile();
+
+    s.text.voicePunctuation    = config.voicePunctuation();
+    s.text.capitalizeSentences = config.capitalizeSentences();
+    s.text.addFinalDot         = config.addFinalDot();
+    s.text.collapseSpaces      = true;
+
+    s.punctuationHotwordsScore = config.punctuationHotwordsScore();
+
+    return s;
+}
+
+bool VoicePipeline::initialize(QString* error)
+{
+    const auto fail = [this, error](const QString& msg) {
+        if (error) {
+            *error = msg;
+        }
+        qCritical().noquote() << "VoicePipeline:" << msg;
+        emit errorOccurred(msg);
+        return false;
+    };
+
+    if (m_settings.vadModelPath.isEmpty()) {
+        return fail(QStringLiteral("не задан путь к silero_vad.onnx ([vad] model в settings.ini)"));
+    }
+
+    // --- VAD ---
+    SileroVad::Options vadOpt;
+    vadOpt.threshold          = m_settings.vadThreshold;
+    vadOpt.minSilenceDuration = m_settings.vadMinSilence;
+    vadOpt.minSpeechDuration  = m_settings.vadMinSpeech;
+    vadOpt.maxSpeechDuration  = m_settings.vadMaxSpeech;
+    vadOpt.windowSize         = m_settings.vadWindowSize;
+    vadOpt.numThreads         = m_settings.vadNumThreads;
+    vadOpt.bufferSizeSeconds  = m_settings.vadBufferSeconds;
+
+    // Родителя QObject не задаём намеренно: владельцем является unique_ptr.
+    // Если передать this, объект попадёт и в список детей, и под unique_ptr —
+    // порядок деструкции (сначала члены, потом база QObject) делает это безопасным,
+    // но полагаться на такой тонкий момент не стоит.
+    m_vad = std::make_unique<SileroVad>(m_settings.vadModelPath, vadOpt);
+
+    connect(m_vad.get(), &IVad::speechStarted, this, &VoicePipeline::speechStarted);
+    connect(m_vad.get(), &IVad::speechEnded,   this, &VoicePipeline::speechEnded);
+    connect(m_vad.get(), &IVad::errorOccurred, this, &VoicePipeline::errorOccurred);
+    connect(m_vad.get(), &SileroVad::speechSegmentReady,
+            this, &VoicePipeline::onSpeechSegment);
+
+    if (!m_vad->initialize()) {
+        return fail(QStringLiteral("SileroVad::initialize() вернул false для %1")
+                        .arg(m_settings.vadModelPath));
+    }
+
+    // --- ASR ---
+    QString factoryError;
+    m_asr = RecognizerFactory::create(m_settings.asr, nullptr, &factoryError);
+    if (!m_asr) {
+        return fail(factoryError.isEmpty()
+                        ? QStringLiteral("не удалось создать распознаватель для профиля '%1'")
+                              .arg(m_settings.asr.name)
+                        : factoryError);
+    }
+
+    connect(m_asr.get(), &IRecognizer::errorOccurred, this, &VoicePipeline::errorOccurred);
+
+    if (!m_asr->initialize()) {
+        return fail(QStringLiteral("ASR '%1' (engine=%2) не инициализировался")
+                        .arg(m_settings.asr.name,
+                             AsrProfile::engineToString(m_settings.asr.engine)));
+    }
+
+    m_ready = true;
+
+    // Подсказки здесь НЕ применяем: ApplicationController всё равно вызовет
+    // setHotwords() со своим списком, и получилась бы двойная строка в логе
+    // (13 шт. от знаков, потом 31 шт. со словарём команд). Вместо этого
+    // applyHotwords() сработает лениво — перед первым декодированием, если
+    // список так никто и не задал (так работает tools/vad_asr_test).
+
+    qInfo().noquote() << QString("VoicePipeline готов: VAD=%1 | ASR=%2 (%3) | потоков=%4 | пунктуация=%5")
+                             .arg(m_settings.vadModelPath,
+                                  m_settings.asr.name,
+                                  AsrProfile::engineToString(m_settings.asr.engine))
+                             .arg(m_settings.asr.numThreads)
+                             .arg(m_settings.text.voicePunctuation ? QStringLiteral("голосовая")
+                                                                    : QStringLiteral("выкл"));
+    return true;
+}
+
+void VoicePipeline::processAudio(const QByteArray& pcm16Mono, int sampleRate)
+{
+    if (!m_ready || !m_vad) {
+        return;
+    }
+    m_vad->processAudio(pcm16Mono, sampleRate);
+}
+
+void VoicePipeline::flush()
+{
+    if (m_vad) {
+        m_vad->flush();
+    }
+}
+
+void VoicePipeline::reset()
+{
+    if (m_vad) {
+        m_vad->reset();
+    }
+    if (m_asr) {
+        m_asr->reset();
+    }
+}
+
+void VoicePipeline::setHotwords(const QStringList& words, float score)
+{
+    m_userHotwords  = words;
+    m_hotwordsScore = score;
+    applyHotwords();
+}
+
+void VoicePipeline::applyHotwords()
+{
+    if (!m_asr) {
+        return;   // ещё не инициализированы — применим в initialize()
+    }
+
+    QStringList effective = m_userHotwords;
+
+    // Диктантные знаки ("точка", "запятая", ...) добавляем сами: замер показал,
+    // что без буста модель их просто не выдаёт, и голосовая пунктуация не работает.
+    // Смысл есть только для transducer в modified_beam_search — остальные движки
+    // hotwords игнорируют.
+    const bool canBoost = m_settings.text.voicePunctuation
+        && m_settings.asr.engine == AsrProfile::Engine::Transducer
+        && m_settings.asr.decodingMethod == QLatin1String("modified_beam_search");
+
+    if (canBoost) {
+        // Записи могут приходить уже с суффиксом ":score" (их добавляет
+        // ApplicationController для фраз команд), поэтому сравниваем по базовой
+        // фразе — иначе «точка» попала бы в список дважды с разными скорами.
+        QSet<QString> already;
+        for (const QString& e : effective) {
+            const int i = e.lastIndexOf(QStringLiteral(" :"));
+            already.insert(i < 0 ? e : e.left(i));
+        }
+
+        const QStringList punct = m_post.punctuationPhrases();
+        const QString suffix = QStringLiteral(" :%1")
+                                   .arg(m_settings.punctuationHotwordsScore, 0, 'f', 2);
+        for (const QString& p : punct) {
+            if (!already.contains(p)) {
+                effective << p + suffix;   // "точка :2.00" — скор именно на эту фразу
+                already.insert(p);
+            }
+        }
+    }
+
+    m_asr->setHotwords(effective, m_hotwordsScore);
+    m_hotwordsApplied = true;
+
+    const int userCount = m_userHotwords.size();
+    qInfo().noquote()
+        << QStringLiteral("Hotwords: %1 пользовательских/командных + %2 диктантных знаков = %3 "
+                          "(score=%4)")
+               .arg(userCount)
+               .arg(effective.size() - userCount)
+               .arg(effective.size())
+               .arg(m_hotwordsScore, 0, 'f', 1);
+}
+
+void VoicePipeline::onSpeechSegment(const QByteArray& pcm16, int sampleRate)
+{
+    if (!m_asr) {
+        return;
+    }
+
+    if (!m_hotwordsApplied) {
+        applyHotwords();   // лениво: диктантные знаки должны попасть в ASR до первого декода
+    }
+
+    m_asr->acceptWaveform(pcm16, sampleRate);
+    const QString raw = m_asr->finalResult();
+    if (raw.isEmpty()) {
+        return;
+    }
+
+    emit rawTextRecognized(raw);
+
+    const QString text = m_post.process(raw);
+    if (!text.isEmpty()) {
+        emit textReady(text);
+    }
+}
+
+===== src/ui/TrayIcon.h =====
+
+#pragma once
+
+#include <QSystemTrayIcon>
+#include <QMap>
+#include "core/Mode.h"
+#include "core/OutputTarget.h"
+#include "ui/SettingsDialog.h"
+
+class QAction;
+class ApplicationController;
+
+class TrayIcon : public QSystemTrayIcon
+{
+    Q_OBJECT
+
+public:
+    explicit TrayIcon(ApplicationController* controller, QWidget* parent = nullptr);
+
+    // Мастер загрузки моделей: вызывается из меню и из main() при первом
+    // запуске, если детектор речи не установлен.
+    void showModelDownloader();
+
+private slots:
+    void onToggleRecording();
+    void onShowSettings();
+    void onShowHotwordsEditor();
+    void onShowCommandsEditor();
+    void onShowModelDownloader();
+    void onModeChanged(Mode mode);
+    void onError(const QString& message);
+    void onToggleMicCheck();
+    void onToggleNotesTarget();
+    void onOpenNotesFile();
+    void onOutputTargetChanged(OutputTarget target);
+
+private:
+    void buildMenu();
+    void connectSignals();
+    void updateIcon(Mode mode);
+    void updateMenu(Mode mode);
+    // Тултип лотка — единственный постоянно видимый индикатор состояния:
+    // режим (ожидание / ● ЗАПИСЬ / ошибка), цель вывода и активная модель.
+    void updateTooltip();
+    // Синхронизирует пункты заметок с состоянием контроллера БЕЗ уведомления:
+    // вызывается при старте и из updateMenu(), чтобы не показывать всплывающее
+    // окно каждый раз, когда меню перерисовывается.
+    void syncNotesAction();
+    // Один диалог настроек на все случаи: пункты меню лотка открывают его
+    // на нужной вкладке, а применение настроек (settingsApplied) описано
+    // в одном месте.
+    void execSettingsDialog(SettingsDialog::Tab tab);
+
+    ApplicationController* m_controller;
+    QAction* m_toggleAction = nullptr;
+    QAction* m_micCheckAction = nullptr;
+    QAction* m_notesAction = nullptr;       // куда писать: окно или файл заметок
+    QAction* m_openNotesAction = nullptr;
+    QMap<Mode, QAction*> m_modeActions;
+};
+===== src/ui/TrayIcon.cpp =====
+
+#include "ui/TrayIcon.h"
+#include "core/ApplicationController.h"
+#include "config/AsrProfile.h"
+#include "config/ConfigManager.h"
+#include "ui/ModelDownloadDialog.h"
+#include "ui/SettingsDialog.h"
+
+#include <QDebug>
+
+#include <QAction>
+#include <QApplication>
+#include <QDesktopServices>
+#include <QFileInfo>
+#include <QUrl>
+#include <QIcon>
+#include <QMenu>
+#include <QTimer>
+
+TrayIcon::TrayIcon(ApplicationController* controller, QWidget* parent)
+    : QSystemTrayIcon(parent)
+    , m_controller(controller)
+{
+    buildMenu();
+    connectSignals();
+    updateIcon(m_controller ? m_controller->mode() : Mode::Off);
+    updateTooltip();
+    syncNotesAction();
+
+    // Ошибки, возникшие в конструкторе ApplicationController, сигналом мы уже
+    // не получим (подписка появилась позже). Догоняем их отложенно — к этому
+    // моменту значок в лотке уже создан и уведомление будет кому показать.
+    if (m_controller && !m_controller->lastError().isEmpty()) {
+        const QString msg = m_controller->lastError();
+        QTimer::singleShot(300, this, [this, msg]() { onError(msg); });
+    }
+}
+
+void TrayIcon::buildMenu()
+{
+    auto* menu = new QMenu();
+
+    // --- Пункт вкл/выкл микрофона (иконка меняется динамически) ---
+    m_toggleAction = menu->addAction(
+        QIcon(":/icons/mic-off.svg"),
+        tr("Включить микрофон")
+    );
+    connect(m_toggleAction, &QAction::triggered,
+            this, &TrayIcon::onToggleRecording);
+
+    menu->addSeparator();
+
+    // --- Подменю режимов ---
+    QMenu* modeMenu = menu->addMenu(tr("Режим"));
+
+    m_modeActions[Mode::Dictation] = modeMenu->addAction(
+        QIcon(":/icons/dictation.svg"), tr("Диктовка"));
+    m_modeActions[Mode::Edit] = modeMenu->addAction(
+        QIcon(":/icons/edit.svg"), tr("Редактирование"));
+    m_modeActions[Mode::Spellcheck] = modeMenu->addAction(
+        QIcon(":/icons/spellcheck.svg"), tr("Проверка орфографии"));
+
+    for (auto it = m_modeActions.begin(); it != m_modeActions.end(); ++it) {
+        it.value()->setCheckable(true);
+        Mode mode = it.key();
+        connect(it.value(), &QAction::triggered, this, [this, mode]() {
+            m_controller->setMode(mode);
+        });
+    }
+
+    // --- Проверка микрофона: запись тракта в WAV ---
+    m_micCheckAction = menu->addAction(tr("Проверить микрофон (запись в WAV)"));
+    m_micCheckAction->setCheckable(true);
+    connect(m_micCheckAction, &QAction::triggered, this, &TrayIcon::onToggleMicCheck);
+
+    menu->addSeparator();
+
+    // --- Цель вывода: активное окно или файл заметок ---
+    // Заметки нужны, чтобы диктовать по ходу работы с файлом: результат уходит
+    // в файл, а не в окно, поэтому клавиатура, фокус и буфер обмена свободны —
+    // можно продолжать печатать руками.
+    m_notesAction = menu->addAction(tr("Писать в файл заметок"));
+    m_notesAction->setCheckable(true);
+    m_notesAction->setToolTip(tr("Распознанный текст дописывается в файл заметок, "
+                                 "а не вставляется в активное окно"));
+    connect(m_notesAction, &QAction::triggered, this, &TrayIcon::onToggleNotesTarget);
+
+    m_openNotesAction = menu->addAction(tr("Открыть файл заметок"));
+    connect(m_openNotesAction, &QAction::triggered, this, &TrayIcon::onOpenNotesFile);
+
+    menu->addSeparator();
+
+    // --- Настройки: один диалог, пункты меню открывают нужную вкладку ---
+    auto* modelsAction = menu->addAction(tr("Скачать модели..."));
+    modelsAction->setToolTip(tr("Мастер загрузки: список моделей с размером, "
+                                "проверка sha256, докачка при обрыве"));
+    connect(modelsAction, &QAction::triggered,
+            this, &TrayIcon::onShowModelDownloader);
+
+    auto* settingsAction = menu->addAction(tr("Настройки..."));
+    connect(settingsAction, &QAction::triggered,
+            this, &TrayIcon::onShowSettings);
+
+    auto* hotwordsAction = menu->addAction(tr("Голосовые подсказки..."));
+    hotwordsAction->setToolTip(tr("Слова и фразы, которые модель должна узнавать лучше"));
+    connect(hotwordsAction, &QAction::triggered,
+            this, &TrayIcon::onShowHotwordsEditor);
+
+    auto* commandsAction = menu->addAction(tr("Голосовые команды..."));
+    commandsAction->setToolTip(tr("Что понимает помощник: встроенные команды и свои фразы"));
+    connect(commandsAction, &QAction::triggered,
+            this, &TrayIcon::onShowCommandsEditor);
+
+    menu->addSeparator();
+
+    // --- Выход ---
+    auto* quitAction = menu->addAction(tr("Выход"));
+    connect(quitAction, &QAction::triggered,
+            qApp, &QApplication::quit);
+
+    setContextMenu(menu);
+}
+
+void TrayIcon::connectSignals()
+{
+    connect(m_controller, &ApplicationController::modeChanged,
+            this, &TrayIcon::onModeChanged);
+    connect(m_controller, &ApplicationController::errorOccurred,
+            this, &TrayIcon::onError);
+    connect(m_controller, &ApplicationController::outputTargetChanged,
+            this, &TrayIcon::onOutputTargetChanged);
+
+    // Запись микрофона завершена — сообщаем, куда лёг файл
+    connect(m_controller, &ApplicationController::micCheckFinished,
+            this, [this](const QString& path, double seconds) {
+        if (m_micCheckAction) {
+            m_micCheckAction->setChecked(false);
+            m_micCheckAction->setText(tr("Проверить микрофон (запись в WAV)"));
+        }
+        const QString msg = tr("%1 с записано в %2\nПрогнать: ./tools/vad-asr-test %3 --config "
+                               "~/.config/voice-assistant/settings.ini")
+                                .arg(seconds, 0, 'f', 1).arg(path, path);
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Запись микрофона сохранена"), msg, QSystemTrayIcon::Information, 15000);
+        } else {
+            qInfo().noquote() << msg;
+        }
+    });
+
+    // Результаты проверки правописания показываем уведомлением: список слов
+    // с вариантами исправления берём у контроллера, чтобы не тащить их сигналом.
+    connect(m_controller, &ApplicationController::spellcheckFinished,
+            this, [this](const QString& text, const QStringList& errors) {
+        Q_UNUSED(text)
+        if (errors.isEmpty()) {
+            return;
+        }
+        QStringList lines;
+        for (const QString& w : errors) {
+            const QStringList sug = m_controller->suggestionsFor(w);
+            lines << (sug.isEmpty() ? w
+                                    : QStringLiteral("%1 → %2").arg(w, sug.join(QStringLiteral(", "))));
+        }
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(QStringLiteral("Проверка правописания: %1").arg(errors.size()),
+                          lines.join(QStringLiteral("\n")),
+                          QSystemTrayIcon::Information, 10000);
+        } else {
+            qInfo().noquote() << lines.join(QStringLiteral("; "));
+        }
+    });
+}
+
+void TrayIcon::onToggleMicCheck()
+{
+    if (!m_controller) {
+        return;
+    }
+    if (m_controller->isMicChecking()) {
+        m_controller->stopMicCheck();
+        if (m_micCheckAction) {
+            m_micCheckAction->setChecked(false);
+            m_micCheckAction->setText(tr("Проверить микрофон (запись в WAV)"));
+        }
+    } else {
+        QString path;
+        if (m_controller->startMicCheck(&path) && m_micCheckAction) {
+            m_micCheckAction->setChecked(true);
+            m_micCheckAction->setText(tr("Остановить запись: %1").arg(QFileInfo(path).fileName()));
+        }
+    }
+}
+
+void TrayIcon::onError(const QString& message)
+{
+    if (message.isEmpty()) {
+        return;
+    }
+    if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+        showMessage(QStringLiteral("voice-assistant"), message,
+                    QSystemTrayIcon::Warning, 15000);
+    } else {
+        // нет лотка (чистый WM, ssh) — хотя бы в лог
+        qWarning().noquote() << message;
+    }
+}
+
+// --- Слоты ---
+
+void TrayIcon::onToggleRecording()
+{
+    if (m_controller->mode() == Mode::Off) {
+        m_controller->startRecording();
+    } else {
+        m_controller->stopRecording();
+    }
+}
+
+void TrayIcon::onShowSettings()
+{
+    execSettingsDialog(SettingsDialog::TabAsr);
+}
+
+void TrayIcon::onShowHotwordsEditor()
+{
+    execSettingsDialog(SettingsDialog::TabHotwords);
+}
+
+void TrayIcon::onShowCommandsEditor()
+{
+    execSettingsDialog(SettingsDialog::TabCommands);
+}
+
+void TrayIcon::onShowModelDownloader()
+{
+    showModelDownloader();
+}
+
+void TrayIcon::showModelDownloader()
+{
+    if (!m_controller) {
+        return;
+    }
+    ModelDownloadDialog dialog;
+    // После успешной загрузки: если ТЕКУЩИЙ активный профиль не готов
+    // (модель не скачана), переключаем на рекомендованный из установленных.
+    // Работающий выбор не трогаем — пользователь мог скачать gigaam для шума,
+    // оставив zipformer активным.
+    connect(&dialog, &ModelDownloadDialog::modelsInstalled, this,
+            [this](const QString& recommended) {
+        const ConfigManager cfg;
+        const AsrProfile active = cfg.asrProfile(cfg.activeAsrProfileName());
+        QString err;
+        if (active.isValid(&err)) {
+            return;   // активный профиль и так готов
+        }
+        if (recommended.isEmpty() || recommended == cfg.activeAsrProfileName()) {
+            return;
+        }
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const bool ok = m_controller->switchAsrProfile(recommended);
+        QApplication::restoreOverrideCursor();
+        const QString msg = ok
+            ? tr("Активный профиль ASR: %1 (перезагружен без перезапуска).")
+                  .arg(recommended)
+            : tr("Не удалось активировать профиль %1: %2")
+                  .arg(recommended, m_controller->lastError());
+        if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+            showMessage(tr("Модели установлены"), msg,
+                        ok ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning,
+                        ok ? 5000 : 15000);
+        } else {
+            qInfo().noquote() << msg;
+        }
+    });
+    dialog.exec();
+}
+
+void TrayIcon::execSettingsDialog(SettingsDialog::Tab tab)
+{
+    if (!m_controller) {
+        return;
+    }
+    SettingsDialog dialog(nullptr, tab);
+    // settingsApplied испускается после записи ini/файлов — применяем на лету:
+    // модель, цель вывода, настройки инжектора, хоткей, подсказки и команды
+    // перечитываются без перезапуска. И ОБЯЗАТЕЛЬНО говорим пользователю, что
+    // применилось: молчаливое применение настроек — то самое «выглядит рабочим,
+    // но не работает», с которым проект борется с итерации 10.
+    connect(&dialog, &SettingsDialog::settingsApplied, this, [this]() {
+        const ConfigManager cfg;   // свежий экземпляр: читает уже сохранённый ini
+
+        QString modelReport;
+        bool modelFailed = false;
+        const QString profile = cfg.activeAsrProfileName();
+        if (profile != m_controller->activeAsrProfile()) {
+            // Пересоздание пайплайна занимает 1–2 с: показываем курсор
+            // ожидания, иначе UI выглядит подвисшим.
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            const bool ok = m_controller->switchAsrProfile(profile);
+            QApplication::restoreOverrideCursor();
+            modelFailed = !ok;
+            modelReport = ok
+                ? tr("Модель ASR «%1» перезагружена.").arg(profile)
+                : tr("Модель ASR «%1» НЕ переключена: %2")
+                      .arg(profile, m_controller->lastError());
+        }
+
+        // Состояние применяем синхронно: к моменту возврата из диалога всё
+        // уже действует.
+        m_controller->setOutputTarget(
+            cfg.notesStartTarget() == QLatin1String("notes") ? OutputTarget::Notes
+                                                             : OutputTarget::Focus);
+        m_controller->reloadOutputSettings();
+        m_controller->reloadHotkey();
+        m_controller->reloadHotwords();
+        m_controller->reloadCommands();
+        syncNotesAction();
+
+        // Тултип и уведомление — ОТЛОЖЕННО, на следующем витке event loop:
+        // здесь мы всё ещё внутри saveSettings() модального диалога (exec()
+        // не вернулся). Обращения к лотковому мосту (setToolTip/showMessage
+        // у QSystemTrayIcon на StatusNotifier) из стека сигнала сохранения,
+        // пока модальное окно живо и вот-вот начнёт разрушаться, — плохая
+        // примета; в отложенном виде они выполняются уже после уничтожения
+        // диалога.
+        const QString body = modelReport.isEmpty()
+            ? tr("Изменения вступили в силу без перезапуска.")
+            : modelReport;
+        QTimer::singleShot(0, this, [this, body, modelFailed]() {
+            updateTooltip();
+            if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+                showMessage(tr("Настройки применены"), body,
+                            modelFailed ? QSystemTrayIcon::Warning
+                                        : QSystemTrayIcon::Information,
+                            modelFailed ? 15000 : 4000);
+            } else {
+                qInfo().noquote() << QStringLiteral("Настройки применены: %1").arg(body);
+            }
+        });
+    });
+    dialog.exec();
+}
+
+void TrayIcon::onModeChanged(Mode mode)
+{
+    updateIcon(mode);
+    updateMenu(mode);
+    updateTooltip();
+}
+
+// --- Приватные методы обновления ---
+
+void TrayIcon::updateIcon(Mode mode)
+{
+    QString iconPath;
+    switch (mode) {
+        case Mode::Off:         iconPath = ":/icons/mic-off.svg";      break;
+        case Mode::Dictation:   iconPath = ":/icons/dictation.svg";    break;
+        case Mode::Edit:        iconPath = ":/icons/edit.svg";         break;
+        case Mode::Spellcheck:  iconPath = ":/icons/spellcheck.svg";   break;
+        case Mode::Error:       iconPath = ":/icons/error.svg";        break;
+    }
+    setIcon(QIcon(iconPath));
+}
+
+void TrayIcon::updateMenu(Mode mode)
+{
+    // Обновляем пункт "Вкл/Выкл микрофон"
+    const bool isRecording = (mode != Mode::Off);
+    if (isRecording) {
+        m_toggleAction->setIcon(QIcon(":/icons/mic-on.svg"));
+        m_toggleAction->setText(tr("Выключить микрофон"));
+    } else {
+        m_toggleAction->setIcon(QIcon(":/icons/mic-off.svg"));
+        m_toggleAction->setText(tr("Включить микрофон"));
+    }
+
+    // Галки на пунктах режимов
+    for (auto it = m_modeActions.begin(); it != m_modeActions.end(); ++it) {
+        it.value()->setChecked(it.key() == mode);
+    }
+
+    syncNotesAction();
+}
+
+void TrayIcon::updateTooltip()
+{
+    if (!m_controller) {
+        setToolTip(tr("Голосовой помощник"));
+        return;
+    }
+    QString state;
+    switch (m_controller->mode()) {
+    case Mode::Off:        state = tr("ожидание (микрофон выключен)"); break;
+    case Mode::Dictation:  state = tr("● ЗАПИСЬ — диктовка");          break;
+    case Mode::Edit:       state = tr("● ЗАПИСЬ — редактирование");    break;
+    case Mode::Spellcheck: state = tr("● ЗАПИСЬ — проверка правописания"); break;
+    case Mode::Error:      state = tr("ОШИБКА — см. последнее уведомление"); break;
+    }
+    const bool notes = (m_controller->outputTarget() == OutputTarget::Notes);
+    const QString target = notes
+        ? tr("файл заметок %1").arg(m_controller->notesFilePath())
+        : tr("активное окно (привязывается в начале записи)");
+    setToolTip(tr("Голосовой помощник\n%1\nКуда писать: %2\nМодель: %3")
+                   .arg(state, target, m_controller->activeAsrProfile()));
+}
+
+void TrayIcon::syncNotesAction()
+{
+    if (!m_controller) {
+        return;
+    }
+    const bool notes = (m_controller->outputTarget() == OutputTarget::Notes);
+    const QString path = m_controller->notesFilePath();
+
+    if (m_notesAction) {
+        m_notesAction->setChecked(notes);
+        m_notesAction->setText(notes ? tr("Писать в активное окно")
+                                     : tr("Писать в файл заметок"));
+        m_notesAction->setEnabled(notes || !path.isEmpty());
+    }
+    if (m_openNotesAction) {
+        m_openNotesAction->setEnabled(!path.isEmpty());
+        m_openNotesAction->setText(path.isEmpty()
+            ? tr("Открыть файл заметок")
+            : tr("Открыть заметки: %1").arg(QFileInfo(path).fileName()));
+    }
+}
+
+void TrayIcon::onToggleNotesTarget()
+{
+    if (!m_controller) {
+        return;
+    }
+    // -> outputTargetChanged -> onOutputTargetChanged (галка и уведомление)
+    m_controller->toggleOutputTarget();
+}
+
+void TrayIcon::onOutputTargetChanged(OutputTarget target)
+{
+    syncNotesAction();
+    updateTooltip();
+
+    // Уведомление обязательно: другого индикатора цели вывода нет, а ошибка
+    // «диктовал в редактор, а текст ушёл в файл» стоит дорого.
+    const bool notes = (target == OutputTarget::Notes);
+    const QString title = notes ? tr("Заметки") : tr("Диктовка");
+    const QString msg = notes
+        ? tr("Текст дописывается в %1\nКлавиатура, фокус и буфер обмена не трогаются.")
+              .arg(m_controller ? m_controller->notesFilePath() : QString())
+        : tr("Текст вставляется в активное окно.");
+
+    if (QSystemTrayIcon::isSystemTrayAvailable() && supportsMessages()) {
+        showMessage(title, msg, QSystemTrayIcon::Information, 6000);
+    } else {
+        qInfo().noquote() << title << QStringLiteral(":") << msg;
+    }
+}
+
+void TrayIcon::onOpenNotesFile()
+{
+    const QString path = m_controller ? m_controller->notesFilePath() : QString();
+    if (path.isEmpty()) {
+        onError(tr("Файл заметок не задан (проверьте [notes] enabled)"));
+        return;
+    }
+    if (!QFileInfo::exists(path)) {
+        onError(tr("Файла заметок ещё нет: %1\nОн появится после первой записи.").arg(path));
+        return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path))) {
+        onError(tr("Не удалось открыть %1").arg(path));
+    }
+}
+===== src/asr/IRecognizer.h =====
+
+#pragma once
+
+#include <QObject>
+#include <QByteArray>
+#include <QString>
+#include <QStringList>
+
+// ЭТАЛОН интерфейса (такой же, как в твоём проекте).
+class IRecognizer : public QObject {
+    Q_OBJECT
+
+public:
+    explicit IRecognizer(QObject* parent = nullptr) : QObject(parent) {}
+    ~IRecognizer() override = default;
+
+    virtual bool initialize() = 0;
+    virtual void acceptWaveform(const QByteArray& audioData, int sampleRate) = 0;
+    virtual QString finalResult() = 0;
+    virtual void reset() = 0;
+    virtual void setHotwords(const QStringList& words, float score) = 0;
+    virtual bool isLoaded() const = 0;
+
+signals:
+    void errorOccurred(const QString& message);
+};
+
+===== src/output/ITextInjector.h =====
+
+#pragma once
+
+#include <QString>
+
+class ITextInjector {
+public:
+    virtual ~ITextInjector() = default;
+    
+    virtual bool initialize() = 0;
+    virtual bool typeText(const QString& text) = 0;
+    virtual bool sendKey(const QString& key) = 0;  // "BackSpace", "Return", "Left" и т.д.
+    virtual bool isAvailable() const = 0;
+
+    // Как именно вставляется текст (для логов и SettingsDialog).
+    // Не чисто виртуальный: существующие реализации не сломаются.
+    virtual QString backendName() const { return QStringLiteral("unknown"); }
+};
+===== src/audio/IAudioCapture.h =====
+
+#pragma once
+
+#include <QObject>
+#include <QByteArray>
+
+class IAudioCapture : public QObject {
+    Q_OBJECT
+
+public:
+    explicit IAudioCapture(QObject* parent = nullptr) : QObject(parent) {}
+    virtual ~IAudioCapture() = default;
+    
+    virtual bool initialize() = 0;
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual bool isRunning() const = 0;
+    
+signals:
+    void audioDataReady(const QByteArray& data, int sampleRate);
+    void errorOccurred(const QString& message);
+};
+===== src/audio/WavWriter.h =====
+
+#pragma once
+
+#include <QByteArray>
+#include <QFile>
+#include <QString>
+
+// Запись PCM16 в WAV-файл.
+//
+// Зачем: без записи живого тракта (микрофон -> AGC -> VAD/ASR) невозможно
+// отдебажить качество распознавания. Файл потом прогоняется офлайн:
+//   ./tools/vad-asr-test запись.wav --config ~/.config/voice-assistant/settings.ini
+// и сравнивается между профилями ASR, с AGC и без.
+//
+// Заголовок пишется сразу с нулевыми размерами и правится в close() —
+// поэтому файл остаётся валидным даже после аварийного завершения:
+// размеры можно пересчитать из фактической длины (так делает tools/vad_asr_test).
+class WavWriter {
+public:
+    WavWriter();
+    ~WavWriter();
+
+    // bits пока только 16 — весь тракт проекта работает с PCM16
+    bool open(const QString& path, int sampleRate, int channels = 1, int bits = 16);
+    bool write(const QByteArray& pcm);
+    void close();
+
+    bool    isOpen() const { return m_file.isOpen(); }
+    QString filePath() const { return m_file.fileName(); }
+    qint64  dataBytes() const { return m_dataBytes; }
+    int     sampleRate() const { return m_sampleRate; }
+    int     channels() const { return m_channels; }
+    double  seconds() const;
+    QString lastError() const { return m_lastError; }
+
+    // 44-байтный заголовок RIFF/WAVE PCM. Вынесено, чтобы его можно было
+    // протестировать без файловой системы.
+    static QByteArray makeHeader(int sampleRate, int channels, int bits, qint64 dataBytes);
+
+    // Имя файла с отметкой времени: mic-check-20261003-042501.wav
+    static QString defaultFileName(const QString& prefix = QStringLiteral("mic-check"));
+
+private:
+    bool patchHeader();
+
+    QFile   m_file;
+    int     m_sampleRate = 16000;
+    int     m_channels   = 1;
+    int     m_bits       = 16;
+    qint64  m_dataBytes  = 0;
+    QString m_lastError;
+};
+
+===== src/text/TextPostProcessor.h =====
+
+#pragma once
+
+#include <QList>
+#include <QPair>
+#include <QString>
+
+// Постобработка текста, который выдаёт ASR.
+//
+// Зачем: ни zipformer-ru, ни GigaAM (кроме недоступных в ONNX e2e-версий) не ставят
+// знаки препинания и заглавные буквы. Русской модели пунктуации в sherpa-onnx нет.
+// Поэтому:
+//   1) голосовые знаки препинания ("точка" -> ".", "запятая" -> ",") — надёжный способ;
+//   2) граница сегмента VAD = граница предложения: заглавная в начале, точка в конце;
+//   3) косметика: убрать пробел перед знаком, схлопнуть повторы.
+//
+// Класс намеренно НЕ QObject: чистая функция над строкой, удобно тестировать.
+class TextPostProcessor {
+public:
+    struct Options {
+        bool voicePunctuation  = true;   // "точка" -> "."
+        bool capitalizeSentences = true; // заглавная после начала текста и после ". "
+        bool addFinalDot       = true;   // точка в конце, если знака нет
+        bool collapseSpaces    = true;   // лишние пробелы и пробел перед знаком
+    };
+
+    using Rule = QPair<QString, QString>;   // фраза (строчными) -> что вставить
+
+    // Два конструктора вместо `= Options()` в аргументе: GCC не позволяет
+    // использовать default member initializers вложенного структура в default
+    // argument того же класса ("required before the end of its enclosing class").
+    TextPostProcessor();
+    explicit TextPostProcessor(const Options& options);
+
+    QString process(const QString& raw) const;
+
+    void setRules(const QList<Rule>& rules);
+    const QList<Rule>& rules() const { return m_rules; }
+
+    // Фразы-знаки ("точка", "вопросительный знак", ...) — их стоит добавлять
+    // в hotwords, иначе ASR их проглатывает: модель обучена на живой речи и не
+    // ожидает диктантных команд. Проверено замером: с ними в hotwords текст
+    // "…помощника точка набор текста работает запятая…" распознаётся целиком,
+    // без них оба "точка" теряются. Слово "пробел" не возвращаем: его буст
+    // рискованнее, чем полезен.
+    QStringList punctuationPhrases() const;
+
+    // Порядок важен: сначала самые длинные фразы, иначе "точка с запятой"
+    // превратится в "точка" + хвост.
+    static QList<Rule> defaultRules();
+
+    // Нужен ли пробел перед очередным сегментом при вставке.
+    //
+    // VAD режет речь на фразы, и каждая вставляется отдельным вызовом typeText().
+    // Без разделителя получается "…двадцать лет назад.Сегодня вот…" — именно так
+    // это и выглядело в первом живом прогоне.
+    //
+    // Правила: пробел нужен, если предыдущий сегмент не кончился пробелом/переводом
+    // строки, а следующий не начинается со знака препинания или закрывающей кавычки.
+    static bool needsLeadingSpace(const QString& previous, const QString& next);
+
+private:
+    QString applyVoicePunctuation(const QString& text) const;
+    static QString fixSpacing(const QString& text);
+    static QString capitalizeSentences(const QString& text);
+    static QString ensureFinalDot(const QString& text);
+
+    Options m_options;
+    QList<Rule> m_rules;   // отсортированы по убыванию числа слов
+};
+
+===== src/config/AsrProfile.h =====
+
+#pragma once
+
+#include <QDir>
+#include <QFile>
+#include <QString>
+
+// Описание одной ASR-модели: откуда грузить и как декодировать.
+// Профили живут в settings.ini, секции вида [asr_<имя>], активный — в [asr] active=.
+//
+// Проверенные на практике профили (см. README, раздел 1):
+//   small-zipformer-ru        transducer  110 МБ  RTF 0.06   hotwords: да   ОСНОВНОЙ
+//   GigaAM v3 RNN-T           transducer  167 МБ  RTF 0.27   hotwords: да   для шумного аудио
+//   GigaAM v3 CTC             nemo-ctc    163 МБ  RTF 0.16   hotwords: нет
+//   Whisper base              whisper     208 МБ  RTF 0.51   hotwords: нет  пунктуация + ITN + en
+struct AsrProfile {
+    enum class Engine {
+        Unknown,
+        Transducer,   // encoder + decoder + joiner (zipformer-ru, GigaAM RNN-T)
+        NemoCtc,      // одна модель (GigaAM CTC, NeMo CTC)
+        Whisper       // encoder + decoder (Whisper)
+    };
+
+    QString name;
+    Engine  engine = Engine::Unknown;
+
+    // transducer
+    QString encoderPath;
+    QString decoderPath;
+    QString joinerPath;
+    // nemo-ctc
+    QString ctcModelPath;
+    // общее
+    QString tokensPath;
+
+    // whisper
+    QString language = QStringLiteral("ru");   // "" = автоопределение
+
+    // hotwords (только transducer + modified_beam_search)
+    QString bpeVocabPath;                       // словарь ssentencepiece для BPE-моделей
+    QString modelingUnit;                       // "bpe" или пусто
+
+    int     numThreads     = 2;
+    QString decodingMethod = QStringLiteral("modified_beam_search");
+    int     maxActivePaths = 4;
+    float   hotwordsScore  = 2.0f;
+    bool    debug          = false;
+
+    static Engine engineFromString(const QString& s);
+    static QString engineToString(Engine e);
+
+    // Проверяет, что движок задан и все нужные файлы существуют на диске.
+    bool isValid(QString* error = nullptr) const;
+};
+
+// ---------------------------------------------------------------------------
+
+inline AsrProfile::Engine AsrProfile::engineFromString(const QString& s)
+{
+    const QString v = s.trimmed().toLower();
+    if (v == QLatin1String("transducer") || v == QLatin1String("rnnt")
+        || v == QLatin1String("zipformer") || v == QLatin1String("gigaam-rnnt")) {
+        return Engine::Transducer;
+    }
+    if (v == QLatin1String("nemo-ctc") || v == QLatin1String("nemo_ctc")
+        || v == QLatin1String("ctc") || v == QLatin1String("gigaam-ctc")) {
+        return Engine::NemoCtc;
+    }
+    if (v == QLatin1String("whisper")) {
+        return Engine::Whisper;
+    }
+    return Engine::Unknown;
+}
+
+inline QString AsrProfile::engineToString(AsrProfile::Engine e)
+{
+    switch (e) {
+    case Engine::Transducer: return QStringLiteral("transducer");
+    case Engine::NemoCtc:    return QStringLiteral("nemo-ctc");
+    case Engine::Whisper:    return QStringLiteral("whisper");
+    case Engine::Unknown:    break;
+    }
+    return QStringLiteral("unknown");
+}
+
+inline bool AsrProfile::isValid(QString* error) const
+{
+    const auto need = [&](const QString& path, const char* what) {
+        if (path.isEmpty() || !QFile::exists(path)) {
+            if (error) {
+                *error = QStringLiteral(
+                         "профиль '%1': %2 не найден: %3\n"
+                         "  Модели скачиваются отдельно — см. docs/models.md "
+                         "(wget из релизов k2-fsa/sherpa-onnx в ~/.voice_models).\n"
+                         "  Диагностика: ./src/voice-assistant --check")
+                         .arg(name, QString::fromLatin1(what), path);
+            }
+            return false;
+        }
+        return true;
+    };
+
+    switch (engine) {
+    case Engine::Transducer:
+        return need(encoderPath, "encoder")
+            && need(decoderPath, "decoder")
+            && need(joinerPath, "joiner")
+            && need(tokensPath, "tokens");
+    case Engine::NemoCtc:
+        return need(ctcModelPath, "model")
+            && need(tokensPath, "tokens");
+    case Engine::Whisper:
+        return need(encoderPath, "encoder")
+            && need(decoderPath, "decoder")
+            && need(tokensPath, "tokens");
+    case Engine::Unknown:
+        if (error) {
+            *error = QStringLiteral("профиль '%1': неизвестный engine").arg(name);
+        }
+        return false;
+    }
+    return false;
+}
+
+===== src/CMakeLists.txt =====
+
+file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS "*.cpp")
+file(GLOB_RECURSE HEADERS CONFIGURE_DEPENDS "*.h")
+
+# main.cpp не входит в библиотеку: он нужен только исполняемому файлу,
+# а тесты должны линковаться со всем остальным кодом.
+set(CORE_SOURCES ${ALL_SOURCES})
+list(FILTER CORE_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
+
+# ---------------------------------------------------------------------------
+# Статическая библиотека с ядром. Нужна тестам (tests/CMakeLists.txt ссылается
+# на цель voice-assistant-core) и позволяет гонять QTest без GUI и микрофона.
+# ---------------------------------------------------------------------------
+add_library(voice-assistant-core STATIC
+    ${CORE_SOURCES}
+    ${HEADERS}   # ОБЯЗАТЕЛЬНО: header-only классы с Q_OBJECT (IVad, IRecognizer,
+                 # IAudioCapture) иначе не попадают в AUTOMOC -> undefined
+                 # reference to `vtable for IVad'
+)
+
+target_include_directories(voice-assistant-core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${SHERPA_ONNX_INCLUDE_DIR}
+)
+
+# ---------------------------------------------------------------------------
+# hunspell — проверка правописания. Зависимость НЕОБЯЗАТЕЛЬНАЯ:
+# если её нет, проект собирается без режима Spellcheck (см. HunspellChecker.cpp).
+# ---------------------------------------------------------------------------
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HUNSPELL QUIET hunspell)
+endif()
+
+if(HUNSPELL_FOUND)
+    target_compile_definitions(voice-assistant-core PRIVATE HAVE_HUNSPELL=1)
+    target_include_directories(voice-assistant-core PRIVATE ${HUNSPELL_INCLUDE_DIRS})
+    if(HUNSPELL_LIBRARY_DIRS)
+        target_link_directories(voice-assistant-core PRIVATE ${HUNSPELL_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(voice-assistant-core PUBLIC ${HUNSPELL_LIBRARIES})
+    message(STATUS "hunspell ${HUNSPELL_VERSION}: найден — проверка правописания включена")
+else()
+    message(WARNING
+        "hunspell не найден — проект соберётся БЕЗ проверки правописания.\n"
+        "   Установка: sudo apt install libhunspell-dev hunspell-ru\n"
+        "   После этого пересоберите: cd build && cmake .. && make -j4")
+endif()
+
+# ONNX Runtime не линкуем намеренно — он уже внутри libsherpa-onnx-c-api.so
+target_link_libraries(voice-assistant-core PUBLIC
+    Qt5::Core
+    Qt5::Widgets
+    Qt5::Multimedia
+    Qt5::DBus
+    Qt5::Network
+    ${SHERPA_ONNX_CXX_LIBRARY}
+    ${SHERPA_ONNX_C_LIBRARY}
+)
+
+# ---------------------------------------------------------------------------
+# Исполняемый файл
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_SOURCE_DIR}/resources/resources.qrc")
+    set(RESOURCES "${CMAKE_SOURCE_DIR}/resources/resources.qrc")
+else()
+    set(RESOURCES "")
+endif()
+
+add_executable(voice-assistant
+    main.cpp
+    ${RESOURCES}
+)
+
+target_link_libraries(voice-assistant PRIVATE voice-assistant-core)
+
+# ---------------------------------------------------------------------------
+# Установка (используется CPack'ом для .deb/.rpm).
+#
+# Рантайм-библиотеки везём С СОБОЙ в /usr/lib/voice-assistant: sherpa-onnx
+# нет в репозиториях дистрибутивов, а hunspell в Ubuntu 24.04 переименован
+# (t64) — общая сборка должна ставиться и на 22.04, и на 24.04. RPATH
+# бинарника — $ORIGIN-относительный: пакет самодостаточен и чисто сносится.
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+
+install(TARGETS voice-assistant RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+set_target_properties(voice-assistant PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/voice-assistant")
+
+option(VOICE_ASSISTANT_BUNDLE_LIBS
+       "Устанавливать sherpa-onnx/onnxruntime/hunspell рядом с бинарником (для пакетов)" ON)
+if(VOICE_ASSISTANT_BUNDLE_LIBS)
+    get_filename_component(_sherpa_dir "${SHERPA_ONNX_C_LIBRARY}" DIRECTORY)
+    file(GLOB _bundled_libs
+         "${_sherpa_dir}/libsherpa-onnx-c-api.so*"
+         "${_sherpa_dir}/libsherpa-onnx-cxx-api.so*"
+         "${_sherpa_dir}/libonnxruntime.so*")
+    # hunspell: имя узнаём из pkg-config, сами файлы — glob'ом рядом
+    find_library(_hunspell_lib
+                 NAMES ${HUNSPELL_LIBRARIES} hunspell-1.7 hunspell
+                 PATHS ${HUNSPELL_LIBRARY_DIRS} /usr/lib/x86_64-linux-gnu /usr/lib64)
+    if(_hunspell_lib)
+        get_filename_component(_hunspell_dir "${_hunspell_lib}" DIRECTORY)
+        file(GLOB _hunspell_libs "${_hunspell_dir}/libhunspell-*.so*")
+        list(APPEND _bundled_libs ${_hunspell_libs})
+    endif()
+    if(_bundled_libs)
+        install(FILES ${_bundled_libs}
+                DESTINATION ${CMAKE_INSTALL_LIBDIR}/voice-assistant)
+        message(STATUS "В пакет будут уложены библиотеки: ${_bundled_libs}")
+    else()
+        message(WARNING "VOICE_ASSISTANT_BUNDLE_LIBS=ON, но библиотеки не найдены — "
+                        "пакет получится нерабочим")
+    endif()
+endif()
+
+target_compile_definitions(voice-assistant PRIVATE
+    VOICE_ASSISTANT_VERSION="${PROJECT_VERSION}")

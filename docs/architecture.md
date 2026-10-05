@@ -92,6 +92,8 @@ VoicePipeline::textReady(text)          → emit textRecognized(text)
 | Правописание | `ISpellChecker` | `HunspellChecker` (hunspell, C API) |
 | Глобальный хоткей | `IHotkeyListener` | `EvdevHotkeyListener` (`/dev/input/event*`) |
 | Запись аудио | — | `WavWriter` (PCM16 → WAV) |
+| Чтение аудиофайлов | — | `AudioFileDecoder` (WAV/RAW/GStreamer → моно 16 кГц int16) |
+| Разбор файла в текст | — | `FileTranscriber` (worker в QThread: декодер → `VoicePipeline`) |
 | Глушитель печати | — | `TypingGuard` (header-only, время передаётся снаружи) |
 | Цель вывода | — | `OutputTarget` (`Focus` / `Notes`) |
 
@@ -326,10 +328,19 @@ evdev: клавиша ──▶ IHotkeyListener::keyActivity()
 
 ## Потоки
 
-Один поток (GUI). Аудио приходит из `QAudioInput` через `QIODevice::readyRead`
-в тот же поток; VAD и ASR считаются синхронно внутри слота. Для Celeron это
-осознанный выбор: RTF zipformer-ru ≈ 0.06, то есть декодирование фразы в разы
-быстрее её длительности, и выносить ASR в отдельный поток пока незачем.
+Диктовка живёт в одном потоке (GUI). Аудио приходит из `QAudioInput` через
+`QIODevice::readyRead` в тот же поток; VAD и ASR считаются синхронно внутри
+слота. Для Celeron это осознанный выбор: RTF zipformer-ru ≈ 0.06, то есть
+декодирование фразы в разы быстрее её длительности, и выносить ASR в отдельный
+поток пока незачем.
+
+Исключение — разбор аудиофайла («разбери файл» / `--transcribe`): часовой звонок
+считается минуты, поэтому `FileTranscriber` работает в своём `QThread`
+(moveToThread + `run()` по `started`). Свой `VoicePipeline` он создаёт уже
+в рабочем потоке — диктующий конвейер не трогается (плата: на время разбора
+модель загружена дважды). Прогресс и результат приходят в GUI очередью
+(`Qt::QueuedConnection` автоматически: получатель живёт в главном потоке),
+отмена — атомарным флагом, который проверяется в цикле подачи аудио.
 
 Если понадобится стриминговое распознавание с частичными результатами,
 декодирование придётся вынести в worker-поток, а обмен сделать через

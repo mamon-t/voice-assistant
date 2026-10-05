@@ -32,6 +32,10 @@ private slots:
     void onToggleNotesTarget();
     void onOpenNotesFile();
     void onOutputTargetChanged(OutputTarget target);
+    // Контроллер попросил показать выбор файла («разбери файл» или пункт меню):
+    // диалог выбора -> (для RAW — диалог параметров) -> startFileTranscription
+    // -> модальный прогресс с отменой -> уведомление с итогом.
+    void onTranscribeFileRequested(const QString& targetWindowId);
 
 private:
     void buildMenu();
@@ -53,6 +57,7 @@ private:
     ApplicationController* m_controller;
     QAction* m_toggleAction = nullptr;
     QAction* m_micCheckAction = nullptr;
+    QAction* m_transcribeAction = nullptr;   // «Разобрать аудиофайл…»
     QAction* m_notesAction = nullptr;       // куда писать: окно или файл заметок
     QAction* m_openNotesAction = nullptr;
     QMap<Mode, QAction*> m_modeActions;

@@ -416,7 +416,7 @@ QWidget* SettingsDialog::buildCommandsTab()
     customLay->addWidget(new QLabel(
         QStringLiteral("Формат: «фраза = тип[:аргумент]», типы: set-mode:{dictation|edit|"
                        "spellcheck|off}, set-target:{focus|notes}, delete-word, delete-line, "
-                       "new-line, space, punctuation:<символ>.\n"
+                       "new-line, space, punctuation:<символ>, transcribe-file.\n"
                        "Своя фраза перекрывает встроенную с тем же действием; при сохранении "
                        "файл перезаписывается (комментарии не сохраняются), битые строки "
                        "сохранить не дадим.")));
