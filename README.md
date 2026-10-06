@@ -1,9 +1,8 @@
 # voice-assistant
 
-Офлайновый голосовой помощник для Linux: диктовка текста в любое поле ввода,
-голосовые команды правки и проверка правописания. Распознавание работает локально —
-без интернета, без облаков и без отправки аудио куда-либо. Рассчитан на слабое
-железо (Celeron, 4–16 ГБ ОЗУ).
+Offline voice assistant for Linux: dictation into any input field, voice editing commands, and spellchecking. Recognition runs locally — no internet, no clouds, no sending audio anywhere. Designed for low-end hardware (Celeron, 4–16 GB RAM).
+
+![README russian](README_RU.md) 
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)
@@ -13,114 +12,113 @@
 
 ---
 
-## Возможности
+## Features
 
-* **Диктовка в любое приложение** — текст вставляется через буфер обмена + `Ctrl+V`
-  либо через `xdotool type`, работает в браузере, редакторах и терминале.
-  Прежнее содержимое буфера запоминается и возвращается обратно
+* **Dictation into any application** — text is inserted via clipboard + `Ctrl+V`
+  or via `xdotool type`; works in browsers, editors, and terminals.
+  Previous clipboard contents are remembered and restored
   (`[output] preserve_clipboard`).
-* **Полностью офлайн** — VAD (Silero) и ASR (zipformer-ru / GigaAM / Whisper)
-  выполняются локально через [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx).
-* **Голосовые команды** — смена режима, удаление слова/строки, новая строка,
-  знаки препинания. Словарь расширяется своим файлом.
-* **Пунктуация голосом** — «точка», «запятая», «вопросительный знак», «абзац»
-  превращаются в знаки; заглавные буквы и точка в конце расставляются автоматически.
-* **Подсказки пользователя (hotwords)** — редкие слова, имена и термины из файла
-  повышают точность распознавания: для transducer-моделей работает настоящий
-  контекстный бустинг, а не замена по тексту.
-* **Проверка правописания** — режим `Spellcheck` проверяет продиктованное через
-  hunspell с русским словарём и показывает варианты исправления уведомлением.
-* **Заметки в файл** — вторая цель вывода: распознанный текст дописывается в
-  `~/.local/share/voice-assistant/notes/YYYY-MM-DD.md` вместо активного окна.
-  Ни фокус, ни клавиатура, ни буфер обмена не участвуют, поэтому пометки к файлу,
-  с которым работаешь, можно диктовать, продолжая печатать руками. Переключение —
-  голосом («заметка» / «в редактор»), из трея или по D-Bus.
-* **Разбор аудиофайла** — команда «разбери файл» или пункт лотка «Разобрать
-  аудиофайл…» открывает системный диалог выбора записи; расшифровка вставляется
-  в окно, которое было активно до диалога (или дописывается в заметки). Форматы:
-  WAV (PCM 8/16/24/32, float, телефонные A-law/μ-law), RAW без контейнера
-  (параметры спрашивает диалог), MP3/OGG/FLAC/M4A/AMR через системный декодер.
-  Из консоли — `--transcribe` с выбором профиля ASR.
-* **Диктовка не блокирует клавиатуру** — `evdev` только слушает события
-  (`[hotkey] grab=false` по умолчанию), а `EVIOCGRAB` дополнительно защищён:
-  устройство, похожее на полноценную клавиатуру, не перехватывается, даже если
-  в конфиге стоит `grab=true`, пока оно явно не названо в `grab_devices`.
-* **Печать во время диктовки** — `[output] pin_window` привязывает вставку к окну,
-  активному в начале записи, а `[audio] typing_guard_ms` глушит микрофон, пока
-  идёт набор текста, чтобы стук клавиш не превращался в слова. Окна самого
-  помощника (меню трея) привязкой не становятся, а каждая вставка пишется в лог
-  с адресом и способом — «текст ушёл неизвестно куда» больше не диагностируется
-  на глаз.
-* **Глобальный хоткей микрофона** — `evdev`, работает в X11, Wayland и голой TTY;
-  два режима: push-to-talk (держим клавишу) и toggle (нажал/отжал).
-* **Проверка микрофона** — запись тракта в WAV из трея, по D-Bus или из консоли
-  (`--record 15 ~/mic.wav`): тот же файл потом прогоняется всеми профилями ASR,
-  что отделяет проблемы микрофона и AGC от проблем модели.
-* **Переключаемые профили ASR** — модель меняется одной строкой в конфиге или
-  на лету из D-Bus/трея: быстрый zipformer-ru для тишины, GigaAM v3 для шума.
-* **Мастер загрузки моделей** — при первом запуске приложение само предложит
-  скачать модели (список с размером и описанием, sha256, докачка при обрыве,
-  атомарная распаковка); из консоли — `--download-model`.
-* **Готовые пакеты .deb/.rpm** — sherpa-onnx/onnxruntime/hunspell едут внутри
-  пакета, чистое удаление (см. «Установка»).
-* **Внешнее управление по D-Bus** — сервис `org.voiceassistant.App`.
+* **Fully offline** — VAD (Silero) and ASR (zipformer-ru / GigaAM / Whisper)
+  run locally via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx).
+* **Voice commands** — switch mode, delete word/line, new line,
+  punctuation. The dictionary can be extended with your own file.
+* **Voice punctuation** — “period”, “comma”, “question mark”, “paragraph”
+  become marks; capitalization and the final period are placed automatically.
+* **User hotwords** — rare words, names, and terms from a file
+  improve recognition accuracy: for transducer models, true
+  contextual boosting works rather than text substitution.
+* **Spellchecking** — `Spellcheck` mode checks dictated text via
+  hunspell with a Russian dictionary and shows correction options in a notification.
+* **Notes to file** — a second output target: recognized text is appended to
+  `~/.local/share/voice-assistant/notes/YYYY-MM-DD.md` instead of the active window.
+  Neither focus, nor keyboard, nor clipboard is involved, so notes for the file
+  you are working with can be dictated while continuing to type by hand. Switching —
+  by voice (“заметка” / “в редактор”), from the tray, or via D-Bus.
+* **Audio file transcription** — the command “разбери файл” or the tray item
+  “Transcribe audio file…” opens the system file picker for a recording; the transcript
+  is inserted into the window that was active before the dialog (or appended to notes).
+  Formats: WAV (PCM 8/16/24/32, float, telephone A-law/μ-law), RAW without a container
+  (the dialog asks for parameters), MP3/OGG/FLAC/M4A/AMR via the system decoder.
+  From the console — `--transcribe` with ASR profile selection.
+* **Dictation does not block the keyboard** — `evdev` only listens to events
+  (`[hotkey] grab=false` by default), and `EVIOCGRAB` is additionally guarded:
+  a device resembling a full keyboard is not grabbed, even if the config has
+  `grab=true`, until it is explicitly named in `grab_devices`.
+* **Typing during dictation** — `[output] pin_window` binds insertion to the window
+  active at the start of recording, and `[audio] typing_guard_ms` mutes the microphone
+  while typing so keystrokes do not turn into words. The assistant’s own windows
+  (tray menu) do not become pinned, and each insertion is logged with address and
+  method — “text went somewhere unknown” is no longer diagnosed by eye.
+* **Global microphone hotkey** — `evdev`, works in X11, Wayland, and bare TTY;
+  two modes: push-to-talk (hold the key) and toggle (press/release).
+* **Microphone check** — recording the path to WAV from the tray, via D-Bus, or from
+  the console (`--record 15 ~/mic.wav`): the same file is then run through all ASR
+  profiles, which separates microphone and AGC problems from model problems.
+* **Switchable ASR profiles** — the model is changed by one line in the config or
+  on the fly from D-Bus/tray: fast zipformer-ru for silence, GigaAM v3 for noise.
+* **Model download wizard** — on first launch the application itself will offer to
+  download models (list with size and description, sha256, resume on interruption,
+  atomic unpacking); from the console — `--download-model`.
+* **Ready-made .deb/.rpm packages** — sherpa-onnx/onnxruntime/hunspell come inside
+  the package, clean removal (see “Installation”).
+* **External control via D-Bus** — service `org.voiceassistant.App`.
 
-## Требования
+## Requirements
 
-| Компонент | Версия | Зачем |
-|---|---|---|
-| Linux, X11 | — | для Wayland/TTY потребуется `ydotool` (в планах) |
-| g++ / clang | C++17 | сборка |
-| CMake | 3.16+ | сборка |
-| Qt | 5.13+ (Core, Widgets, Multimedia, DBus, Test) | каркас, звук, трей, D-Bus |
-| sherpa-onnx | с C++ API (`cxx-api.h`) | VAD и ASR |
-| xdotool, xclip | любые | вставка текста |
-| доступ к `/dev/input` | группа `input` | глобальный хоткей через evdev |
-| hunspell + словарь | libhunspell-dev, hunspell-ru | проверка правописания (необязательно) |
-| gstreamer-плагины | libqt5multimedia5-plugins, gstreamer1.0-plugins-good/ugly/libav | MP3/OGG/FLAC/M4A в разборе аудиофайлов (необязательно; WAV и RAW работают без них). В Linux Mint обычно уже стоят |
-| Свободное место | ~300 МБ | модели (VAD 0.6 МБ + ASR 110–208 МБ) |
+| Component              | Version                                                         | Purpose                                                                                                                                  |
+| ---------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux, X11             | —                                                               | for Wayland/TTY, `ydotool` will be required (planned)                                                                                    |
+| g++ / clang            | C++17                                                           | build                                                                                                                                    |
+| CMake                  | 3.16+                                                           | build                                                                                                                                    |
+| Qt                     | 5.13+ (Core, Widgets, Multimedia, DBus, Test)                   | framework, sound, tray, D-Bus                                                                                                            |
+| sherpa-onnx            | with C++ API (`cxx-api.h`)                                      | VAD and ASR                                                                                                                              |
+| xdotool, xclip         | any                                                             | text insertion                                                                                                                           |
+| access to `/dev/input` | group `input`                                                   | global hotkey via evdev                                                                                                                  |
+| hunspell + dictionary  | libhunspell-dev, hunspell-ru                                    | spellchecking (optional)                                                                                                                 |
+| gstreamer plugins      | libqt5multimedia5-plugins, gstreamer1.0-plugins-good/ugly/libav | MP3/OGG/FLAC/M4A in audio file transcription (optional; WAV and RAW work without them). On Linux Mint they are usually already installed |
+| Free space             | ~300 MB                                                         | models (VAD 0.6 MB + ASR 110–208 MB)                                                                                                     |
 
-## Установка
+## Installation
 
-### 0. Готовые пакеты (рекомендуется)
+### 0. Ready-made packages (recommended)
 
-Скачайте `.deb` (Debian/Ubuntu/Mint) или `.rpm` (Fedora/openSUSE) со страницы
-[Releases](https://github.com/mamon-t/voice-assistant/releases):
+Download the `.deb` (Debian/Ubuntu/Mint) or `.rpm` (Fedora/openSUSE) from the
+[Releases](https://github.com/mamon-t/voice-assistant/releases) page:
 
 ```bash
 sudo apt install ./voice-assistant_0.9.0_amd64.deb    # Debian/Ubuntu/Mint
 sudo dnf install ./voice-assistant-0.9.0-1.x86_64.rpm # Fedora
 ```
 
-Пакет самодостаточен: sherpa-onnx, onnxruntime и hunspell едут внутри
-(`/usr/lib/voice-assistant/`, RPATH `$ORIGIN`), системные библиотеки не
-подменяются. При первом запуске помощник предложит **мастер загрузки моделей**
-(~110 МБ, проверка sha256, докачка при обрыве); из консоли то же самое —
-`voice-assistant --download-model zipformer-ru`. Для глобального хоткея
-потребуется `sudo usermod -aG input $USER` и перелогин (postinst об этом
-напомнит). Удаление: `sudo apt remove voice-assistant` — системные файлы
-сносятся начисто; пользовательские данные (настройки, заметки, модели)
-остаются в домашнем каталоге — как их убрать, см. конец раздела.
+The package is self-contained: sherpa-onnx, onnxruntime, and hunspell come inside
+(`/usr/lib/voice-assistant/`, RPATH `$ORIGIN`); system libraries are not
+replaced. On first launch the assistant will offer the **model download wizard**
+(~110 MB, sha256 verification, resume on interruption); from the console the same
+is done with `voice-assistant --download-model zipformer-ru`. For the global hotkey,
+`sudo usermod -aG input $USER` and a relogin will be required (postinst will
+remind you about this). Removal: `sudo apt remove voice-assistant` — system files
+are removed cleanly; user data (settings, notes, models) remain in the home
+directory — for how to remove them, see the end of this section.
 
-### 1. Системные зависимости
+### 1. System dependencies
 
 ```bash
 sudo apt install build-essential cmake \
     qtbase5-dev qtmultimedia5-dev \
     xdotool xclip
 
-# необязательно, для режима проверки правописания:
+# optional, for spellcheck mode:
 sudo apt install libhunspell-dev hunspell-ru
 ```
 
-Без hunspell проект тоже собирается — режим `Spellcheck` просто сообщит,
-что поддержка не включена (зависимость детектируется через pkg-config,
-см. вывод `cmake`).
+Without hunspell the project also builds — `Spellcheck` mode will simply report
+that support is not enabled (the dependency is detected via pkg-config,
+see the `cmake` output).
 
 ### 2. sherpa-onnx
 
-Рекомендуется собрать из исходников тем же компилятором, что и проект — тогда
-ABI libstdc++ гарантированно совпадёт:
+It is recommended to build from source with the same compiler as the project — then
+the libstdc++ ABI is guaranteed to match:
 
 ```bash
 git clone https://github.com/k2-fsa/sherpa-onnx.git
@@ -131,131 +129,131 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
 make -j$(nproc) && sudo make install && sudo ldconfig
 ```
 
-Если ставите **готовые бинарники** sherpa-onnx, проверьте ABI — иначе приложение
-соберётся без ошибок, но упадёт в `strlen()` при создании VAD:
+If you install **prebuilt sherpa-onnx binaries**, check the ABI — otherwise the app
+will build without errors but crash in `strlen()` when creating the VAD:
 
 ```bash
 nm -D --defined-only /usr/local/lib/libsherpa-onnx-cxx-api.so | grep -c ERKSs
-#   >0  -> библиотека собрана со старым ABI, собирайте проект с
+#   >0  -> library built with old ABI, build the project with
 #          cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON
-#    0  -> обычный новый ABI, ничего добавлять не нужно
+#    0  -> normal new ABI, nothing to add
 ```
 
-Подробности — в [docs/sherpa-onnx-notes.md](docs/sherpa-onnx-notes.md).
+Details — in [docs/sherpa-onnx-notes.md](docs/sherpa-onnx-notes.md).
 
-### 3. Модели
+### 3. Models
 
-Основной способ — **мастер загрузки в самом приложении**: при первом запуске
-без моделей он откроется сам (или лоток → «Скачать модели...»). Проверка
-sha256, докачка при обрыве, профиль автоматически становится активным.
-Из консоли:
+The main method is the **download wizard in the application itself**: on first launch
+without models it opens by itself (or tray → “Download models...”). sha256
+verification, resume on interruption, the profile automatically becomes active.
+From the console:
 
 ```bash
-voice-assistant --download-model list            # что есть и что установлено
-voice-assistant --download-model zipformer-ru    # VAD добавится автоматически
+voice-assistant --download-model list            # what is available and what is installed
+voice-assistant --download-model zipformer-ru    # VAD will be added automatically
 ```
 
-Вручную (альтернатива, например без GUI):
+Manually (alternative, e.g. without GUI):
 
 ```bash
 mkdir -p ~/.voice_models && cd ~/.voice_models
 
-# VAD (обязательно, 0.6 МБ)
+# VAD (required, 0.6 MB)
 wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
 
-# ASR по умолчанию: русский zipformer (110 МБ)
+# Default ASR: Russian zipformer (110 MB)
 wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2
 tar xf sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2 && rm sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2
 
-# словарь для hotwords обычными словами (нужен только для zipformer-ru)
+# dictionary for hotwords in ordinary words (needed only for zipformer-ru)
 python3 -m pip install --user sentencepiece
-python3 <путь к проекту>/tools/gen_bpe_vocab.py \
+python3 <path to project>/tools/gen_bpe_vocab.py \
     ~/.voice_models/sherpa-onnx-small-zipformer-ru-2024-09-18/bpe.model \
     ~/.voice_models/sherpa-onnx-small-zipformer-ru-2024-09-18/bpe.vocab
 ```
 
-Запасные профили (GigaAM v3 RNN-T для шумной обстановки, Whisper для английского)
-и сравнение моделей по точности и скорости — в [docs/models.md](docs/models.md).
+Alternative profiles (GigaAM v3 RNN-T for noisy environments, Whisper for English)
+and a comparison of models by accuracy and speed — in [docs/models.md](docs/models.md).
 
-### 4. Конфиг
+### 4. Config
 
 ```bash
 mkdir -p ~/.config/voice-assistant
 cp config/* ~/.config/voice-assistant/
 ```
 
-### 5. Сборка
+### 5. Build
 
 ```bash
 git clone https://github.com/mamon-t/voice-assistant.git
 cd voice-assistant
 mkdir -p build && cd build
-cmake ..              # + -DSHERPA_ONNX_OLD_CXX_ABI=ON, если проверка ABI дала >0
+cmake ..              # + -DSHERPA_ONNX_OLD_CXX_ABI=ON, if the ABI check returned >0
 make -j$(nproc)
 ctest --output-on-failure
 ```
 
-### Полное удаление (пакет и данные)
+### Complete removal (package and data)
 
-`sudo apt remove voice-assistant` (или `dnf remove`) сносит все системные
-файлы начисто. Пользовательские данные пакет не трогает ни при remove, ни при
-purge — так устроены дистрибутивы. Убираются одной командой:
+`sudo apt remove voice-assistant` (or `dnf remove`) removes all system
+files cleanly. The package does not touch user data during either remove or
+purge — that is how distributions work. They are removed with one command:
 
 ```bash
 rm -rf ~/.config/voice-assistant ~/.local/share/voice-assistant ~/.voice_models
 ```
 
-## Быстрый старт
+## Quick start
 
 ```bash
-./src/voice-assistant --check      # диагностика: модели, инжектор, словарь, хоткей, /dev/input
-./src/voice-assistant              # значок в системном лотке
-./src/voice-assistant --record 15 ~/mic.wav   # записать 15 с с микрофона (сырой тракт, без AGC)
-./src/voice-assistant --transcribe ~/звонок.mp3 --profile gigaam-v3   # расшифровать запись (текст в stdout)
-./src/voice-assistant --note "проверить AGC"  # дописать строку в файл заметок и выйти
-./src/voice-assistant --pin-info              # куда пойдёт текст: окно, WM_CLASS, способ вставки
-./src/voice-assistant --type "проверка раз" --pin-active --delay 3000
-                                             # вставить текст, не запуская распознавание
+./src/voice-assistant --check      # diagnostics: models, injector, dictionary, hotkey, /dev/input
+./src/voice-assistant              # icon in the system tray
+./src/voice-assistant --record 15 ~/mic.wav   # record 15 s from the microphone (raw path, no AGC)
+./src/voice-assistant --transcribe ~/call.mp3 --profile gigaam-v3   # transcribe a recording (text to stdout)
+./src/voice-assistant --note "check AGC"  # append a line to the notes file and exit
+./src/voice-assistant --pin-info              # where the text will go: window, WM_CLASS, insertion method
+./src/voice-assistant --type "insertion test" --pin-active --delay 3000
+                                             # insert text without starting recognition
 ```
 
-Для глобального хоткея нужен доступ к устройствам ввода:
+For the global hotkey, access to input devices is required:
 
 ```bash
-sudo usermod -aG input $USER      # затем перелогин
-./src/voice-assistant --check     # строка «/dev/input: N устройств, доступно для чтения: M»
+sudo usermod -aG input $USER      # then relogin
+./src/voice-assistant --check     # line “/dev/input: N devices, readable: M”
 ```
 
-Без прав на `/dev/input` приложение работает как ни в чём не бывало — режимы
-переключаются из трея и по D-Bus, хоткей просто не запускается.
+Without permissions for `/dev/input`, the application works as usual — modes
+are switched from the tray and via D-Bus, the hotkey simply does not start.
 
-`--check` не требует ни микрофона, ни X-сервера и печатает по каждому профилю
-ASR все пути с пометкой `OK (размер)` или `НЕТ ФАЙЛА`, а в конце — число проблем.
-Код возврата 0/1, поэтому его можно гонять в скриптах. Если приложение запустилось,
-но речь не распознаётся, начинать надо именно с него.
+`--check` requires neither a microphone nor an X server and prints, for each ASR
+profile, all paths marked `OK (size)` or `NO FILE`, and at the end — the number of
+problems. Return code 0/1, so it can be run in scripts. If the application has started
+but speech is not recognized, start with it.
 
-* Клик по значку — начать/остановить диктовку.
-* `F8` (по умолчанию) — push-to-talk: держим, пока говорим; отпустили — фраза
-  ушла в распознавание. Клавиша и режим настраиваются в `[hotkey]`.
-* Правый клик — выбор режима (диктовка / правка / проверка правописания),
-  «Писать в файл заметок», «Открыть заметки», настройки, редактор подсказок, выход.
-* Говорите обычный текст — он появляется в активном поле ввода.
-* Скажите «заметка» — и текст пойдёт в файл заметок, а не в окно: можно
-  продолжать печатать руками. Обратно — «в редактор».
-* Скажите «режим редактирования», затем «удали слово», «новая строка» и т. п.
-* В режиме «Проверка орфографии» текст вставляется как при диктовке, а найденные
-  ошибки показываются уведомлением с вариантами: `прверка → проверка, поверка`.
+* Click the icon — start/stop dictation.
+* `F8` (default) — push-to-talk: hold while speaking; release — the phrase
+  goes to recognition. The key and mode are configured in `[hotkey]`.
+* Right click — select mode (dictation / edit / spellcheck),
+  “Write to notes file”, “Open notes”, settings, hotwords editor, exit.
+* Say ordinary text — it appears in the active input field.
+* Say “заметка” — and the text goes to the notes file, not the window: you can
+  continue typing by hand. Back — “в редактор”.
+* Say “режим редактирования”, then “удали слово”, “новая строка”, etc.
+* In “Spellcheck” mode, text is inserted as during dictation, and found
+  errors are shown in a notification with options: `прверка → проверка, поверка`.
 
-`--check` помимо моделей и инжектора проверяет словарь и тут же прогоняет
-контрольное слово:
+`--check`, besides models and the injector, checks the dictionary and immediately runs
+a control word:
 
 ```
-Правописание
-  движок    : hunspell
-  словарь   : /usr/share/hunspell/ru_RU.dic
-  контроль  : "прверка" -> ошибка, варианты: проверка, поверка, привертка
+Spelling
+  engine    : hunspell
+  dictionary: /usr/share/hunspell/ru_RU.dic
+  control   : "прверка" -> error, options: проверка, поверка, привертка
 ```
 
-Управление из терминала:
+Control from the terminal:
 
 ```bash
 BUS=org.voiceassistant.App
@@ -265,20 +263,21 @@ gdbus call --session --dest $BUS --object-path $OBJ --method $BUS.setMode "dicta
 gdbus call --session --dest $BUS --object-path $OBJ --method $BUS.reloadHotwords
 gdbus call --session --dest $BUS --object-path $OBJ --method $BUS.setOutputTarget "notes"
 gdbus call --session --dest $BUS --object-path $OBJ --method $BUS.notesFile
-gdbus monitor --session --dest $BUS      # смотреть сигналы textRecognized, noteWritten
+gdbus monitor --session --dest $BUS      # watch signals textRecognized, noteWritten
 ```
 
-Проверка тракта без микрофона и X-сервера:
+Checking the pipeline without a microphone or X server:
 
 ```bash
-VOICE_ASSISTANT_DRYRUN=1 ./src/voice-assistant     # инжектор логирует вместо отправки
-./tools/vad-asr-test запись.wav --config ~/.config/voice-assistant/settings.ini
+VOICE_ASSISTANT_DRYRUN=1 ./src/voice-assistant     # injector logs instead of sending
+./tools/vad-asr-test recording.wav --config ~/.config/voice-assistant/settings.ini
 ```
 
-## Настройка
+## Configuration
 
-Всё — в `~/.config/voice-assistant/settings.ini`. Профили ASR описаны секциями
-`[asr_<имя>]`, активный выбирается строкой `active=` в секции `[asr]`.
+Everything is in `~/.config/voice-assistant/settings.ini`. ASR profiles are described
+by `[asr_<name>]` sections; the active one is selected by the `active=` line in the
+`[asr]` section.
 
 ```ini
 [asr]
@@ -286,232 +285,234 @@ active=zipformer-ru
 profiles=zipformer-ru,gigaam-v3,gigaam-v3-ctc,whisper-base
 ```
 
-Пути к моделям можно задавать относительно `~/.voice_models`, от home (`~/...`)
-или абсолютно. Полный справочник всех ключей — в
+Model paths can be specified relative to `~/.voice_models`, from home (`~/...`),
+or absolutely. The full reference of all keys is in
 [docs/configuration.md](docs/configuration.md).
 
-## Голосовые команды
+## Voice commands
 
-| Фраза | Действие |
-|---|---|
-| «режим диктовки» / «режим ввода» | `Mode::Dictation` |
-| «режим редактирования» / «режим правки» | `Mode::Edit` |
-| «режим проверки» / «режим правописания» | `Mode::Spellcheck` |
-| «выключить» / «стоп» | `Mode::Off` |
-| «заметка» / «в заметки» | цель вывода — файл заметок |
-| «в редактор» / «в окно» | цель вывода — активное окно |
-| «разбери файл» / «разбери запись» / «расшифруй аудиофайл» | диалог выбора аудиофайла — расшифровка в окно или заметки |
-| «удали слово» / «сотри слово» | `Ctrl+BackSpace` |
-| «удали строку» | `Shift+Home`, `BackSpace` |
-| «новая строка» / «абзац» | `Enter` |
-| «пробел» | пробел |
-| «точка», «запятая», «двоеточие», «тире» … | соответствующий знак |
+| Phrase                                                    | Action                                            |
+| --------------------------------------------------------- | ------------------------------------------------- |
+| «режим диктовки» / «режим ввода»                          | `Mode::Dictation`                                 |
+| «режим редактирования» / «режим правки»                   | `Mode::Edit`                                      |
+| «режим проверки» / «режим правописания»                   | `Mode::Spellcheck`                                |
+| «выключить» / «стоп»                                      | `Mode::Off`                                       |
+| «заметка» / «в заметки»                                   | output target — notes file                        |
+| «в редактор» / «в окно»                                   | output target — active window                     |
+| «разбери файл» / «разбери запись» / «расшифруй аудиофайл» | audio file picker — transcript to window or notes |
+| «удали слово» / «сотри слово»                             | `Ctrl+BackSpace`                                  |
+| «удали строку»                                            | `Shift+Home`, `BackSpace`                         |
+| «новая строка» / «абзац»                                  | `Enter`                                           |
+| «пробел»                                                  | space                                             |
+| «точка», «запятая», «двоеточие», «тире» …                 | the corresponding punctuation mark                |
 
-Командой считается только фраза, совпавшая со словарём **целиком**: «привет мир» —
-это текст, «удали слово» — команда, а «сделать заметку на полях» — снова текст.
-Команды правки в режиме диктовки по умолчанию выключены
-(`[commands] editing_in_dictation=false`), иначе продиктованное «удали слово»
-съедало бы само себя. Команды смены режима и цели вывода работают всегда:
-это маршрутизация, а не правка текста. Если слово «заметка» мешает в обычной
-речи, голосовое переключение выключается (`[notes] voice_commands=false`),
-а цель остаётся доступной из трея и по D-Bus. Свои команды добавляются файлом
-`фраза = тип[:аргумент]` — см. [docs/configuration.md](docs/configuration.md).
+Only a phrase matching the dictionary **in full** is considered a command: “привет мир” —
+this is text, “удали слово” — a command, and “сделать заметку на полях” — text again.
+Editing commands in dictation mode are disabled by default
+(`[commands] editing_in_dictation=false`), otherwise the dictated “удали слово”
+would eat itself. Mode and output target switching commands always work:
+this is routing, not text editing. If the word “заметка” gets in the way in ordinary
+speech, voice switching is disabled (`[notes] voice_commands=false`),
+and the target remains accessible from the tray and via D-Bus. Custom commands are
+added by a file `phrase = type[:argument]` — see [docs/configuration.md](docs/configuration.md).
 
-## Разбор аудиофайла
+## Audio file transcription
 
-Запись телефонного разговора, голосовое сообщение, WAV с проверки микрофона —
-любой аудиофайл прогоняется через тот же боевой тракт (Silero VAD → ASR →
-пунктуация), что и диктовка.
+A phone call recording, a voice message, a WAV from a microphone check —
+any audio file is run through the same production path (Silero VAD → ASR →
+punctuation) as dictation.
 
-**Из GUI.** Скажите «разбери файл» во время диктовки (или выберите пункт
-«Разобрать аудиофайл…» в меню лотка) → откроется системный диалог выбора →
-после выбора помощник остановит запись, покажет прогресс с кнопкой «Отмена»,
-а готовая расшифровка уйдёт **в окно, которое было активно до диалога**
-(например, в XED), либо в файл заметок, если цель вывода — notes. Окно
-запоминается заранее не случайно: диалог и прогресс — окна самого помощника,
-и после их закрытия фокус непредсказуем. Доставка — тем же механизмом
-`pin_mode=activate`: окно активируется, текст печатается настоящими событиями,
-фокус возвращается.
+**From the GUI.** Say “разбери файл” during dictation (or choose the
+“Transcribe audio file…” item in the tray menu) → the system file picker opens →
+after selection, the assistant stops recording, shows progress with a “Cancel”
+button, and the finished transcript goes **to the window that was active before
+the dialog** (e.g., XED), or to the notes file if the output target is notes. The
+window is remembered in advance not by accident: the dialog and progress are the
+assistant’s own windows, and after they close, focus is unpredictable. Delivery uses
+the same `pin_mode=activate` mechanism: the window is activated, text is typed
+with real events, focus is returned.
 
-Сегменты речи (их режет VAD по паузам) склеиваются через перевод строки:
-для расшифровки звонка каждая реплика оказывается на своей строке.
+Speech segments (VAD cuts them by pauses) are joined with a newline:
+for a call transcript, each utterance ends up on its own line.
 
-**Форматы.**
+**Formats.**
 
-| Формат | Как читается |
-|---|---|
-| WAV | свой парсер: PCM 8/16/24/32 бит, float32/64, A-law, μ-law, любые каналы и частота |
-| RAW (`.raw`, `.pcm`, `.audio`, без расширения) | PCM без контейнера: частоту/каналы/кодирование спрашивает диалог (по умолчанию телефонные 8000 Гц, моно, s16le), выбор запоминается в `[transcribe]` |
-| MP3, OGG/Opus, FLAC, M4A/AAC, AMR, WMA | системный декодер (QtMultimedia → GStreamer); нужны `libqt5multimedia5-plugins` и gstreamer-плагины — в Linux Mint обычно уже стоят, в .deb добавлены в Recommends |
+| Format                                            | How it is read                                                                                                                                                                        |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WAV                                               | own parser: PCM 8/16/24/32 bit, float32/64, A-law, μ-law, any channels and sample rate                                                                                                |
+| RAW (`.raw`, `.pcm`, `.audio`, without extension) | containerless PCM: sample rate/channels/encoding asked by the dialog (default telephone 8000 Hz, mono, s16le), choice remembered in `[transcribe]`                                    |
+| MP3, OGG/Opus, FLAC, M4A/AAC, AMR, WMA            | system decoder (QtMultimedia → GStreamer); requires `libqt5multimedia5-plugins` and gstreamer plugins — on Linux Mint they are usually already installed, in .deb added to Recommends |
 
-Всё домикшируется в моно и передискретизируется в 16 кГц.
+Everything is downmixed to mono and resampled to 16 kHz.
 
-**Из консоли** (модель выбирается профилем из конфига — тем же, что и в GUI;
-список профилей показывает `--check`):
+**From the console** (the model is selected by a profile from the config — the same as
+in the GUI; the list of profiles is shown by `--check`):
 
 ```bash
-voice-assistant --transcribe звонок.mp3                    # активный профиль, текст в stdout
-voice-assistant --transcribe звонок.mp3 --profile gigaam-v3   # другая модель (шумное аудио)
-voice-assistant --transcribe запись.raw --rate 8000 --format alaw --out call.txt
-voice-assistant --transcribe голос.wav --notes             # дописать в файл заметок
-voice-assistant --transcribe голос.wav --insert            # вставить в активное окно
-voice-assistant --transcribe звонок.mp3 --config /путь/к/settings.ini   # другой конфиг
+voice-assistant --transcribe call.mp3                    # active profile, text to stdout
+voice-assistant --transcribe call.mp3 --profile gigaam-v3   # another model (noisy audio)
+voice-assistant --transcribe recording.raw --rate 8000 --format alaw --out call.txt
+voice-assistant --transcribe voice.wav --notes             # append to notes file
+voice-assistant --transcribe voice.wav --insert            # insert into active window
+voice-assistant --transcribe call.mp3 --config /path/to/settings.ini   # another config
 ```
 
-Результат всегда печатается в stdout (удобно для скриптов:
-`--transcribe call.mp3 > call.txt`), диагностика и прогресс — в stderr.
-`--profile`/`--config` выбирают модель, `--threads`/`--no-punct`/`--hotwords`
-уточняют режим. Произвольные пути к моделям без конфига — по-прежнему у
-`tools/vad-asr-test` (он теперь понимает те же форматы).
+The result is always printed to stdout (convenient for scripts:
+`--transcribe call.mp3 > call.txt`), diagnostics and progress go to stderr.
+`--profile`/`--config` select the model, `--threads`/`--no-punct`/`--hotwords`
+refine the mode. Arbitrary model paths without a config are still handled by
+`tools/vad-asr-test` (it now understands the same formats).
 
-**Ограничения.** Файл декодируется в память целиком: ~115 МБ ОЗУ на час аудио
-(16 кГц моно int16) плюс ~60 МБ/час на час исходных 8 кГц — часовые звонки
-разбираются без проблем, многочасовые аудиокниги уже тяжелее. На время разбора
-модель грузится вторым экземпляром (диктующий конвейер не трогается) — ОЗУ
-временно расходуется вдвое. Скорость — как у диктовки: zipformer-ru RTF ~0.07
-на 2 ядрах, час звонка ≈ 4–5 минут.
+**Limitations.** The file is decoded into memory entirely: ~115 MB RAM per hour of audio
+(16 kHz mono int16) plus ~60 MB/hour for an hour of source 8 kHz — hour-long calls
+are handled without problems, multi-hour audiobooks are harder. During transcription
+the model is loaded as a second instance (the dictating pipeline is untouched) — RAM
+is temporarily doubled. Speed is the same as dictation: zipformer-ru RTF ~0.07
+on 2 cores, an hour-long call ≈ 4–5 minutes.
 
-## Инструменты
+## Tools
 
-| Файл | Назначение |
-|---|---|
-| `tools/vad_asr_test.cpp` | прогон аудиофайла (WAV/MP3/RAW — те же форматы, что у приложения) через боевой тракт (конфиг → VAD → ASR → пунктуация), печатает сегменты, текст и RTF; умеет явные пути к моделям без конфига |
-| `tools/gen_bpe_vocab.py` | делает из `bpe.model` словарь для hotwords обычными словами |
-| `./src/voice-assistant --check` | диагностика конфигурации, моделей, инжектора, словаря и хоткея |
-| `./src/voice-assistant --record N file.wav` | запись с микрофона в WAV без GUI (сырой тракт, без AGC) |
-| `voice-assistant --transcribe <файл> [--profile <имя>] [--out f.txt \| --notes \| --insert]` | расшифровать аудиофайл (WAV/MP3/RAW/OGG/FLAC…) любой моделью из конфига; текст в stdout |
-| `./src/voice-assistant --note "текст"` | дописать заметку в файл из консоли (без микрофона и X) |
-| `./src/voice-assistant --pin-info` | диагностика вывода: активное окно, WM_CLASS, PID, `pin_mode`, что запомнил бы `pin_window` |
-| `voice-assistant --download-model list\|<id>\|all [--force]` | каталог моделей и загрузка: sha256, докачка, атомарная распаковка |
-| `./src/voice-assistant --type "текст" [--pin-active] [--window WID] [--delay мс]` | проверить вставку отдельно от распознавания |
-| `./tools/vad-asr-test … --notes` | то же, но заметками становятся сегменты из файла: прогон записи в файл заметок |
+| File                                                                                          | Purpose                                                                                                                                                                                                              |
+| --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tools/vad_asr_test.cpp`                                                                      | run an audio file (WAV/MP3/RAW — the same formats as the application) through the production path (config → VAD → ASR → punctuation), prints segments, text, and RTF; supports explicit model paths without a config |
+| `tools/gen_bpe_vocab.py`                                                                      | creates a dictionary for hotwords in ordinary words from `bpe.model`                                                                                                                                                 |
+| `./src/voice-assistant --check`                                                               | diagnostics of configuration, models, injector, dictionary, and hotkey                                                                                                                                               |
+| `./src/voice-assistant --record N file.wav`                                                   | record from microphone to WAV without GUI (raw path, no AGC)                                                                                                                                                         |
+| `voice-assistant --transcribe <file> [--profile <name>] [--out f.txt \| --notes \| --insert]` | transcribe an audio file (WAV/MP3/RAW/OGG/FLAC…) with any model from the config; text to stdout                                                                                                                      |
+| `./src/voice-assistant --note "text"`                                                         | append a note to the file from the console (without microphone or X)                                                                                                                                                 |
+| `./src/voice-assistant --pin-info`                                                            | output diagnostics: active window, WM_CLASS, PID, `pin_mode`, what `pin_window` would remember                                                                                                                       |
+| `voice-assistant --download-model list\|<id>\|all [--force]`                                  | model catalog and download: sha256, resume, atomic unpacking                                                                                                                                                         |
+| `./src/voice-assistant --type "text" [--pin-active] [--window WID] [--delay ms]`              | test insertion separately from recognition                                                                                                                                                                           |
+| `./tools/vad-asr-test … --notes`                                                              | same, but segments from the file become notes: run a recording into the notes file                                                                                                                                   |
 
 ```bash
-./tools/vad-asr-test запись.wav --config ~/.config/voice-assistant/settings.ini \
+./tools/vad-asr-test recording.wav --config ~/.config/voice-assistant/settings.ini \
     [--profile gigaam-v3] [--hotwords words.txt] [--threads 1] [--no-punct] \
     [--notes] [--notes-file ~/work/notes.md] \
     [--rate 8000] [--channels 1] [--format s16le|s8u|f32le|alaw|ulaw]
 ```
 
-## Тесты
+## Tests
 
 ```bash
 cd build && ctest --output-on-failure
 ```
 
-* `CommandParserTest` — разбор команд;
-* `VoiceUnitsTest` — 66 проверок: словарь и нормализация команд, постобработка текста
-  (голосовые знаки, заглавные, пробелы), разбор `settings.ini` с профилями и путями,
-  инжектор в режиме dry-run, правописание по настоящему словарю
-  (пропускается через `QSKIP`, если hunspell или словаря нет),
-  запись WAV (заголовок, round-trip данных, валидность для внешних инструментов),
-  логика evdev-хоткея на синтетических `input_event` — железо для тестов не нужно.
-  Отдельно покрыты: файл заметок (`FileInjector`: имя файла дня, заголовок,
-  метка времени, кириллица, «удали слово», явный файл без markdown),
-  команды переключения цели и их отключение, `TypingGuard` на синтетическом
-  времени, сигнал `keyActivity` и политика `EVIOCGRAB` — в том числе то, что
-  основная клавиатура не перехватывается.
-  Отдельно покрыт выбор окна для вставки (`output/WindowTarget.h`): куда пойдёт
-  текст при привязке к окну — активация + настоящие события или `--window`
-  с синтетикой, откат на активное окно, если привязанное закрыли или это окно
-  самого помощника, возврат фокуса и разбор `pin_mode`. Это чистая функция без
-  X11, поэтому проверяется без дисплея. Файл своих команд покрыт через
-  `CommandDictionary::parseLine` (валидные строки, комментарии, битые типы)
-  и round-trip `commandToSpec` по всем встроенным командам — той же функцией
-  валидирует строки вкладка «Команды» перед сохранением. Каталог моделей
-  (уникальность id, URL релизов, полные sha256, соответствие профилям) и
-  `sha256File` загрузчика проверены на эталонном значении из FIPS 180-2.
+* `CommandParserTest` — command parsing;
+* `VoiceUnitsTest` — 66 checks: command dictionary and normalization, text
+  post-processing (voice punctuation, capitalization, spaces), parsing `settings.ini`
+  with profiles and paths, injector in dry-run mode, spelling against a real dictionary
+  (skipped via `QSKIP` if hunspell or the dictionary is missing),
+  WAV recording (header, data round-trip, validity for external tools),
+  evdev hotkey logic on synthetic `input_event` — no hardware is needed for the tests.
+  Separately covered: the notes file (`FileInjector`: day filename, header,
+  timestamp, Cyrillic, “удали слово”, explicit file without markdown),
+  target switching commands and their disabling, `TypingGuard` on synthetic
+  time, the `keyActivity` signal and the `EVIOCGRAB` policy — including that
+  the main keyboard is not grabbed.
+  Separately covered is window selection for insertion (`output/WindowTarget.h`): where
+  text will go when pinned to a window — activation + real events or `--window`
+  with synthetic events, fallback to the active window if the pinned one was closed or
+  is the assistant’s own window, focus return and `pin_mode` parsing. This is a pure
+  function without X11, so it is tested without a display. The custom commands file is
+  covered via `CommandDictionary::parseLine` (valid lines, comments, broken types)
+  and a `commandToSpec` round-trip over all built-in commands — the same function
+  validates lines in the “Commands” tab before saving. The model catalog
+  (id uniqueness, release URLs, full sha256, correspondence to profiles) and
+  the downloader’s `sha256File` are verified against a reference value from FIPS 180-2.
 
-Помимо модульных тестов есть e2e-стенд привязки вывода к окну —
-`tools/e2e/run-e2e.sh` (13 сценариев): поднимает Xvfb + openbox, открывает
-тестовые Qt-окна с перехватом сырых xcb-событий (видно, настоящими событиями
-пришёл ввод или синтетикой `XSendEvent`) и прогоняет `--type` во всех
-комбинациях `pin_mode`/`method`. В ctest не регистрируется — нужен X.
-Подробности: `tools/e2e/README.md`.
+Besides unit tests, there is an e2e test bench for binding output to a window —
+`tools/e2e/run-e2e.sh` (13 scenarios): it starts Xvfb + openbox, opens test Qt windows
+with raw xcb event interception (you can see whether input arrived via real events or
+via synthetic `XSendEvent`) and runs `--type` in all combinations of
+`pin_mode`/`method`. It is not registered in ctest — X is required.
+Details: `tools/e2e/README.md`.
 
-## Архитектура
+## Architecture
 
 ```
-микрофон → QtAudioCapture → Agc → ApplicationController
+microphone → QtAudioCapture → Agc → ApplicationController
                                       ↓
                                  VoicePipeline
-                     SileroVad → сегмент → IRecognizer → TextPostProcessor
+                     SileroVad → segment → IRecognizer → TextPostProcessor
                                       ↓
-                    CommandParser (команда)  /  ITextInjector (текст)
+                    CommandParser (command)  /  ITextInjector (text)
 ```
 
-* `ApplicationController` тонкий: режимы, трей, D-Bus, маршрутизация результата.
-* Выбор модели — за `ConfigManager` + `RecognizerFactory`; всё приложение знает
-  только интерфейс `IRecognizer`.
-* `SileroVad` отдаёт **целые речевые сегменты**: нестриминговая модель получает
-  фразу целиком, а не нарезку по 32 мс.
+* `ApplicationController` is thin: modes, tray, D-Bus, result routing.
+* Model selection is handled by `ConfigManager` + `RecognizerFactory`; the whole
+  application knows only the `IRecognizer` interface.
+* `SileroVad` returns **whole speech segments**: the non-streaming model receives
+  the phrase as a whole, not 32 ms slices.
 
-Описание слоёв, порядка сигналов и владения объектами —
-в [docs/architecture.md](docs/architecture.md).
+Description of layers, signal order, and object ownership —
+in [docs/architecture.md](docs/architecture.md).
 
-## Производительность
+## Performance
 
-Замер на русской фразе 7.16 с (2 потока, серверный CPU; на Celeron умножайте на 3–5):
+Measurement on a Russian phrase of 7.16 s (2 threads, server CPU; on Celeron multiply by 3–5):
 
-| Профиль ASR | Размер | Декод | RTF | Русский |
-|---|---|---|---|---|
-| **zipformer-ru** (по умолчанию) | 110 МБ | **397 мс** | **0.06** | точно |
-| GigaAM v3 RNN-T | 167 МБ | 1905 мс | 0.27 | точнее на шуме |
-| GigaAM v3 CTC | 163 МБ | 1256 мс | 0.16 | точно, без hotwords |
-| Whisper base | 208 МБ | 3663 мс | 0.48 | хуже, зато пунктуация и английский |
+| ASR profile                | Size   | Decode     | RTF      | Russian                                |
+| -------------------------- | ------ | ---------- | -------- | -------------------------------------- |
+| **zipformer-ru** (default) | 110 MB | **397 ms** | **0.06** | accurate                               |
+| GigaAM v3 RNN-T            | 167 MB | 1905 ms    | 0.27     | more accurate on noise                 |
+| GigaAM v3 CTC              | 163 MB | 1256 ms    | 0.16     | accurate, without hotwords             |
+| Whisper base               | 208 MB | 3663 ms    | 0.48     | worse, but has punctuation and English |
 
-Полные таблицы, методика и вывод, почему SenseVoice не подходит для русского, —
-в [docs/models.md](docs/models.md).
+Full tables, methodology, and the conclusion why SenseVoice is not suitable for Russian —
+in [docs/models.md](docs/models.md).
 
-## Дорожная карта
+## Roadmap
 
-* [x] `Mode::Spellcheck`: hunspell с русским словарём (`AspellChecker`-заглушка удалена)
-* [x] Диалог настроек: пять вкладок (модель со статусом готовности, хоткей с захватом
-      клавиши, вывод, подсказки, команды); встроенные команды видны как «фраза → действие»,
-      свои — правятся с валидацией; всё применяется без перезапуска
-* [ ] Автозамена найденной ошибки на первый вариант по голосовой команде
-* [x] Push-to-talk: глобальный хоткей через `evdev` (X11, Wayland, TTY)
-* [x] Заметки в файл как вторая цель вывода — диктовка не мешает печатать
-* [x] Разбор аудиофайла: «разбери файл» / пункт лотка / `--transcribe`
-      (WAV, телефонные RAW/G.711, MP3/OGG/FLAC/M4A через системный GStreamer)
-* [ ] Панель-черновик: продиктованное копится в окне помощника и вставляется по команде
-* [ ] Wayland/TTY: реализация `ITextInjector` поверх `ydotool` (хоткей там уже работает — evdev)
-* [ ] Частичные результаты в реальном времени (streaming zipformer)
-* [ ] Пунктуация моделью, если появится русская (API `cxx::OfflinePunctuation` уже есть)
+* [x] `Mode::Spellcheck`: hunspell with a Russian dictionary (`AspellChecker` stub removed)
+* [x] Settings dialog: five tabs (model with readiness status, hotkey with key
+  
+      capture, output, hotwords, commands); built-in commands are visible as “phrase → action”,
+      custom ones are edited with validation; everything is applied without restart
+* [ ] Auto-replace a found error with the first option by voice command
+* [x] Push-to-talk: global hotkey via `evdev` (X11, Wayland, TTY)
+* [x] Notes to file as a second output target — dictation does not interfere with typing
+* [x] Audio file transcription: “разбери файл” / tray item / `--transcribe`
+  
+      (WAV, telephone RAW/G.711, MP3/OGG/FLAC/M4A via system GStreamer)
+* [ ] Draft panel: dictated text accumulates in the assistant window and is inserted by command
+* [ ] Wayland/TTY: `ITextInjector` implementation over `ydotool` (the hotkey already works there — evdev)
+* [ ] Real-time partial results (streaming zipformer)
+* [ ] Model-based punctuation, if a Russian one appears (`cxx::OfflinePunctuation` API already exists)
 
-## Документация
+## Documentation
 
-| Файл | О чём |
-|---|---|
-| [docs/architecture.md](docs/architecture.md) | слои, цепочка сигналов, владение объектами |
-| [docs/configuration.md](docs/configuration.md) | справочник `settings.ini`, профили, пути, команды |
-| [docs/models.md](docs/models.md) | модели, лицензии, замеры точности и скорости |
-| [docs/hotwords-and-punctuation.md](docs/hotwords-and-punctuation.md) | подсказки пользователя и пунктуация |
-| [docs/sherpa-onnx-notes.md](docs/sherpa-onnx-notes.md) | реальный API sherpa-onnx, ABI, AUTOMOC |
-| [docs/integration-ApplicationController.md](docs/integration-ApplicationController.md) | как устроен контроллер |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | симптомы и лечение |
-| [docs/development-log.md](docs/development-log.md) | рабочие заметки по итерациям |
+| File                                                                                   | About                                               |
+| -------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| [docs/architecture.md](docs/architecture.md)                                           | layers, signal chain, object ownership              |
+| [docs/configuration.md](docs/configuration.md)                                         | `settings.ini` reference, profiles, paths, commands |
+| [docs/models.md](docs/models.md)                                                       | models, licenses, accuracy and speed measurements   |
+| [docs/hotwords-and-punctuation.md](docs/hotwords-and-punctuation.md)                   | user hotwords and punctuation                       |
+| [docs/sherpa-onnx-notes.md](docs/sherpa-onnx-notes.md)                                 | actual sherpa-onnx API, ABI, AUTOMOC                |
+| [docs/integration-ApplicationController.md](docs/integration-ApplicationController.md) | how the controller is structured                    |
+| [docs/troubleshooting.md](docs/troubleshooting.md)                                     | symptoms and treatment                              |
+| [docs/development-log.md](docs/development-log.md)                                     | working notes by iterations                         |
 
-## Лицензия
+## License
 
-Код проекта — [MIT](LICENSE).
+Project code — [MIT](LICENSE).
 
-Сторонние компоненты распространяются по своим лицензиям и **не входят** в репозиторий
-(скачиваются отдельно):
+Third-party components are distributed under their own licenses and are **not included**
+in the repository (downloaded separately):
 
-| Компонент | Лицензия |
-|---|---|
-| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Apache-2.0 |
-| [Silero VAD](https://github.com/snakers4/silero-vad) | MIT |
-| [zipformer-ru (icefall)](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/zipformer-transducer-models.html) | Apache-2.0 |
-| [GigaAM v2/v3](https://github.com/salute-developers/GigaAM) | MIT |
-| [Whisper](https://github.com/openai/whisper) | MIT |
-| Qt 5 | LGPL-3.0 (динамическая линковка) |
+| Component                                                                                                                            | License                    |
+| ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)                                                                                 | Apache-2.0                 |
+| [Silero VAD](https://github.com/snakers4/silero-vad)                                                                                 | MIT                        |
+| [zipformer-ru (icefall)](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/zipformer-transducer-models.html) | Apache-2.0                 |
+| [GigaAM v2/v3](https://github.com/salute-developers/GigaAM)                                                                          | MIT                        |
+| [Whisper](https://github.com/openai/whisper)                                                                                         | MIT                        |
+| Qt 5                                                                                                                                 | LGPL-3.0 (dynamic linking) |
 
-## Благодарности
+## Acknowledgements
 
-* [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — инференс и готовые
-  ONNX-модели, включая конвертацию GigaAM.
-* [Salute Developers (GigaAM)](https://github.com/salute-developers/GigaAM) — лучшие
-  открытые русские акустические модели.
-* [Silero](https://github.com/snakers4/silero-vad) — VAD, который тянет слабое железо.
+* [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — inference and ready-made
+  ONNX models, including GigaAM conversion.
+* [Salute Developers (GigaAM)](https://github.com/salute-developers/GigaAM) — the best
+  open Russian acoustic models.
+* [Silero](https://github.com/snakers4/silero-vad) — VAD that runs on weak hardware.
