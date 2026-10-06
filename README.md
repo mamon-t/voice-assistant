@@ -2,7 +2,7 @@
 
 Offline voice assistant for Linux: dictation into any input field, voice editing commands, and spellchecking. Recognition runs locally — no internet, no clouds, no sending audio anywhere. Designed for low-end hardware (Celeron, 4–16 GB RAM).
 
-![README russian](README_RU.md) 
+[README russian](README_RU.md) 
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)
