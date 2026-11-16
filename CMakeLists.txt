@@ -6,6 +6,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
+# Опциональные санитайзеры для поиска утечек/UB (включайте в dev/debug-сборках).
+# Пример: cmake -S . -B build-asan -DVOICE_ASSISTANT_SANITIZERS=address,undefined
+set(VOICE_ASSISTANT_SANITIZERS "" CACHE STRING
+    "Comma-separated sanitizers for GCC/Clang (e.g. address,undefined,leak,thread)")
+if(VOICE_ASSISTANT_SANITIZERS)
+    message(STATUS "Sanitizers enabled: ${VOICE_ASSISTANT_SANITIZERS}")
+    add_compile_options(-fsanitize=${VOICE_ASSISTANT_SANITIZERS} -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${VOICE_ASSISTANT_SANITIZERS})
+endif()
+
 find_package(Qt5 5.13 REQUIRED COMPONENTS Core Widgets Multimedia DBus Network)
 
 # ---------------------------------------------------------------------------

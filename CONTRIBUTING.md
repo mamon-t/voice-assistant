@@ -39,6 +39,22 @@ ctest --output-on-failure
 
 Перед отправкой изменений убедитесь, что релевантные тесты проходят локально.
 
+## Поиск утечек памяти и UB (sanitizers)
+
+Для воспроизводимой диагностики надёжности можно собирать проект с санитайзерами GCC/Clang:
+
+```bash
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DVOICE_ASSISTANT_SANITIZERS=address,undefined
+cmake --build build-asan -j"$(nproc)"
+QT_QPA_PLATFORM=offscreen ctest --test-dir build-asan --output-on-failure
+```
+
+Рекомендации:
+- Запускайте длительные/проблемные сценарии (разбор больших файлов, отмена, загрузка моделей) под ASan/UBSan для поиска утечек и неопределённого поведения.
+- При необходимости задавайте `ASAN_OPTIONS`/`UBSAN_OPTIONS` (например, `detect_leaks=1`, `halt_on_error=1`) и сохраняйте команды/окружение в отчёте.
+- Для профилирования аллокаций в long-run сценариях используйте внешние инструменты (`heaptrack`, `valgrind`) на релевантных воспроизводимых кейсах.
+
 ## Pull Request
 
 - Один PR — одна логическая задача.
