@@ -397,7 +397,7 @@ bool EvdevHotkeyListener::openDevices(QString* error)
                        .arg(path, devName, grabReason);
         }
 
-        auto* notifier = new QSocketNotifier(fd, QSocketNotifier::Read, this);
+        auto* notifier = new QSocketNotifier(fd, QSocketNotifier::Read);
         connect(notifier, &QSocketNotifier::activated, this, [this, fd]() { onDeviceReadable(fd); });
 
         m_fds << fd;
@@ -482,20 +482,29 @@ bool EvdevHotkeyListener::start(QString* error)
 
 void EvdevHotkeyListener::stop()
 {
-    for (int fd : std::as_const(m_grabbedFds)) {
-        int grab = 0;
-        ::ioctl(fd, EVIOCGRAB, &grab);   // отпускаем устройство
-    }
-    m_grabbedFds.clear();
-
+    // Сначала останавливаем наблюдение, затем снимаем grab и закрываем fd.
+    // Notifier'ы создаются без QObject-parent и удаляются явно, чтобы не было
+    // двойного владения/удаления.
     for (QSocketNotifier* n : std::as_const(m_notifiers)) {
-        n->setEnabled(false);
-        n->deleteLater();
+        if (n) {
+            n->setEnabled(false);
+            delete n;
+        }
     }
     m_notifiers.clear();
 
+    for (int fd : std::as_const(m_grabbedFds)) {
+        if (fd >= 0) {
+            int grab = 0;
+            ::ioctl(fd, EVIOCGRAB, &grab);   // отпускаем устройство
+        }
+    }
+    m_grabbedFds.clear();
+
     for (int fd : std::as_const(m_fds)) {
-        ::close(fd);
+        if (fd >= 0) {
+            ::close(fd);
+        }
     }
     m_fds.clear();
     m_deviceNames.clear();

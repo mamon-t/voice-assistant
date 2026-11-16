@@ -30,6 +30,11 @@ ModelDownloader::~ModelDownloader()
 {
     if (m_reply) {
         m_reply->abort();
+        m_reply->deleteLater();
+        m_reply = nullptr;
+    }
+    if (m_file.isOpen()) {
+        m_file.close();
     }
 }
 
@@ -173,14 +178,20 @@ void ModelDownloader::onReplyReadyRead()
     if (m_resumed) {
         const int code = m_reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (code != 206) {
-            m_resumed = false;
             disconnect(m_reply, nullptr, this, nullptr);
             m_reply->abort();
             m_reply->deleteLater();
             m_reply = nullptr;
-            m_file.close();
-            // startNext() перечитает .part? Нет — обнуляем его явно:
+
+            if (m_file.isOpen()) {
+                m_file.close();
+            }
             m_file.remove();
+
+            m_hash.reset(new QCryptographicHash(QCryptographicHash::Sha256));
+            m_received = 0;
+            m_resumed = false;
+
             m_queue.prepend(m_current);
             startNext();
             return;
@@ -361,6 +372,14 @@ bool ModelDownloader::extractArchive(const QString& archivePath, const QString& 
 
 void ModelDownloader::fail(const QString& error)
 {
+    if (m_reply) {
+        m_reply->abort();
+        m_reply->deleteLater();
+        m_reply = nullptr;
+    }
+    if (m_file.isOpen()) {
+        m_file.close();
+    }
     qWarning().noquote() << QStringLiteral("Модели: %1 — %2").arg(m_current.id, error);
     m_anyFailed = true;
     emit packageFailed(m_current.id, error);
