@@ -209,6 +209,7 @@ private:
     FileTranscriber* m_transcriber     = nullptr;   // живёт в m_transcribeThread
     QString         m_transcribeFile;               // какой файл разбираем
     QString         m_transcribeTargetWindow;       // куда вставлять результат
+    bool            m_transcribeDetached = false;   // задача не остановилась вовремя; новый запуск небезопасен
 
     bool    m_micCheckOwnsCapture = false;   // захват запущен специально для записи
     QString m_micCheckSource;                // "agc" | "raw"

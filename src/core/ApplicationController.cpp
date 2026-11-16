@@ -1132,15 +1132,19 @@ void ApplicationController::onKeyActivity()
 
 bool ApplicationController::isTranscribing() const
 {
-    return m_transcriber != nullptr;
+    return m_transcriber != nullptr || m_transcribeDetached;
 }
 
 void ApplicationController::requestFileTranscription()
 {
     if (isTranscribing()) {
-        reportError(QStringLiteral("Файл уже разбирается (%1) — дождитесь окончания "
-                                   "или отмените")
-                        .arg(m_transcribeFile));
+        const QString reason = m_transcribeDetached
+            ? QStringLiteral("Предыдущий разбор файла не завершился штатно и был отсоединён "
+                             "для предотвращения аварийного завершения потока. "
+                             "Перезапустите приложение перед новым разбором.")
+            : QStringLiteral("Файл уже разбирается (%1) — дождитесь окончания или отмените")
+                  .arg(m_transcribeFile);
+        reportError(reason);
         return;
     }
 
@@ -1171,7 +1175,11 @@ bool ApplicationController::startFileTranscription(const QString& filePath,
                                                    const AudioFileDecoder::RawParams& rawParams)
 {
     if (isTranscribing()) {
-        reportError(QStringLiteral("Файл уже разбирается (%1)").arg(m_transcribeFile));
+        const QString reason = m_transcribeDetached
+            ? QStringLiteral("Разбор файла недоступен: предыдущая задача зависла и была "
+                             "отсоединена без terminate. Перезапустите приложение.")
+            : QStringLiteral("Файл уже разбирается (%1)").arg(m_transcribeFile);
+        reportError(reason);
         return false;
     }
     if (!QFileInfo::exists(filePath)) {
@@ -1251,8 +1259,10 @@ void ApplicationController::cleanupTranscriber()
     QThread* thread = m_transcribeThread;
     FileTranscriber* transcriber = m_transcriber;
     if (!thread && !transcriber) {
-        m_transcribeFile.clear();
-        m_transcribeTargetWindow.clear();
+        if (!m_transcribeDetached) {
+            m_transcribeFile.clear();
+            m_transcribeTargetWindow.clear();
+        }
         return;
     }
 
@@ -1271,12 +1281,13 @@ void ApplicationController::cleanupTranscriber()
         if (!thread->wait(8000)) {
             qWarning().noquote()
                 << QStringLiteral("Разбор файла: рабочий поток не остановился за 8 с "
-                                  "после запроса отмены — отсоединяю задачу без terminate "
-                                  "(ожидание естественного завершения)");
+                                  "после запроса отмены — отсоединяю задачу без terminate. "
+                                  "Новый разбор файла будет заблокирован до перезапуска "
+                                  "приложения, чтобы избежать гонок и утечек.");
+            m_transcribeDetached = true;
             m_transcribeThread = nullptr;
             m_transcriber = nullptr;
-            m_transcribeFile.clear();
-            m_transcribeTargetWindow.clear();
+            // Контекст файла сохраняем для диагностики/сообщений пользователю.
             return;
         }
         // Поток завершился: event loop остановлен, поэтому deleteLater-события
@@ -1292,6 +1303,7 @@ void ApplicationController::cleanupTranscriber()
     m_transcriber = nullptr;
     m_transcribeFile.clear();
     m_transcribeTargetWindow.clear();
+    m_transcribeDetached = false;
 }
 
 void ApplicationController::onFileTranscriptionSucceeded(const QString& text, int segments,
