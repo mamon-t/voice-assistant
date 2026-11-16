@@ -955,6 +955,11 @@ int runTranscribe(QCoreApplication& app, const QStringList& args)
 
     const QString hotwordsFile = argValue(QStringLiteral("--hotwords"));
     if (!hotwordsFile.isEmpty()) {
+        if (!QFileInfo::exists(hotwordsFile)) {
+            std::fprintf(stderr, "--transcribe: файл подсказок не найден: %s\n",
+                         qPrintable(hotwordsFile));
+            return 2;
+        }
         const QStringList hw = cfg->loadHotwords(hotwordsFile);
         pipeline.setHotwords(hw, cfg->hotwordsScore());
         std::fprintf(stderr, "Подсказки: %d шт. из %s\n",
@@ -992,6 +997,13 @@ int runTranscribe(QCoreApplication& app, const QStringList& args)
 
     const QString outFile = argValue(QStringLiteral("--out"));
     if (!outFile.isEmpty()) {
+        const QFileInfo outInfo(outFile);
+        const QDir outDir = outInfo.dir();
+        if (!outDir.exists() && !QDir().mkpath(outDir.absolutePath())) {
+            std::fprintf(stderr, "--out: не удалось создать каталог для %s\n",
+                         qPrintable(outFile));
+            return 1;
+        }
         QFile out(outFile);
         if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             std::fprintf(stderr, "--out: не удалось записать %s: %s\n",
@@ -1128,9 +1140,20 @@ int main(int argc, char *argv[])
                 return 2;
             }
         }
-        const QString out = (recordIdx + 2 < args.size())
+        QString out = (recordIdx + 2 < args.size())
             ? args.at(recordIdx + 2)
             : QDir(QDir::homePath()).filePath(WavWriter::defaultFileName(QStringLiteral("mic-raw")));
+        if (out.startsWith(QLatin1String("--"))) {
+            std::fprintf(stderr, "--record: после длительности ожидается путь к WAV-файлу или ничего\n");
+            return 2;
+        }
+
+        const QFileInfo outInfo(out);
+        const QDir outDir = outInfo.dir();
+        if (!outDir.exists() && !QDir().mkpath(outDir.absolutePath())) {
+            std::fprintf(stderr, "--record: не удалось создать каталог для %s\n", qPrintable(out));
+            return 1;
+        }
 
         QtAudioCapture capture;
         WavWriter writer;

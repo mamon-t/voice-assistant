@@ -2,6 +2,8 @@
 #include "core/ApplicationController.h"
 #include "core/Mode.h"
 
+#include <QDebug>
+
 DBusInterface::DBusInterface(ApplicationController* controller)
     : QDBusAbstractAdaptor(controller)
     , m_controller(controller)
@@ -43,7 +45,12 @@ void DBusInterface::stopRecording() {
 }
 
 void DBusInterface::setMode(const QString& mode) {
-    m_controller->setMode(stringToMode(mode));
+    Mode parsed = Mode::Off;
+    if (!tryParseMode(mode, &parsed)) {
+        qWarning().noquote() << QStringLiteral("D-Bus setMode: неизвестный режим '%1'").arg(mode);
+        return;
+    }
+    m_controller->setMode(parsed);
 }
 
 QString DBusInterface::getMode() const {
@@ -75,7 +82,13 @@ QString DBusInterface::hotkeyStatus() const {
 }
 
 void DBusInterface::setOutputTarget(const QString& target) {
-    m_controller->setOutputTarget(stringToOutputTarget(target));
+    OutputTarget parsed = OutputTarget::Focus;
+    if (!tryParseOutputTarget(target, &parsed)) {
+        qWarning().noquote()
+            << QStringLiteral("D-Bus setOutputTarget: неизвестная цель '%1'").arg(target);
+        return;
+    }
+    m_controller->setOutputTarget(parsed);
 }
 
 QString DBusInterface::getOutputTarget() const {

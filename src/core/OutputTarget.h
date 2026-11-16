@@ -29,9 +29,16 @@ inline QString outputTargetToString(OutputTarget target)
 
 // Принимает и английские, и русские имена — их произносят голосом и пишут
 // в D-Bus-вызовах одинаково часто.
-inline OutputTarget stringToOutputTarget(const QString& str)
+inline bool tryParseOutputTarget(const QString& str, OutputTarget* out)
 {
     const QString v = str.trimmed().toLower();
+    if (v == QLatin1String("focus") || v == QLatin1String("window")
+        || v == QLatin1String("active")
+        || v == QStringLiteral("окно") || v == QStringLiteral("редактор")
+        || v == QStringLiteral("фокус")) {
+        if (out) *out = OutputTarget::Focus;
+        return true;
+    }
     // Кириллические имена сравниваются через QStringLiteral, НЕ через
     // QLatin1String: исходник в UTF-8, а QLatin1String трактует каждый байт
     // как отдельный символ Latin-1, и «заметки» никогда не совпадёт
@@ -39,9 +46,17 @@ inline OutputTarget stringToOutputTarget(const QString& str)
     if (v == QLatin1String("notes") || v == QLatin1String("note")
         || v == QLatin1String("file")
         || v == QStringLiteral("заметки") || v == QStringLiteral("заметка")) {
-        return OutputTarget::Notes;
+        if (out) *out = OutputTarget::Notes;
+        return true;
     }
-    return OutputTarget::Focus;
+    return false;
+}
+
+inline OutputTarget stringToOutputTarget(const QString& str)
+{
+    OutputTarget t = OutputTarget::Focus;
+    tryParseOutputTarget(str, &t);
+    return t;
 }
 
 // Человекочитаемое имя — для логов, трея и уведомлений.
