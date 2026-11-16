@@ -57,6 +57,9 @@ signals:
     void succeeded(const QString& text, int segments, double audioSeconds, double wallMs);
     void failed(const QString& error);
     void cancelled();
+    // Всегда испускается при завершении run() (после terminal-сигнала) —
+    // используется для безопасной остановки/очистки потока.
+    void finished();
 
 private:
     QString m_path;

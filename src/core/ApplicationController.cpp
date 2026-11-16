@@ -1202,6 +1202,14 @@ bool ApplicationController::startFileTranscription(const QString& filePath,
     // становится прямым: transcriber живёт в этом потоке).
     connect(thread, &QThread::started, transcriber, &FileTranscriber::run);
 
+    // Безопасный жизненный цикл: worker всегда сообщает о завершении (finished),
+    // после чего поток корректно выходит и объекты удаляются в своих контекстах.
+    // Принудительное завершение потока (terminate) не используется: это опасно
+    // утечками/UB при блокирующих операциях внутри сторонних библиотек.
+    connect(transcriber, &FileTranscriber::finished, thread, &QThread::quit);
+    connect(thread, &QThread::finished, transcriber, &QObject::deleteLater);
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+
     // Ретрансляция прогресса в UI (сигналы приходят очередью — потоки разные).
     connect(transcriber, &FileTranscriber::progress,
             this, &ApplicationController::fileTranscriptionProgress);
@@ -1228,42 +1236,82 @@ void ApplicationController::cancelFileTranscription()
 {
     if (m_transcriber) {
         m_transcriber->requestCancel();
-        qInfo().noquote() << QStringLiteral("Разбор файла: запрошена отмена (%1)")
+        if (m_transcribeThread) {
+            // quit() безопасен, но возымеет эффект только когда run() вернёт управление
+            // в event loop потока (кооперативная отмена, без принудительного terminate).
+            m_transcribeThread->quit();
+        }
+        qInfo().noquote() << QStringLiteral("Разбор файла: запрошена кооперативная отмена (%1)")
                                  .arg(m_transcribeFile);
     }
 }
 
 void ApplicationController::cleanupTranscriber()
 {
-    if (m_transcribeThread) {
-        m_transcribeThread->quit();
-        // run() проверяет флаг отмены каждые ~0.5 с; неделима только загрузка
-        // модели (1–3 с). Если поток за 8 с не остановился (патологический
-        // случай — например, зависший системный декодер), прерываем жёстко.
-        if (!m_transcribeThread->wait(8000)) {
+    QThread* thread = m_transcribeThread;
+    FileTranscriber* transcriber = m_transcriber;
+    if (!thread && !transcriber) {
+        m_transcribeFile.clear();
+        m_transcribeTargetWindow.clear();
+        return;
+    }
+
+    if (transcriber) {
+        transcriber->requestCancel();
+        // После запроса остановки игнорируем поздние сигналы от этой задачи.
+        disconnect(transcriber, nullptr, this, nullptr);
+    }
+
+    if (thread) {
+        thread->quit();
+        // Ждём штатного завершения. Если run() заблокирован в непрерываемой операции
+        // (например, внешнем декодере), не используем terminate(): это опасно утечками
+        // и UB. Вместо этого отсоединяем задачу и позволяем ей завершиться естественно,
+        // сохранив deleteLater-цепочку очистки объектов.
+        if (!thread->wait(8000)) {
             qWarning().noquote()
-                << QStringLiteral("Разбор файла: рабочий поток не остановился за 8 с — "
-                                  "прерываю жёстко");
-            m_transcribeThread->terminate();
-            m_transcribeThread->wait(2000);
+                << QStringLiteral("Разбор файла: рабочий поток не остановился за 8 с "
+                                  "после запроса отмены — отсоединяю задачу без terminate "
+                                  "(ожидание естественного завершения)");
+            m_transcribeThread = nullptr;
+            m_transcriber = nullptr;
+            m_transcribeFile.clear();
+            m_transcribeTargetWindow.clear();
+            return;
         }
-        delete m_transcribeThread;
-        m_transcribeThread = nullptr;
+        // Поток завершился: event loop остановлен, поэтому deleteLater-события
+        // могли не выполниться — удаляем объекты явно (без terminate).
+        delete transcriber;
+        delete thread;
+    } else if (transcriber) {
+        // Аномальное состояние: worker без потока.
+        delete transcriber;
     }
-    if (m_transcriber) {
-        // Поток остановлен, событий больше не будет — удаляем напрямую
-        // (deleteLater не сработал бы: event loop потока уже мёртв).
-        delete m_transcriber;
-        m_transcriber = nullptr;
-    }
+
+    m_transcribeThread = nullptr;
+    m_transcriber = nullptr;
+    m_transcribeFile.clear();
+    m_transcribeTargetWindow.clear();
 }
 
 void ApplicationController::onFileTranscriptionSucceeded(const QString& text, int segments,
                                                          double audioSeconds, double wallMs)
 {
+    auto* transcriber = qobject_cast<FileTranscriber*>(sender());
+    if (!transcriber || transcriber != m_transcriber) {
+        qInfo().noquote() << QStringLiteral("Разбор файла: игнорирую поздний сигнал завершения");
+        return;
+    }
+
     const QString filePath = m_transcribeFile;
     const QString targetWindow = m_transcribeTargetWindow;
-    cleanupTranscriber();
+
+    // Снимаем активную задачу сразу (неблокирующе): объекты очистятся через
+    // finished -> quit -> deleteLater/cleanup-путь без принудительного terminate.
+    m_transcriber = nullptr;
+    m_transcribeThread = nullptr;
+    m_transcribeFile.clear();
+    m_transcribeTargetWindow.clear();
 
     qInfo().noquote() << QStringLiteral("Разбор файла завершён: %1 — сегментов: %2, "
                                         "аудио %3 с, затрачено %4 мс (RTF %5)")
@@ -1350,8 +1398,18 @@ void ApplicationController::onFileTranscriptionSucceeded(const QString& text, in
 
 void ApplicationController::onFileTranscriptionFailed(const QString& error)
 {
+    auto* transcriber = qobject_cast<FileTranscriber*>(sender());
+    if (!transcriber || transcriber != m_transcriber) {
+        qInfo().noquote() << QStringLiteral("Разбор файла: игнорирую поздний сигнал ошибки");
+        return;
+    }
+
     const QString filePath = m_transcribeFile;
-    cleanupTranscriber();
+    m_transcriber = nullptr;
+    m_transcribeThread = nullptr;
+    m_transcribeFile.clear();
+    m_transcribeTargetWindow.clear();
+
     qWarning().noquote() << QStringLiteral("Разбор файла не удался (%1): %2")
                                 .arg(filePath, error);
     // Только специализированный сигнал (не reportError): UI показывает
@@ -1362,8 +1420,18 @@ void ApplicationController::onFileTranscriptionFailed(const QString& error)
 
 void ApplicationController::onFileTranscriptionCancelled()
 {
+    auto* transcriber = qobject_cast<FileTranscriber*>(sender());
+    if (!transcriber || transcriber != m_transcriber) {
+        qInfo().noquote() << QStringLiteral("Разбор файла: игнорирую поздний сигнал отмены");
+        return;
+    }
+
     const QString filePath = m_transcribeFile;
-    cleanupTranscriber();
+    m_transcriber = nullptr;
+    m_transcribeThread = nullptr;
+    m_transcribeFile.clear();
+    m_transcribeTargetWindow.clear();
+
     qInfo().noquote() << QStringLiteral("Разбор файла отменён: %1").arg(filePath);
     emit fileTranscriptionCancelled(filePath);
 }

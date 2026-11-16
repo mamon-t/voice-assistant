@@ -30,6 +30,18 @@ void FileTranscriber::run()
     QElapsedTimer wall;
     wall.start();
 
+    bool terminalEmitted = false;
+    const auto finish = [this, &terminalEmitted]() {
+        if (!terminalEmitted) {
+            terminalEmitted = true;
+            emit finished();
+        }
+    };
+    struct FinishGuard {
+        decltype(finish)* fn;
+        ~FinishGuard() { (*fn)(); }
+    } guard{&finish};
+
     // --- 1. Декодирование файла ------------------------------------------------
     emit progress(2, QStringLiteral("Читаю аудиофайл…"));
 
