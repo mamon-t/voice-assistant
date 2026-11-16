@@ -21,6 +21,12 @@
 namespace {
 
 constexpr int kTargetRate = 16000;
+// Защитные пределы для внешних/произвольных файлов: ограничивают пиковое
+// потребление памяти и время обработки при ошибочных или аномальных входах.
+// 4 часа моно 16 кГц int16 ~ 440 МБ в декодированном виде.
+constexpr qint64 kMaxInputFileBytes = 512LL * 1024 * 1024;
+constexpr int kMaxDecodedSeconds = 4 * 60 * 60;
+constexpr int kMaxDecodedSamples = kTargetRate * kMaxDecodedSeconds;
 
 inline uint32_t rd32(const char* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline uint16_t rd16(const char* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
@@ -252,6 +258,20 @@ bool AudioFileDecoder::decode(const QString& path, const RawParams& rawParams,
         return false;
     };
 
+    const QFileInfo fileInfo(path);
+    if (!fileInfo.exists() || !fileInfo.isFile()) {
+        return fail(QStringLiteral("файл не найден или недоступен: %1").arg(path));
+    }
+    if (fileInfo.size() <= 0) {
+        return fail(QStringLiteral("файл пустой: %1").arg(path));
+    }
+    if (fileInfo.size() > kMaxInputFileBytes) {
+        return fail(QStringLiteral(
+            "файл слишком большой (%1 МБ): лимит %2 МБ для безопасной транскрибации")
+                        .arg(fileInfo.size() / (1024.0 * 1024.0), 0, 'f', 1)
+                        .arg(kMaxInputFileBytes / (1024 * 1024)));
+    }
+
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) {
         return fail(QStringLiteral("не могу открыть %1: %2").arg(path, f.errorString()));
@@ -279,7 +299,7 @@ bool AudioFileDecoder::decode(const QString& path, const RawParams& rawParams,
                         .arg(path, wavError, qtError));
     }
 
-    const QString ext = QFileInfo(path).suffix().toLower();
+    const QString ext = fileInfo.suffix().toLower();
     if (qtDecoderExtensions().contains(ext)) {
         f.close();
         return decodeViaQt(path, out, error);
@@ -288,6 +308,9 @@ bool AudioFileDecoder::decode(const QString& path, const RawParams& rawParams,
     // Всё остальное — RAW-поток: ни контейнера, ни параметров в файле нет.
     const QByteArray all = f.readAll();
     f.close();
+    if (all.isEmpty()) {
+        return fail(QStringLiteral("файл пустой: %1").arg(path));
+    }
     return decodeRaw(all, rawParams, out, error);
 }
 
@@ -404,6 +427,15 @@ bool AudioFileDecoder::decodeWav(const QByteArray& data, Audio& out, QString* er
     if (frames <= 0) {
         return fail(QStringLiteral("в чанке data нет ни одного кадра"));
     }
+    // Оценка длительности после приведения к 16 кГц: при больших srcRate
+    // данных станет меньше, но как верхнюю границу памяти используем frames.
+    if (frames > kMaxDecodedSamples) {
+        return fail(QStringLiteral(
+            "аудио слишком длинное (%1 с при %2 Гц): лимит %3 с")
+                        .arg(double(frames) / double(sampleRate), 0, 'f', 1)
+                        .arg(sampleRate)
+                        .arg(kMaxDecodedSeconds));
+    }
 
     std::vector<int16_t> mono(static_cast<size_t>(frames));
     for (int i = 0; i < frames; ++i) {
@@ -454,6 +486,13 @@ bool AudioFileDecoder::decodeRaw(const QByteArray& data, const RawParams& pr,
                                    "%2 Гц, %3 кан., %4")
                         .arg(data.size()).arg(pr.sampleRate).arg(pr.channels)
                         .arg(RawParams::formatToString(pr.format)));
+    }
+    if (frames > kMaxDecodedSamples) {
+        return fail(QStringLiteral(
+            "RAW: аудио слишком длинное (%1 с при %2 Гц): лимит %3 с")
+                        .arg(double(frames) / double(pr.sampleRate), 0, 'f', 1)
+                        .arg(pr.sampleRate)
+                        .arg(kMaxDecodedSeconds));
     }
 
     const char* p = data.constData();
@@ -546,24 +585,35 @@ bool AudioFileDecoder::decodeViaQt(const QString& path, Audio& out, QString* err
         loop.quit();
     });
 
-    auto appendMono = [&acc, &accRate](const int16_t* data, int frames, int rate) {
-        if (frames <= 0) {
+    auto appendMono = [&acc, &accRate, &decodeError, &loop](const int16_t* data, int frames, int rate) {
+        if (frames <= 0 || !decodeError.isEmpty()) {
             return;
         }
-        if (accRate == 0) {
-            accRate = rate;
+
+        // Приводим входной кусок к целевой частоте для корректной оценки лимита.
+        std::vector<int16_t> chunk;
+        if (rate == kTargetRate) {
+            chunk.assign(data, data + frames);
+        } else {
+            chunk.assign(data, data + frames);
+            resampleTo16k(chunk, rate);
         }
-        if (rate != accRate) {
-            // практически не встречается: приводим накопленное к 16 кГц и
-            // продолжаем накапливать уже в целевой частоте
+
+        if (accRate == 0) {
+            accRate = kTargetRate;
+        } else if (accRate != kTargetRate) {
             resampleTo16k(acc, accRate);
             accRate = kTargetRate;
-            std::vector<int16_t> chunk(data, data + frames);
-            resampleTo16k(chunk, rate);
-            acc.insert(acc.end(), chunk.begin(), chunk.end());
+        }
+
+        if (static_cast<qint64>(acc.size()) + static_cast<qint64>(chunk.size()) > kMaxDecodedSamples) {
+            decodeError = QStringLiteral(
+                "аудио слишком длинное после декодирования: лимит %1 с").arg(kMaxDecodedSeconds);
+            loop.quit();
             return;
         }
-        acc.insert(acc.end(), data, data + frames);
+
+        acc.insert(acc.end(), chunk.begin(), chunk.end());
     };
 
     QObject::connect(&decoder, &QAudioDecoder::bufferReady, &decoder, [&]() {
