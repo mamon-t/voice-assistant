@@ -49,7 +49,8 @@ jobs:
       - name: Сборка
         run: |
           mkdir build && cd build
-          cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DSHERPA_ONNX_OLD_CXX_ABI=ON -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic"
           make -j"$(nproc)"
 
       - name: Модульные тесты

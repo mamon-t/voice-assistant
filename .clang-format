@@ -1,0 +1,38 @@
+# C++ formatting for voice-assistant (Qt/C++17)
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+AccessModifierOffset: -4
+IndentCaseLabels: false
+IndentPPDirectives: None
+NamespaceIndentation: None
+
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: true
+BinPackParameters: true
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+
+SortIncludes: false
+IncludeBlocks: Preserve
+ReflowComments: false
+FixNamespaceComments: true
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AlignTrailingComments: false
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
