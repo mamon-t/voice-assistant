@@ -492,6 +492,15 @@ in [docs/models.md](docs/models.md).
 | [docs/integration-ApplicationController.md](docs/integration-ApplicationController.md) | how the controller is structured                    |
 | [docs/troubleshooting.md](docs/troubleshooting.md)                                     | symptoms and treatment                              |
 | [docs/development-log.md](docs/development-log.md)                                     | working notes by iterations                         |
+| [CONTRIBUTING.md](CONTRIBUTING.md)                                                     | development workflow, style, CI, issue/PR guidelines |
+
+## Contributing and maintenance
+
+- Contribution workflow, local checks, and PR/issue guidelines: [CONTRIBUTING.md](CONTRIBUTING.md).
+- Code style and baseline tooling: `.clang-format`, `.clang-tidy`, `.editorconfig`; CI enforces stricter compiler warnings (`-Wall -Wextra -Wpedantic`) during builds.
+- Security/operational notes: the app uses `/dev/input` (evdev hotkey), session D-Bus, text injection into windows, and user-provided audio/config paths — prefer least privilege and validate inputs/paths when extending behavior. See [docs/troubleshooting.md](docs/troubleshooting.md).
+- Reproducibility: packaging/CI pin external build inputs where practical (e.g. sherpa-onnx version/ABI assumptions); document dependency and ABI-related changes in code/docs.
+- Performance measurements: reference numbers are in [docs/models.md](docs/models.md); for reproducible comparisons use the same audio, ASR profile, and thread count with `tools/vad-asr-test` or `voice-assistant --transcribe`.
 
 ## License
 

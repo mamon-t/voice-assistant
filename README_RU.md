@@ -491,6 +491,15 @@ cd build && ctest --output-on-failure
 | [docs/integration-ApplicationController.md](docs/integration-ApplicationController.md) | как устроен контроллер |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | симптомы и лечение |
 | [docs/development-log.md](docs/development-log.md) | рабочие заметки по итерациям |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | процесс разработки, стиль, CI, правила issue/PR |
+
+## Участие в разработке и сопровождение
+
+- Процесс разработки, локальные проверки и правила PR/issue: [CONTRIBUTING.md](CONTRIBUTING.md).
+- Стиль и базовый инструментарий: `.clang-format`, `.clang-tidy`, `.editorconfig`; в CI сборка выполняется со строгими предупреждениями компилятора (`-Wall -Wextra -Wpedantic`).
+- Безопасность и эксплуатация: приложение использует `/dev/input` (evdev хоткей), сессионный D-Bus, ввод текста в окна и пользовательские пути к аудио/конфигам — при расширении поведения придерживайтесь принципа минимальных привилегий и проверки входных данных/путей. См. [docs/troubleshooting.md](docs/troubleshooting.md).
+- Воспроизводимость: в CI/упаковке по возможности фиксируются внешние входные данные сборки (например, версия/ABI-предположения sherpa-onnx); изменения зависимостей и ABI документируйте в коде и документации.
+- Замеры производительности: эталонные числа приведены в [docs/models.md](docs/models.md); для воспроизводимых сравнений используйте одинаковые аудиофайлы, профиль ASR и число потоков в `tools/vad-asr-test` или `voice-assistant --transcribe`.
 
 ## Лицензия
 
